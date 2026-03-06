@@ -6111,8 +6111,12 @@ class TUI:
 
             # Multiline mode: Enter continues, empty line sends.
             # Works for all locales (like Claude CLI).
-            if (first_line.strip() and
-                    not first_line.strip().startswith("/")):
+            # Skip multiline for slash commands (/help etc) but NOT for file paths (/Users/...)
+            _fl = first_line.strip()
+            _fl_word0 = _fl.split()[0] if _fl else ""
+            _is_cmd = (_fl.startswith("/") and len(_fl_word0) > 1 and
+                       _fl_word0[1:2].isalpha() and "/" not in _fl_word0[1:])
+            if (_fl and not _is_cmd):
                 # Show subtle hint on first use
                 if not hasattr(self, '_multiline_hint_shown'):
                     self._multiline_hint_shown = True
@@ -7754,9 +7758,14 @@ def main():
                 print(f"  {_ansi(chr(27)+'[38;5;240m')}Resume anytime: eve-cli --resume{C.RESET}\n")
                 break
 
-            # Handle commands
-            if user_input.startswith("/"):
-                cmd = user_input.split()[0].lower()
+            # Handle commands (only /word style, not absolute paths like /Users/...)
+            _first_word = user_input.split()[0] if user_input.strip() else ""
+            _is_slash_cmd = (user_input.startswith("/") and
+                             len(_first_word) > 1 and
+                             _first_word[1:2].isalpha() and
+                             "/" not in _first_word[1:])
+            if _is_slash_cmd:
+                cmd = _first_word.lower()
                 if cmd in ("/exit", "/quit", "/q"):
                     session.save()
                     msgs = len(session.messages)
