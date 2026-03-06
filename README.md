@@ -89,6 +89,38 @@ eve-cli --resume
 | `EVE_CLI_DEBUG` | デバッグモード (`1` で有効) |
 | `OLLAMA_HOST` | Ollamaホスト URL |
 
+### 設定方法
+
+シェルの設定ファイル（`~/.zshrc` または `~/.bashrc`）に追記してください。
+
+```bash
+# デフォルトモデルを設定
+export EVE_CLI_MODEL="qwen3:8b"
+
+# クラウドモデルを使う場合
+export EVE_CLI_MODEL="minimax-m2.5:cloud"
+
+# サイドカーモデル（サブエージェント用の軽量モデル）
+export EVE_CLI_SIDECAR_MODEL="qwen3:4b"
+
+# デバッグモードを有効化
+export EVE_CLI_DEBUG=1
+
+# Ollamaのホストを変更（デフォルト: http://localhost:11434）
+export OLLAMA_HOST="http://localhost:11434"
+```
+
+設定後、ターミナルを再起動するか `source ~/.zshrc` を実行してください。
+
+設定ファイル（`~/.config/eve-cli/config`）でも同様に設定できます。
+
+```
+MODEL=qwen3:8b
+SIDECAR_MODEL=qwen3:4b
+OLLAMA_HOST=http://localhost:11434
+EVE_CLI_DEBUG=0
+```
+
 ## 推奨環境
 
 | 環境 | メモリ | 推奨モデル |
