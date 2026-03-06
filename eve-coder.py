@@ -6065,6 +6065,20 @@ class TUI:
                         w = _char_display_width(ch_removed)
                         sys.stdout.write("\b" * w + " " * w + "\b" * w)
                         sys.stdout.flush()
+                    elif lines:
+                        # Buffer empty but previous lines exist — go back to previous line
+                        prev_line = lines.pop()
+                        buf = list(prev_line)
+                        # Move cursor up, clear current line, rewrite previous line
+                        cont_prompt = "... " if not lines else "... "
+                        first_prompt = prompt_str
+                        use_prompt = cont_prompt if lines else first_prompt
+                        # Erase current "... " line and move up
+                        sys.stdout.write("\r\033[K")  # clear current line
+                        sys.stdout.write("\033[A")     # move up one line
+                        sys.stdout.write("\r\033[K")  # clear that line
+                        sys.stdout.write(use_prompt + prev_line)
+                        sys.stdout.flush()
                     continue
 
                 if b == 0x15:  # Ctrl+U — clear line
