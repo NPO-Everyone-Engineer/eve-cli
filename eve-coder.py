@@ -5938,218 +5938,27 @@ class TUI:
         else:
             print(f"{C.DIM}{'·' * sep_w}{C.RESET}")
 
-    def _build_prompt_str(self, session=None, plan_mode=False, for_readline=False):
-        """Build the prompt string. If for_readline=True, wrap ANSI codes for readline."""
-        _wrap = _rl_ansi if for_readline else _ansi
-        _reset = _wrap(C.RESET if C._enabled else "")
-        plan_tag = f"{_wrap(chr(27)+'[38;5;226m')}[PLAN]{_reset} " if plan_mode else ""
-        if session:
-            pct = min(int((session.get_token_estimate() / session.config.context_window) * 100), 100)
-            if pct < 50:
-                ctx_color = _wrap("\033[38;5;240m")
-            elif pct < 80:
-                ctx_color = _wrap("\033[38;5;226m")
-            else:
-                ctx_color = _wrap("\033[38;5;196m")
-            return f"{plan_tag}{ctx_color}ctx:{pct}%{_reset} {_wrap(chr(27)+'[38;5;51m')}❯{_reset} "
-        else:
-            return f"{plan_tag}{_wrap(chr(27)+'[38;5;51m')}❯{_reset} "
+    def _clean_shift_enter(self, text):
+        """Remove Shift+Enter escape sequence garbage from input text.
+        Returns cleaned text with sequences replaced by newlines."""
+        import re
+        text = text.replace("\x1b[27;2;13~", "\n")
+        text = re.sub(r'27;2;13~', '\n', text)
+        text = re.sub(r'7;2;13~', '\n', text)
+        return text
 
-    def _raw_input_with_shift_enter(self, prompt_str):
-        """Read input using termios, treating Shift+Enter as newline and Enter as submit.
-        Returns the input string (may contain \\n for Shift+Enter newlines).
-        Falls back to input() if termios is unavailable or stdin is not a TTY."""
-        if not HAS_TERMIOS or not sys.stdin.isatty():
-            return None  # signal caller to fall back to input()
-
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            # Print prompt (raw mode needs explicit \r\n handling)
-            sys.stdout.write(prompt_str)
-            sys.stdout.flush()
-
-            buf = []           # current line characters
-            lines = []         # completed lines (from Shift+Enter)
-            esc_buf = b""      # escape sequence accumulator
-            in_esc = False
-
-            while True:
-                ch = os.read(fd, 1)
-                if not ch:
-                    break
-
-                if in_esc:
-                    esc_buf += ch
-                    # Check if we have a complete CSI sequence
-                    if len(esc_buf) >= 2 and esc_buf[0:1] == b'[':
-                        # CSI sequence ends with a letter or ~
-                        if ch.isalpha() or ch == b'~':
-                            seq = esc_buf.decode('utf-8', errors='replace')
-                            if seq == '[27;2;13~':
-                                # Shift+Enter: insert newline, continue editing
-                                lines.append("".join(buf))
-                                buf = []
-                                sys.stdout.write("\r\n")
-                                # Show continuation prompt
-                                cont_prompt = f"{C.DIM}...{C.RESET} " if C._enabled else "... "
-                                sys.stdout.write(cont_prompt)
-                                sys.stdout.flush()
-                            elif seq in ('[A', '[B', '[C', '[D'):
-                                # Arrow keys — basic handling
-                                if seq == '[C' and buf:  # right (ignore for simplicity)
-                                    pass
-                                elif seq == '[D' and buf:  # left (ignore for simplicity)
-                                    pass
-                                # For up/down, ignore in raw mode
-                            elif seq == '[H':
-                                # Home key
-                                pass
-                            elif seq == '[F':
-                                # End key
-                                pass
-                            elif seq == '[3~':
-                                # Delete key
-                                pass
-                            # else: ignore unknown CSI sequence
-                            in_esc = False
-                            esc_buf = b""
-                            continue
-                        # Still accumulating — continue
-                        if len(esc_buf) > 20:
-                            # Too long, bail out
-                            in_esc = False
-                            esc_buf = b""
-                        continue
-                    elif len(esc_buf) == 1 and esc_buf[0:1] != b'[':
-                        # Alt+key (ESC followed by non-[) — ignore
-                        in_esc = False
-                        esc_buf = b""
-                        continue
-                    continue
-
-                b = ch[0]
-
-                if b == 0x1b:  # ESC
-                    in_esc = True
-                    esc_buf = b""
-                    continue
-
-                if b == 0x0d or b == 0x0a:  # Enter (CR or LF) — submit
-                    sys.stdout.write("\r\n")
-                    sys.stdout.flush()
-                    lines.append("".join(buf))
-                    return "\n".join(lines)
-
-                if b == 0x03:  # Ctrl+C
-                    sys.stdout.write("^C\r\n")
-                    sys.stdout.flush()
-                    raise KeyboardInterrupt
-
-                if b == 0x04:  # Ctrl+D
-                    if not buf and not lines:
-                        sys.stdout.write("\r\n")
-                        sys.stdout.flush()
-                        raise EOFError
-                    # Ctrl+D with content — submit like Enter
-                    sys.stdout.write("\r\n")
-                    sys.stdout.flush()
-                    lines.append("".join(buf))
-                    return "\n".join(lines)
-
-                if b in (0x7f, 0x08):  # Backspace / DEL
-                    if buf:
-                        ch_removed = buf.pop()
-                        # Handle wide chars (CJK)
-                        w = _char_display_width(ch_removed)
-                        sys.stdout.write("\b" * w + " " * w + "\b" * w)
-                        sys.stdout.flush()
-                    elif lines:
-                        # Buffer empty but previous lines exist — go back to previous line
-                        prev_line = lines.pop()
-                        buf = list(prev_line)
-                        # Move cursor up, clear current line, rewrite previous line
-                        cont_prompt = "... " if not lines else "... "
-                        first_prompt = prompt_str
-                        use_prompt = cont_prompt if lines else first_prompt
-                        # Erase current "... " line and move up
-                        sys.stdout.write("\r\033[K")  # clear current line
-                        sys.stdout.write("\033[A")     # move up one line
-                        sys.stdout.write("\r\033[K")  # clear that line
-                        sys.stdout.write(use_prompt + prev_line)
-                        sys.stdout.flush()
-                    continue
-
-                if b == 0x15:  # Ctrl+U — clear line
-                    if buf:
-                        disp_w = sum(_char_display_width(c) for c in buf)
-                        sys.stdout.write("\b" * disp_w + " " * disp_w + "\b" * disp_w)
-                        sys.stdout.flush()
-                        buf = []
-                    continue
-
-                if b == 0x17:  # Ctrl+W — delete word
-                    while buf and buf[-1] == ' ':
-                        buf.pop()
-                        sys.stdout.write("\b \b")
-                    while buf and buf[-1] != ' ':
-                        ch_removed = buf.pop()
-                        w = _char_display_width(ch_removed)
-                        sys.stdout.write("\b" * w + " " * w + "\b" * w)
-                    sys.stdout.flush()
-                    continue
-
-                if b < 0x20 and b not in (0x09,):  # Other control chars — ignore
-                    continue
-
-                # Regular character (may be multi-byte UTF-8)
-                try:
-                    if b >= 0x80:
-                        # Multi-byte UTF-8: read remaining bytes
-                        remaining = b""
-                        if b & 0xE0 == 0xC0:
-                            remaining = os.read(fd, 1)
-                        elif b & 0xF0 == 0xE0:
-                            remaining = os.read(fd, 2)
-                        elif b & 0xF8 == 0xF0:
-                            remaining = os.read(fd, 3)
-                        char = (ch + remaining).decode('utf-8')
-                    else:
-                        char = chr(b)
-                    buf.append(char)
-                    sys.stdout.write(char)
-                    sys.stdout.flush()
-                except (UnicodeDecodeError, OSError):
-                    pass
-
-            lines.append("".join(buf))
-            return "\n".join(lines)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    def _has_shift_enter(self, text):
+        """Check if text contains Shift+Enter escape sequence garbage."""
+        return '7;2;13~' in text or '27;2;13~' in text or '\x1b[27;2;13~' in text
 
     def get_input(self, session=None, plan_mode=False, prefill=""):
-        """Get user input. Supports Shift+Enter for newline, Enter to submit.
+        """Get user input with readline. Shift+Enter triggers continuation lines.
 
-        Uses termios raw input on supported systems (macOS/Linux) to properly
-        handle Shift+Enter. Falls back to standard input() on Windows or when
-        stdin is not a TTY.
+        Uses standard input() for full readline editing (arrow keys, history,
+        Ctrl+A/E, Japanese IME, etc). When Shift+Enter is detected (as leaked
+        escape sequence), cleans it up and prompts for continuation lines.
+        Enter on empty continuation line submits the full input.
         """
-        # Try raw input first (handles Shift+Enter properly)
-        if HAS_TERMIOS and sys.stdin.isatty() and not prefill:
-            try:
-                prompt_str = self._build_prompt_str(session=session, plan_mode=plan_mode, for_readline=False)
-                result = self._raw_input_with_shift_enter(prompt_str)
-                if result is not None:
-                    # Add to readline history for up-arrow recall
-                    if HAS_READLINE and result.strip():
-                        readline.add_history(result.replace("\n", " "))
-                    return result
-            except (KeyboardInterrupt, EOFError):
-                print()
-                return None
-
-        # Fallback: standard input() with readline
         try:
             if prefill and HAS_READLINE:
                 def _hook():
@@ -6157,12 +5966,72 @@ class TUI:
                     readline.redisplay()
                 readline.set_startup_hook(_hook)
 
-            prompt_str = self._build_prompt_str(session=session, plan_mode=plan_mode, for_readline=True)
+            _rl_reset = _rl_ansi(C.RESET if C._enabled else "")
+            plan_tag = f"{_rl_ansi(chr(27)+'[38;5;226m')}[PLAN]{_rl_reset} " if plan_mode else ""
+            if session:
+                pct = min(int((session.get_token_estimate() / session.config.context_window) * 100), 100)
+                if pct < 50:
+                    ctx_color = _rl_ansi("\033[38;5;240m")
+                elif pct < 80:
+                    ctx_color = _rl_ansi("\033[38;5;226m")
+                else:
+                    ctx_color = _rl_ansi("\033[38;5;196m")
+                prompt_str = f"{plan_tag}{ctx_color}ctx:{pct}%{_rl_reset} {_rl_ansi(chr(27)+'[38;5;51m')}❯{_rl_reset} "
+            else:
+                prompt_str = f"{plan_tag}{_rl_ansi(chr(27)+'[38;5;51m')}❯{_rl_reset} "
+
             line = input(prompt_str)
-            # Clean up leaked Shift+Enter escape sequences
-            import re
-            line = re.sub(r'(?:\x1b\[)?27;2;13~', '\n', line)
-            line = re.sub(r'7;2;13~', '\n', line)
+
+            # Check for Shift+Enter garbage
+            if self._has_shift_enter(line):
+                cleaned = self._clean_shift_enter(line)
+                parts = [p for p in cleaned.split("\n")]
+                # Redraw the garbled line cleanly
+                sys.stdout.write(f"\033[A\r\033[K")  # move up, clear line
+                # Print cleaned first line (without readline wrapping for display)
+                _disp_reset = _ansi(C.RESET if C._enabled else "")
+                if session:
+                    if pct < 50:
+                        _disp_ctx = _ansi("\033[38;5;240m")
+                    elif pct < 80:
+                        _disp_ctx = _ansi("\033[38;5;226m")
+                    else:
+                        _disp_ctx = _ansi("\033[38;5;196m")
+                    _disp_prompt = f"{_disp_ctx}ctx:{pct}%{_disp_reset} {_ansi(chr(27)+'[38;5;51m')}❯{_disp_reset} "
+                else:
+                    _disp_prompt = f"{_ansi(chr(27)+'[38;5;51m')}❯{_disp_reset} "
+                sys.stdout.write(f"{_disp_prompt}{parts[0]}\n")
+                # Print remaining parts from the split
+                for p in parts[1:]:
+                    sys.stdout.write(f"{C.DIM}...{C.RESET} {p}\n")
+                sys.stdout.flush()
+
+                # Continue reading more lines
+                lines = parts
+                cont_prompt = f"{_rl_ansi(C.DIM)}...{_rl_ansi(C.RESET)} " if C._enabled else "... "
+                while True:
+                    try:
+                        cont = input(cont_prompt)
+                        if self._has_shift_enter(cont):
+                            cleaned_cont = self._clean_shift_enter(cont)
+                            cont_parts = cleaned_cont.split("\n")
+                            # Redraw garbled continuation line
+                            sys.stdout.write(f"\033[A\r\033[K")
+                            sys.stdout.write(f"{C.DIM}...{C.RESET} {cont_parts[0]}\n")
+                            for p in cont_parts[1:]:
+                                sys.stdout.write(f"{C.DIM}...{C.RESET} {p}\n")
+                            sys.stdout.flush()
+                            lines.extend(cont_parts)
+                        elif cont == "":
+                            # Empty line = submit
+                            break
+                        else:
+                            lines.append(cont)
+                    except (EOFError, KeyboardInterrupt):
+                        print(f"\n{C.DIM}(Cancelled){C.RESET}")
+                        return None
+                return "\n".join(lines)
+
             return line
         except (EOFError, KeyboardInterrupt):
             print()
@@ -6185,26 +6054,6 @@ class TUI:
             first_line = self.get_input(session=session, plan_mode=plan_mode, prefill=prefill)
             if first_line is None:
                 return None
-            # If Shift+Enter produced newlines in the first line, treat as multiline
-            if "\n" in first_line:
-                lines = first_line.split("\n")
-                print(f"{C.DIM}  (multiline detected — enter empty line to send, \"\"\" to end){C.RESET}")
-                while True:
-                    try:
-                        cont = input(f"{C.DIM}...{C.RESET} ")
-                        cont = cont.replace("\x1b[27;2;13~", "\n").replace("7;2;13~", "\n")
-                        if cont.strip() == "":
-                            break
-                        if cont.strip() == '"""':
-                            break
-                        if "\n" in cont:
-                            lines.extend(cont.split("\n"))
-                        else:
-                            lines.append(cont)
-                    except (EOFError, KeyboardInterrupt):
-                        print(f"\n{C.DIM}(Cancelled){C.RESET}")
-                        return None
-                return "\n".join(lines)
 
             if first_line.strip() == '"""':
                 # Explicit multi-line mode
