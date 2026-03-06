@@ -5897,11 +5897,11 @@ class TUI:
         _esc_hint = "ESC/Ctrl+C 中断" if HAS_TERMIOS else "Ctrl+C 中断"
         _esc_hint_en = "ESC or Ctrl+C to interrupt" if HAS_TERMIOS else "Ctrl+C to interrupt"
         if self._is_cjk:
-            print(f"  {_hint}/help コマンド一覧 • {_esc_hint} (2回で終了) • \"\"\"で複数行{C.RESET}")
-            print(f"  {_hint}IME対応: 空行Enterで送信 • 実行中の入力はtype-ahead{C.RESET}\n")
+            print(f"  {_hint}/help コマンド一覧 • {_esc_hint} (2回で終了){C.RESET}")
+            print(f"  {_hint}Enterで改行 • 空行Enterで送信 • 実行中の入力はtype-ahead{C.RESET}\n")
         else:
-            print(f"  {_hint}/help commands • {_esc_hint_en} (press twice to quit) • \"\"\" for multiline{C.RESET}")
-            print(f"  {_hint}Type during execution for type-ahead{C.RESET}\n")
+            print(f"  {_hint}/help commands • {_esc_hint_en} (press twice to quit){C.RESET}")
+            print(f"  {_hint}Enter for newline • empty Enter to send • type-ahead during execution{C.RESET}\n")
 
     def _detect_cjk_locale(self):
         """Detect if user is likely using CJK input (IME)."""
@@ -5938,26 +5938,13 @@ class TUI:
         else:
             print(f"{C.DIM}{'·' * sep_w}{C.RESET}")
 
-    def _clean_shift_enter(self, text):
-        """Remove Shift+Enter escape sequence garbage from input text.
-        Returns cleaned text with sequences replaced by newlines."""
-        import re
-        text = text.replace("\x1b[27;2;13~", "\n")
-        text = re.sub(r'27;2;13~', '\n', text)
-        text = re.sub(r'7;2;13~', '\n', text)
-        return text
-
-    def _has_shift_enter(self, text):
-        """Check if text contains Shift+Enter escape sequence garbage."""
-        return '7;2;13~' in text or '27;2;13~' in text or '\x1b[27;2;13~' in text
-
     def get_input(self, session=None, plan_mode=False, prefill=""):
-        """Get user input with readline. Shift+Enter triggers continuation lines.
+        """Get a single line of user input with full readline support.
 
-        Uses standard input() for full readline editing (arrow keys, history,
-        Ctrl+A/E, Japanese IME, etc). When Shift+Enter is detected (as leaked
-        escape sequence), cleans it up and prompts for continuation lines.
-        Enter on empty continuation line submits the full input.
+        Uses standard input() for readline editing (arrow keys, history,
+        Ctrl+A/E, Japanese IME, etc). Silently strips Shift+Enter escape
+        sequence garbage if present. Multiline handling is done by the
+        caller (get_multiline_input).
         """
         try:
             if prefill and HAS_READLINE:
@@ -5981,57 +5968,10 @@ class TUI:
                 prompt_str = f"{plan_tag}{_rl_ansi(chr(27)+'[38;5;51m')}❯{_rl_reset} "
 
             line = input(prompt_str)
-
-            # Check for Shift+Enter garbage
-            if self._has_shift_enter(line):
-                cleaned = self._clean_shift_enter(line)
-                parts = [p for p in cleaned.split("\n")]
-                # Redraw the garbled line cleanly
-                sys.stdout.write(f"\033[A\r\033[K")  # move up, clear line
-                # Print cleaned first line (without readline wrapping for display)
-                _disp_reset = _ansi(C.RESET if C._enabled else "")
-                if session:
-                    if pct < 50:
-                        _disp_ctx = _ansi("\033[38;5;240m")
-                    elif pct < 80:
-                        _disp_ctx = _ansi("\033[38;5;226m")
-                    else:
-                        _disp_ctx = _ansi("\033[38;5;196m")
-                    _disp_prompt = f"{_disp_ctx}ctx:{pct}%{_disp_reset} {_ansi(chr(27)+'[38;5;51m')}❯{_disp_reset} "
-                else:
-                    _disp_prompt = f"{_ansi(chr(27)+'[38;5;51m')}❯{_disp_reset} "
-                sys.stdout.write(f"{_disp_prompt}{parts[0]}\n")
-                # Print remaining parts from the split
-                for p in parts[1:]:
-                    sys.stdout.write(f"{C.DIM}...{C.RESET} {p}\n")
-                sys.stdout.flush()
-
-                # Continue reading more lines
-                lines = parts
-                cont_prompt = f"{_rl_ansi(C.DIM)}...{_rl_ansi(C.RESET)} " if C._enabled else "... "
-                while True:
-                    try:
-                        cont = input(cont_prompt)
-                        if self._has_shift_enter(cont):
-                            cleaned_cont = self._clean_shift_enter(cont)
-                            cont_parts = cleaned_cont.split("\n")
-                            # Redraw garbled continuation line
-                            sys.stdout.write(f"\033[A\r\033[K")
-                            sys.stdout.write(f"{C.DIM}...{C.RESET} {cont_parts[0]}\n")
-                            for p in cont_parts[1:]:
-                                sys.stdout.write(f"{C.DIM}...{C.RESET} {p}\n")
-                            sys.stdout.flush()
-                            lines.extend(cont_parts)
-                        elif cont == "":
-                            # Empty line = submit
-                            break
-                        else:
-                            lines.append(cont)
-                    except (EOFError, KeyboardInterrupt):
-                        print(f"\n{C.DIM}(Cancelled){C.RESET}")
-                        return None
-                return "\n".join(lines)
-
+            # Silently strip Shift+Enter escape sequence garbage
+            import re
+            line = re.sub(r'(?:\x1b\[)?27;2;13~', '', line)
+            line = re.sub(r'7;2;13~', '', line)
             return line
         except (EOFError, KeyboardInterrupt):
             print()
@@ -6070,20 +6010,22 @@ class TUI:
                         return None
                 return "\n".join(lines)
 
-            # IME-safe mode: if input looks like it might continue
-            # (CJK locale and line doesn't end with command prefix),
-            # allow continuation with Enter, empty line sends
-            if (self._is_cjk and
-                    first_line.strip() and
+            # Multiline mode: Enter continues, empty line sends.
+            # Works for all locales (like Claude CLI).
+            if (first_line.strip() and
                     not first_line.strip().startswith("/")):
                 # Show subtle hint on first use
-                if not hasattr(self, '_ime_hint_shown'):
-                    self._ime_hint_shown = True
-                    print(f"{C.DIM}  (IME mode: press Enter on empty line to send, \"\"\" for multiline){C.RESET}")
+                if not hasattr(self, '_multiline_hint_shown'):
+                    self._multiline_hint_shown = True
+                    print(f"{C.DIM}  (Enter for newline, empty Enter to send){C.RESET}")
                 lines = [first_line]
                 while True:
                     try:
                         cont = input(f"{C.DIM}...{C.RESET} ")
+                        # Strip Shift+Enter garbage from continuation lines too
+                        import re
+                        cont = re.sub(r'(?:\x1b\[)?27;2;13~', '', cont)
+                        cont = re.sub(r'7;2;13~', '', cont)
                         if cont.strip() == "":
                             # Empty line = send
                             break
