@@ -2500,6 +2500,105 @@ _MEDIA_TYPES = {
 }
 
 
+def _extract_image_paths(text):
+    """Extract image file paths from text (handles drag & drop into terminal).
+    Returns (cleaned_text, list_of_image_paths)."""
+    import shlex
+    image_paths = []
+    remaining_parts = []
+
+    # Split by whitespace but respect quotes
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+
+    for token in tokens:
+        # Strip file:// prefix (macOS Finder drag)
+        cleaned = token
+        if cleaned.startswith("file://"):
+            cleaned = urllib.parse.unquote(cleaned[7:])
+        # Strip surrounding quotes
+        cleaned = cleaned.strip("'\"")
+        # Check if it looks like an image path
+        ext = os.path.splitext(cleaned)[1].lower()
+        if ext in IMAGE_EXTENSIONS and os.path.isfile(cleaned):
+            image_paths.append(cleaned)
+        else:
+            remaining_parts.append(token)
+
+    cleaned_text = " ".join(remaining_parts)
+    return cleaned_text, image_paths
+
+
+def _read_image_as_base64(file_path):
+    """Read image file and return (base64_data, media_type) or (None, error_msg)."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in IMAGE_EXTENSIONS:
+        return None, f"Not an image file: {file_path}"
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError as e:
+        return None, f"Cannot read file: {e}"
+    if file_size > IMAGE_MAX_SIZE:
+        return None, f"Image too large ({file_size // 1_000_000}MB, max 10MB)"
+    if file_size == 0:
+        return None, "Image file is empty"
+    media_type = _MEDIA_TYPES.get(ext, "application/octet-stream")
+    try:
+        with open(file_path, "rb") as f:
+            data = base64.b64encode(f.read()).decode("ascii")
+        return (data, media_type), None
+    except Exception as e:
+        return None, f"Error reading image: {e}"
+
+
+def _clipboard_image_to_file():
+    """Save clipboard image to a temp file (macOS only). Returns file path or None."""
+    if platform.system() != "Darwin":
+        return None
+    try:
+        # Check if clipboard has image data
+        result = subprocess.run(
+            ["osascript", "-e", "clipboard info"],
+            capture_output=True, text=True, timeout=5
+        )
+        has_image = any(x in result.stdout for x in ["PNGf", "TIFF", "public.png", "public.tiff"])
+        if not has_image:
+            return None
+        # Save clipboard image as PNG
+        tmp_path = os.path.join(tempfile.gettempdir(), f"eve-clipboard-{uuid.uuid4().hex[:8]}.png")
+        subprocess.run(
+            ["osascript", "-e",
+             f'set fp to POSIX file "{tmp_path}"\n'
+             'set imgData to the clipboard as «class PNGf»\n'
+             'set fh to open for access fp with write permission\n'
+             'write imgData to fh\n'
+             'close access fh'],
+            capture_output=True, text=True, timeout=10
+        )
+        if os.path.isfile(tmp_path) and os.path.getsize(tmp_path) > 0:
+            return tmp_path
+        return None
+    except Exception:
+        return None
+
+
+def _build_multimodal_content(text, image_data_list):
+    """Build OpenAI-compatible multipart content with text and images.
+    image_data_list: list of (base64_data, media_type) tuples.
+    Returns a list suitable for message content field."""
+    parts = []
+    if text.strip():
+        parts.append({"type": "text", "text": text})
+    for b64_data, media_type in image_data_list:
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{media_type};base64,{b64_data}"}
+        })
+    return parts if len(parts) > 1 or not text.strip() else text
+
+
 class ReadTool(Tool):
     name = "Read"
     description = "Read a file from the filesystem. Returns content with line numbers. Can also read image files (PNG, JPG, etc.) for multimodal models."
@@ -6628,6 +6727,8 @@ class TUI:
   {_c198}/init{C.RESET}              Create CLAUDE.md template
   {_c198}/yes{C.RESET}               Auto-approve ON
   {_c198}/no{C.RESET}                Auto-approve OFF
+  {_c198}/image{C.RESET}             Attach image from clipboard
+  {_c198}/image{C.RESET} <path>      Attach image file
   {_c198}/debug{C.RESET}             Toggle debug mode
   {_c198}/debug-scroll{C.RESET}      Test scroll region (DECSTBM)
   {_c198}/resume{C.RESET}            Switch to a different session
@@ -6763,8 +6864,16 @@ class Agent:
                 return tasks
         return []
 
+    def _run_without_add(self, user_input):
+        """Run agent loop without adding user message (already added by caller)."""
+        self._run_impl(user_input, skip_add=True)
+
     def run(self, user_input):
         """Run the agent loop for a single user request."""
+        self._run_impl(user_input, skip_add=False)
+
+    def _run_impl(self, user_input, skip_add=False):
+        """Internal agent loop implementation."""
         _p = self.tui._scroll_print  # scroll-region-safe print
 
         # Auto-parallel detection: if user asks multiple independent tasks, run them in parallel
@@ -6775,7 +6884,8 @@ class Agent:
             if len(parallel_tasks) >= 2:
                 pa_tool = self.registry.get("ParallelAgents")
                 if pa_tool:
-                    self.session.add_user_message(user_input)
+                    if not skip_add:
+                        self.session.add_user_message(user_input)
                     tasks_payload = [{"prompt": t, "max_turns": 10} for t in parallel_tasks]
                     _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}⚡ Auto-detected {len(parallel_tasks)} parallel tasks{C.RESET}")
                     result = pa_tool.execute({"tasks": tasks_payload})
@@ -6798,7 +6908,8 @@ class Agent:
             except Exception as e:
                 if self.config.debug:
                     print(f"{C.DIM}[debug] RAG query failed: {e}{C.RESET}", file=sys.stderr)
-        self.session.add_user_message(user_input)
+        if not skip_add:
+            self.session.add_user_message(user_input)
         self._interrupted.clear()
         _recent_tool_calls = []  # track recent calls for loop detection
         _empty_retries = 0     # cap empty response retries
@@ -8102,6 +8213,52 @@ def main():
                             print(f"{C.RED}Undo failed: {e}{C.RESET}")
                     continue
 
+                elif cmd == "/image":
+                    parts = user_input.split(None, 1)
+                    if len(parts) > 1:
+                        # /image <path> — attach specific file
+                        img_path = parts[1].strip().strip("'\"")
+                        if img_path.startswith("file://"):
+                            img_path = urllib.parse.unquote(img_path[7:])
+                        result, err = _read_image_as_base64(img_path)
+                        if err:
+                            print(f"{C.RED}{err}{C.RESET}")
+                            continue
+                        b64_data, media_type = result
+                        if not hasattr(session, '_pending_images'):
+                            session._pending_images = []
+                        session._pending_images.append((b64_data, media_type))
+                        fname = os.path.basename(img_path)
+                        print(f"  {C.GREEN}📎 Image attached: {fname}{C.RESET}")
+                        print(f"  {C.DIM}Type your message and press Enter to send with image.{C.RESET}")
+                    else:
+                        # /image — paste from clipboard
+                        print(f"  {C.DIM}Checking clipboard for image...{C.RESET}")
+                        tmp_path = _clipboard_image_to_file()
+                        if tmp_path:
+                            result, err = _read_image_as_base64(tmp_path)
+                            if err:
+                                print(f"{C.RED}{err}{C.RESET}")
+                                try:
+                                    os.unlink(tmp_path)
+                                except OSError:
+                                    pass
+                                continue
+                            b64_data, media_type = result
+                            if not hasattr(session, '_pending_images'):
+                                session._pending_images = []
+                            session._pending_images.append((b64_data, media_type))
+                            print(f"  {C.GREEN}📎 Clipboard image attached{C.RESET}")
+                            print(f"  {C.DIM}Type your message and press Enter to send with image.{C.RESET}")
+                            try:
+                                os.unlink(tmp_path)
+                            except OSError:
+                                pass
+                        else:
+                            print(f"{C.YELLOW}No image found in clipboard.{C.RESET}")
+                            print(f"{C.DIM}Usage: /image <path>  or  copy an image to clipboard first{C.RESET}")
+                    continue
+
                 elif cmd == "/init":
                     claude_md = os.path.join(os.getcwd(), "CLAUDE.md")
                     if os.path.exists(claude_md):
@@ -8161,7 +8318,7 @@ def main():
                                  "/tokens", "/commit", "/diff", "/git", "/plan",
                                  "/approve", "/act", "/execute", "/undo", "/init",
                                  "/config", "/debug", "/debug-scroll", "/checkpoint",
-                                 "/rollback", "/autotest", "/skills"]
+                                 "/rollback", "/autotest", "/skills", "/image"]
                     _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                     if not _close:
                         _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []
@@ -8171,8 +8328,40 @@ def main():
                         print(f"{C.YELLOW}Unknown command. Type /help for available commands.{C.RESET}")
                     continue
 
-            # Run agent
-            agent.run(user_input)
+            # Detect dragged-and-dropped image paths in user input
+            cleaned_input, dropped_images = _extract_image_paths(user_input)
+            _images_for_msg = []
+            for img_path in dropped_images:
+                result, err = _read_image_as_base64(img_path)
+                if err:
+                    print(f"{C.YELLOW}Image skipped: {err}{C.RESET}")
+                else:
+                    _images_for_msg.append(result)
+                    print(f"  {C.GREEN}📎 {os.path.basename(img_path)}{C.RESET}")
+
+            # Add pending images from /image command
+            if hasattr(session, '_pending_images') and session._pending_images:
+                _images_for_msg.extend(session._pending_images)
+                session._pending_images = []
+
+            # Build multimodal message if images are present
+            if _images_for_msg:
+                text = cleaned_input if dropped_images else user_input
+                if not text.strip():
+                    text = "この画像について説明してください。"
+                user_input = text
+                # Temporarily override add_user_message to send multimodal content
+                content = _build_multimodal_content(text, _images_for_msg)
+                n_imgs = len(_images_for_msg)
+                print(f"  {C.DIM}Sending with {n_imgs} image{'s' if n_imgs > 1 else ''}...{C.RESET}")
+                session.messages.append({"role": "user", "content": content})
+                session._token_estimate += session._estimate_tokens(text) + n_imgs * 1000
+                session._enforce_max_messages()
+                # Run agent without adding user message again
+                agent._run_without_add(user_input)
+            else:
+                # Run agent normally
+                agent.run(user_input)
             # Capture type-ahead for next prompt (text typed during execution)
             _typeahead_text = agent.get_typeahead()
             if _typeahead_text:
