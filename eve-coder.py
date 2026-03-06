@@ -5938,13 +5938,202 @@ class TUI:
         else:
             print(f"{C.DIM}{'·' * sep_w}{C.RESET}")
 
-    def get_input(self, session=None, plan_mode=False, prefill=""):
-        """Get user input with full readline support.
+    def _build_prompt_str(self, session=None, plan_mode=False, for_readline=False):
+        """Build the prompt string. If for_readline=True, wrap ANSI codes for readline."""
+        _wrap = _rl_ansi if for_readline else _ansi
+        _reset = _wrap(C.RESET if C._enabled else "")
+        plan_tag = f"{_wrap(chr(27)+'[38;5;226m')}[PLAN]{_reset} " if plan_mode else ""
+        if session:
+            pct = min(int((session.get_token_estimate() / session.config.context_window) * 100), 100)
+            if pct < 50:
+                ctx_color = _wrap("\033[38;5;240m")
+            elif pct < 80:
+                ctx_color = _wrap("\033[38;5;226m")
+            else:
+                ctx_color = _wrap("\033[38;5;196m")
+            return f"{plan_tag}{ctx_color}ctx:{pct}%{_reset} {_wrap(chr(27)+'[38;5;51m')}❯{_reset} "
+        else:
+            return f"{plan_tag}{_wrap(chr(27)+'[38;5;51m')}❯{_reset} "
 
-        Always uses standard input() for readline features (history, cursor
-        movement, Ctrl+A/E, tab completion). Mode switching is done via
-        /plan and /approve commands.
+    def _raw_input_with_shift_enter(self, prompt_str):
+        """Read input using termios, treating Shift+Enter as newline and Enter as submit.
+        Returns the input string (may contain \\n for Shift+Enter newlines).
+        Falls back to input() if termios is unavailable or stdin is not a TTY."""
+        if not HAS_TERMIOS or not sys.stdin.isatty():
+            return None  # signal caller to fall back to input()
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            # Print prompt (raw mode needs explicit \r\n handling)
+            sys.stdout.write(prompt_str)
+            sys.stdout.flush()
+
+            buf = []           # current line characters
+            lines = []         # completed lines (from Shift+Enter)
+            esc_buf = b""      # escape sequence accumulator
+            in_esc = False
+
+            while True:
+                ch = os.read(fd, 1)
+                if not ch:
+                    break
+
+                if in_esc:
+                    esc_buf += ch
+                    # Check if we have a complete CSI sequence
+                    if len(esc_buf) >= 2 and esc_buf[0:1] == b'[':
+                        # CSI sequence ends with a letter or ~
+                        if ch.isalpha() or ch == b'~':
+                            seq = esc_buf.decode('utf-8', errors='replace')
+                            if seq == '[27;2;13~':
+                                # Shift+Enter: insert newline, continue editing
+                                lines.append("".join(buf))
+                                buf = []
+                                sys.stdout.write("\r\n")
+                                # Show continuation prompt
+                                cont_prompt = f"{C.DIM}...{C.RESET} " if C._enabled else "... "
+                                sys.stdout.write(cont_prompt)
+                                sys.stdout.flush()
+                            elif seq in ('[A', '[B', '[C', '[D'):
+                                # Arrow keys — basic handling
+                                if seq == '[C' and buf:  # right (ignore for simplicity)
+                                    pass
+                                elif seq == '[D' and buf:  # left (ignore for simplicity)
+                                    pass
+                                # For up/down, ignore in raw mode
+                            elif seq == '[H':
+                                # Home key
+                                pass
+                            elif seq == '[F':
+                                # End key
+                                pass
+                            elif seq == '[3~':
+                                # Delete key
+                                pass
+                            # else: ignore unknown CSI sequence
+                            in_esc = False
+                            esc_buf = b""
+                            continue
+                        # Still accumulating — continue
+                        if len(esc_buf) > 20:
+                            # Too long, bail out
+                            in_esc = False
+                            esc_buf = b""
+                        continue
+                    elif len(esc_buf) == 1 and esc_buf[0:1] != b'[':
+                        # Alt+key (ESC followed by non-[) — ignore
+                        in_esc = False
+                        esc_buf = b""
+                        continue
+                    continue
+
+                b = ch[0]
+
+                if b == 0x1b:  # ESC
+                    in_esc = True
+                    esc_buf = b""
+                    continue
+
+                if b == 0x0d or b == 0x0a:  # Enter (CR or LF) — submit
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    lines.append("".join(buf))
+                    return "\n".join(lines)
+
+                if b == 0x03:  # Ctrl+C
+                    sys.stdout.write("^C\r\n")
+                    sys.stdout.flush()
+                    raise KeyboardInterrupt
+
+                if b == 0x04:  # Ctrl+D
+                    if not buf and not lines:
+                        sys.stdout.write("\r\n")
+                        sys.stdout.flush()
+                        raise EOFError
+                    # Ctrl+D with content — submit like Enter
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    lines.append("".join(buf))
+                    return "\n".join(lines)
+
+                if b in (0x7f, 0x08):  # Backspace / DEL
+                    if buf:
+                        ch_removed = buf.pop()
+                        # Handle wide chars (CJK)
+                        w = _char_display_width(ch_removed)
+                        sys.stdout.write("\b" * w + " " * w + "\b" * w)
+                        sys.stdout.flush()
+                    continue
+
+                if b == 0x15:  # Ctrl+U — clear line
+                    if buf:
+                        disp_w = sum(_char_display_width(c) for c in buf)
+                        sys.stdout.write("\b" * disp_w + " " * disp_w + "\b" * disp_w)
+                        sys.stdout.flush()
+                        buf = []
+                    continue
+
+                if b == 0x17:  # Ctrl+W — delete word
+                    while buf and buf[-1] == ' ':
+                        buf.pop()
+                        sys.stdout.write("\b \b")
+                    while buf and buf[-1] != ' ':
+                        ch_removed = buf.pop()
+                        w = _char_display_width(ch_removed)
+                        sys.stdout.write("\b" * w + " " * w + "\b" * w)
+                    sys.stdout.flush()
+                    continue
+
+                if b < 0x20 and b not in (0x09,):  # Other control chars — ignore
+                    continue
+
+                # Regular character (may be multi-byte UTF-8)
+                try:
+                    if b >= 0x80:
+                        # Multi-byte UTF-8: read remaining bytes
+                        remaining = b""
+                        if b & 0xE0 == 0xC0:
+                            remaining = os.read(fd, 1)
+                        elif b & 0xF0 == 0xE0:
+                            remaining = os.read(fd, 2)
+                        elif b & 0xF8 == 0xF0:
+                            remaining = os.read(fd, 3)
+                        char = (ch + remaining).decode('utf-8')
+                    else:
+                        char = chr(b)
+                    buf.append(char)
+                    sys.stdout.write(char)
+                    sys.stdout.flush()
+                except (UnicodeDecodeError, OSError):
+                    pass
+
+            lines.append("".join(buf))
+            return "\n".join(lines)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def get_input(self, session=None, plan_mode=False, prefill=""):
+        """Get user input. Supports Shift+Enter for newline, Enter to submit.
+
+        Uses termios raw input on supported systems (macOS/Linux) to properly
+        handle Shift+Enter. Falls back to standard input() on Windows or when
+        stdin is not a TTY.
         """
+        # Try raw input first (handles Shift+Enter properly)
+        if HAS_TERMIOS and sys.stdin.isatty() and not prefill:
+            try:
+                prompt_str = self._build_prompt_str(session=session, plan_mode=plan_mode, for_readline=False)
+                result = self._raw_input_with_shift_enter(prompt_str)
+                if result is not None:
+                    # Add to readline history for up-arrow recall
+                    if HAS_READLINE and result.strip():
+                        readline.add_history(result.replace("\n", " "))
+                    return result
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return None
 
         # Fallback: standard input() with readline
         try:
@@ -5954,36 +6143,12 @@ class TUI:
                     readline.redisplay()
                 readline.set_startup_hook(_hook)
 
-            _rl_reset = _rl_ansi(C.RESET if C._enabled else "")
-            plan_tag = f"{_rl_ansi(chr(27)+'[38;5;226m')}[PLAN]{_rl_reset} " if plan_mode else ""
-            if session:
-                pct = min(int((session.get_token_estimate() / session.config.context_window) * 100), 100)
-                if pct < 50:
-                    ctx_color = _rl_ansi("\033[38;5;240m")
-                elif pct < 80:
-                    ctx_color = _rl_ansi("\033[38;5;226m")
-                else:
-                    ctx_color = _rl_ansi("\033[38;5;196m")
-                prompt_str = f"{plan_tag}{ctx_color}ctx:{pct}%{_rl_reset} {_rl_ansi(chr(27)+'[38;5;51m')}❯{_rl_reset} "
-            else:
-                prompt_str = f"{plan_tag}{_rl_ansi(chr(27)+'[38;5;51m')}❯{_rl_reset} "
+            prompt_str = self._build_prompt_str(session=session, plan_mode=plan_mode, for_readline=True)
             line = input(prompt_str)
-            # Clean up leaked Shift+Enter escape sequences.
-            # libedit (macOS) cannot bind long CSI sequences like \e[27;2;13~.
-            # It consumes \e[2 and leaks "7;2;13~" as literal text.
-            # Also handle variations: full sequence, partial leak, repeated.
+            # Clean up leaked Shift+Enter escape sequences
             import re
-            line = line.replace("\x1b[27;2;13~", "\n")
             line = re.sub(r'(?:\x1b\[)?27;2;13~', '\n', line)
             line = re.sub(r'7;2;13~', '\n', line)
-            # If cleanup produced newlines, redraw the prompt line to hide garbage
-            if "\n" in line:
-                # Move cursor up and clear the garbled display line
-                parts = [p for p in line.split("\n") if p.strip()]
-                if parts:
-                    # Reprint cleaned input
-                    sys.stdout.write(f"\r\033[K")
-                    sys.stdout.flush()
             return line
         except (EOFError, KeyboardInterrupt):
             print()
