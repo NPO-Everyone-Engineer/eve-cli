@@ -1476,6 +1476,39 @@ class OllamaClient:
             self._supports_tool_streaming = False
             return False
 
+    def check_vision_support(self, model):
+        """Check if a model supports vision/images via /api/show.
+        Returns True if vision is likely supported, False otherwise."""
+        try:
+            body = json.dumps({"name": model}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.base_url}/api/show",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=10)
+            try:
+                data = json.loads(resp.read(100 * 1024))
+            finally:
+                resp.close()
+            # Check modelfile/template for vision indicators
+            modelfile = data.get("modelfile", "") + data.get("template", "")
+            details = data.get("details", {})
+            families = details.get("families", [])
+            # Known vision model families / projector indicators
+            if any(f in families for f in ["clip", "mllama"]):
+                return True
+            if "vision" in model.lower() or "llava" in model.lower():
+                return True
+            # Check parameters/template for image token
+            template = data.get("template", "")
+            if "image" in template.lower() or ".image" in template:
+                return True
+            return False
+        except Exception:
+            return True  # Assume yes if check fails (don't block user)
+
     def check_model(self, model_name, available_models=None):
         """Check if a specific model is available (exact or tag match).
         If available_models is provided, skip redundant check_connection() call."""
@@ -8359,6 +8392,16 @@ def main():
                 if not text.strip():
                     text = "この画像について説明してください。"
                 user_input = text
+                # Check if model supports vision
+                _model_name = config.model or ""
+                if not hasattr(session, '_vision_warned'):
+                    session._vision_warned = False
+                if not session._vision_warned and _model_name:
+                    _has_vision = client.check_vision_support(_model_name)
+                    if not _has_vision:
+                        print(f"  {C.YELLOW}⚠️  モデル '{_model_name}' はビジョン(画像認識)非対応の可能性があります。{C.RESET}")
+                        print(f"  {C.DIM}ビジョン対応モデル例: llava, llama3.2-vision, gemma3 等{C.RESET}")
+                        session._vision_warned = True
                 # Temporarily override add_user_message to send multimodal content
                 content = _build_multimodal_content(text, _images_for_msg)
                 n_imgs = len(_images_for_msg)
