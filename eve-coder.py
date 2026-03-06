@@ -46,11 +46,14 @@ import concurrent.futures
 try:
     import readline
     HAS_READLINE = True
-    # Bind Shift+Enter (CSI 27;2;13~) to insert a newline instead of
-    # leaking the raw escape sequence into the input buffer.
-    # The sequence is: ESC [ 2 7 ; 2 ; 1 3 ~
+    # Detect libedit vs GNU readline
+    _is_libedit = 'libedit' in (readline.__doc__ or '')
+    # Bind Shift+Enter (CSI 27;2;13~) to prevent raw escape sequence leak.
     try:
-        readline.parse_and_bind(r'"\e[27;2;13~": "\n"')
+        if _is_libedit:
+            readline.parse_and_bind("bind -s '\\e[27;2;13~' '\\n'")
+        else:
+            readline.parse_and_bind(r'"\e[27;2;13~": "\n"')
     except Exception:
         pass
 except ImportError:
@@ -5965,10 +5968,22 @@ class TUI:
             else:
                 prompt_str = f"{plan_tag}{_rl_ansi(chr(27)+'[38;5;51m')}❯{_rl_reset} "
             line = input(prompt_str)
-            # Clean up leaked Shift+Enter escape sequences (CSI 27;2;13~)
-            # that some terminals emit and readline may not fully absorb.
+            # Clean up leaked Shift+Enter escape sequences.
+            # libedit (macOS) cannot bind long CSI sequences like \e[27;2;13~.
+            # It consumes \e[2 and leaks "7;2;13~" as literal text.
+            # Also handle variations: full sequence, partial leak, repeated.
+            import re
             line = line.replace("\x1b[27;2;13~", "\n")
-            line = line.replace("7;2;13~", "\n")
+            line = re.sub(r'(?:\x1b\[)?27;2;13~', '\n', line)
+            line = re.sub(r'7;2;13~', '\n', line)
+            # If cleanup produced newlines, redraw the prompt line to hide garbage
+            if "\n" in line:
+                # Move cursor up and clear the garbled display line
+                parts = [p for p in line.split("\n") if p.strip()]
+                if parts:
+                    # Reprint cleaned input
+                    sys.stdout.write(f"\r\033[K")
+                    sys.stdout.flush()
             return line
         except (EOFError, KeyboardInterrupt):
             print()
