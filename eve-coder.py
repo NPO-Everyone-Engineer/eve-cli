@@ -46,6 +46,13 @@ import concurrent.futures
 try:
     import readline
     HAS_READLINE = True
+    # Bind Shift+Enter (CSI 27;2;13~) to insert a newline instead of
+    # leaking the raw escape sequence into the input buffer.
+    # The sequence is: ESC [ 2 7 ; 2 ; 1 3 ~
+    try:
+        readline.parse_and_bind(r'"\e[27;2;13~": "\n"')
+    except Exception:
+        pass
 except ImportError:
     HAS_READLINE = False
 
@@ -5958,6 +5965,10 @@ class TUI:
             else:
                 prompt_str = f"{plan_tag}{_rl_ansi(chr(27)+'[38;5;51m')}❯{_rl_reset} "
             line = input(prompt_str)
+            # Clean up leaked Shift+Enter escape sequences (CSI 27;2;13~)
+            # that some terminals emit and readline may not fully absorb.
+            line = line.replace("\x1b[27;2;13~", "\n")
+            line = line.replace("7;2;13~", "\n")
             return line
         except (EOFError, KeyboardInterrupt):
             print()
@@ -5980,6 +5991,27 @@ class TUI:
             first_line = self.get_input(session=session, plan_mode=plan_mode, prefill=prefill)
             if first_line is None:
                 return None
+            # If Shift+Enter produced newlines in the first line, treat as multiline
+            if "\n" in first_line:
+                lines = first_line.split("\n")
+                print(f"{C.DIM}  (multiline detected — enter empty line to send, \"\"\" to end){C.RESET}")
+                while True:
+                    try:
+                        cont = input(f"{C.DIM}...{C.RESET} ")
+                        cont = cont.replace("\x1b[27;2;13~", "\n").replace("7;2;13~", "\n")
+                        if cont.strip() == "":
+                            break
+                        if cont.strip() == '"""':
+                            break
+                        if "\n" in cont:
+                            lines.extend(cont.split("\n"))
+                        else:
+                            lines.append(cont)
+                    except (EOFError, KeyboardInterrupt):
+                        print(f"\n{C.DIM}(Cancelled){C.RESET}")
+                        return None
+                return "\n".join(lines)
+
             if first_line.strip() == '"""':
                 # Explicit multi-line mode
                 lines = []
