@@ -14,47 +14,55 @@
 - **Gitチェックポイント**: stashベースのロールバック機能
 - **日本語対応**: 日本語・英語・中国語に対応
 
-## クイックスタート
+## インストール
+
+### ワンライナー（推奨）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main/install.sh | bash
+```
+
+これだけで Python・Ollama の確認、モデルのダウンロード、`eve-cli` コマンドのセットアップが自動で行われます。
+
+### 手動インストール
+
+```bash
+# リポジトリをクローン
+git clone https://github.com/NPO-Everyone-Engineer/eve-cli.git
+cd eve-cli
+
+# 実行権限を付与
+chmod +x eve-coder.py eve-cli.sh
+
+# パスに追加
+ln -s $(pwd)/eve-cli.sh /usr/local/bin/eve-cli
+```
 
 ### 前提条件
 
 - Python 3.8+
 - [Ollama](https://ollama.com/) がインストール・起動済み
 
-### インストール
-
-```bash
-# リポジトリをクローン
-git clone https://github.com/EvECLI/eve-cli.git
-cd eve-cli
-
-# 実行権限を付与
-chmod +x eve-coder.py eve-cli.sh
-
-# （オプション）パスに追加
-ln -s $(pwd)/eve-cli.sh /usr/local/bin/eve-cli
-```
-
-### 使い方
+## 使い方
 
 ```bash
 # 対話モード
-python3 eve-coder.py
+eve-cli
 
 # ワンショット
-python3 eve-coder.py -p "Hello Worldを作って"
+eve-cli -p "Hello Worldを作って"
 
 # ローカルモデル指定
-python3 eve-coder.py --model qwen3:8b
+eve-cli --model qwen3:8b
 
 # クラウドモデル指定（Ollama有料版）
-python3 eve-coder.py --model minimax-m2.5:cloud
+eve-cli --model minimax-m2.5:cloud
 
 # 自動許可モード
-python3 eve-coder.py -y
+eve-cli -y
 
 # セッション再開
-python3 eve-coder.py --resume
+eve-cli --resume
 ```
 
 ### インタラクティブコマンド

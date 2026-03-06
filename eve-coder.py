@@ -3390,7 +3390,7 @@ class WebFetchTool(Tool):
             # Encode non-ASCII characters in URL path/query (e.g. Japanese search terms)
             url = urllib.parse.quote(url, safe=':/?#[]@!$&\'()*+,;=-._~%')
             req = urllib.request.Request(url, headers={
-                "User-Agent": f"eve-cli/{__version__} (+https://github.com/EvECLI/eve-cli)",
+                "User-Agent": f"eve-cli/{__version__} (+https://github.com/NPO-Everyone-Engineer/eve-cli)",
             })
             resp = opener.open(req, timeout=30)
             try:
@@ -3504,7 +3504,7 @@ class WebSearchTool(Tool):
             _accept_lang = "ko,en;q=0.9"
         search_url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query) + _ddg_locale
         req = urllib.request.Request(search_url, headers={
-            "User-Agent": f"eve-cli/{__version__} (+https://github.com/EvECLI/eve-cli)",
+            "User-Agent": f"eve-cli/{__version__} (+https://github.com/NPO-Everyone-Engineer/eve-cli)",
             "Accept-Language": _accept_lang,
         })
         try:
