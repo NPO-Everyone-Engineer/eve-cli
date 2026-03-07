@@ -725,6 +725,12 @@ class Config:
         self.session_id = None
         self.list_sessions = False
         self.cwd = os.getcwd()
+        # Profile / network
+        self.profile = "auto"       # "auto", "online", "offline", or user-defined name
+        self.network_status = None  # "online" or "offline" (detected at startup)
+        self._profiles = {}         # profile_name -> {key: value} from config file
+        self._cli_model_set = False # True if --model was passed on CLI
+
         # RAG options
         self.rag = False
         self.rag_mode = "query"
@@ -757,6 +763,8 @@ class Config:
         self._load_config_file()
         self._load_env()
         self._load_cli_args(argv)
+        self._detect_network()
+        self._apply_profile()
         self._auto_detect_model()
         self._validate_ollama_host()
         self._ensure_dirs()
@@ -781,22 +789,43 @@ class Config:
 
     def _parse_config_file(self, cfg_path):
         try:
+            current_section = None  # None = global, "profile:xxx" = profile section
             with open(cfg_path, encoding="utf-8-sig") as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith("#"):
+                        continue
+                    # Section headers: [profile:online], [profile:offline], [profile:myname]
+                    if line.startswith("[") and line.endswith("]"):
+                        header = line[1:-1].strip()
+                        if header.startswith("profile:"):
+                            current_section = header  # "profile:online"
+                            prof_name = header.split(":", 1)[1].strip()
+                            if prof_name and prof_name not in self._profiles:
+                                self._profiles[prof_name] = {}
+                        else:
+                            current_section = None
                         continue
                     if "=" not in line:
                         continue
                     key, val = line.split("=", 1)
                     key = key.strip()
                     val = val.strip().strip("\"'")
+                    # Store in profile section if inside one
+                    if current_section and current_section.startswith("profile:"):
+                        prof_name = current_section.split(":", 1)[1].strip()
+                        if prof_name:
+                            self._profiles.setdefault(prof_name, {})[key] = val
+                        continue
+                    # Global section
                     if key == "MODEL" and val:
                         self.model = val
                     elif key == "SIDECAR_MODEL" and val:
                         self.sidecar_model = val
                     elif key == "OLLAMA_HOST" and val:
                         self.ollama_host = val
+                    elif key == "PROFILE" and val:
+                        self.profile = val
                     elif key == "MAX_TOKENS" and val:
                         try:
                             self.max_tokens = int(val)
@@ -827,6 +856,8 @@ class Config:
             self.sidecar_model = os.environ["EVE_CODER_SIDECAR"]
         if os.environ.get("EVE_CLI_SIDECAR_MODEL"):
             self.sidecar_model = os.environ["EVE_CLI_SIDECAR_MODEL"]
+        if os.environ.get("EVE_CLI_PROFILE"):
+            self.profile = os.environ["EVE_CLI_PROFILE"]
         if os.environ.get("EVE_CODER_DEBUG") == "1" or os.environ.get("EVE_CLI_DEBUG") == "1":
             self.debug = True
 
@@ -863,6 +894,7 @@ class Config:
         parser.add_argument("--temperature", type=float, help="Sampling temperature")
         parser.add_argument("--context-window", type=int, help="Context window size")
         parser.add_argument("--version", action="version", version=f"eve-coder {__version__}")
+        parser.add_argument("--profile", help="Connection profile: auto, online, offline, or custom name")
         parser.add_argument("--dangerously-skip-permissions", action="store_true",
                             help="Alias for -y (compatibility)")
         # RAG options
@@ -882,6 +914,7 @@ class Config:
             self.prompt = args.prompt
         if args.model:
             self.model = args.model
+            self._cli_model_set = True
         if args.yes or args.dangerously_skip_permissions:
             self.yes_mode = True
         if args.debug:
@@ -901,6 +934,8 @@ class Config:
             self.temperature = args.temperature
         if args.context_window is not None:
             self.context_window = args.context_window
+        if args.profile:
+            self.profile = args.profile
         # RAG args
         if args.rag:
             self.rag = True
@@ -1001,10 +1036,61 @@ class Config:
     # Sidecar candidates (fast + small, used for context compaction)
     _SIDECAR_CANDIDATES = ["qwen3:8b", "qwen3:4b", "qwen3:1.7b", "llama3.2:3b"]
 
+    def _detect_network(self):
+        """Detect network connectivity and set network_status."""
+        if self.profile == "offline":
+            self.network_status = "offline"
+            return
+        if self.profile == "online":
+            self.network_status = "online"
+            return
+        # Auto or custom profile: actually check connectivity
+        self.network_status = "online" if _check_internet(timeout=2) else "offline"
+
+    def _apply_profile(self):
+        """Apply profile settings over current config.
+        For 'auto' profile, selects 'online' or 'offline' profile based on network_status.
+        For named profiles, applies that profile's settings directly."""
+        if self.profile == "auto":
+            # Auto mode: pick online/offline profile based on detected network
+            prof_name = self.network_status or "offline"
+        elif self.profile in ("online", "offline"):
+            prof_name = self.profile
+        else:
+            # Custom named profile
+            prof_name = self.profile
+        prof = self._profiles.get(prof_name, {})
+        if not prof:
+            return
+        # Apply profile settings (only override if not already set by CLI args)
+        if prof.get("MODEL") and not self._cli_model_set:
+            self.model = prof["MODEL"]
+        if prof.get("SIDECAR_MODEL") and not self._cli_model_set:
+            self.sidecar_model = prof["SIDECAR_MODEL"]
+        if prof.get("OLLAMA_HOST"):
+            self.ollama_host = prof["OLLAMA_HOST"]
+        if prof.get("MAX_TOKENS"):
+            try:
+                self.max_tokens = int(prof["MAX_TOKENS"])
+            except ValueError:
+                pass
+        if prof.get("TEMPERATURE"):
+            try:
+                self.temperature = float(prof["TEMPERATURE"])
+            except ValueError:
+                pass
+        if prof.get("CONTEXT_WINDOW"):
+            try:
+                self.context_window = int(prof["CONTEXT_WINDOW"])
+            except ValueError:
+                pass
+
     def _auto_detect_model(self):
         if self.model:
             # Set appropriate context window for known models
             self._apply_context_window(self.model)
+            # Safety: if offline and model is cloud-only, warn but don't override
+            # (user explicitly chose this model)
             return
         ram_gb = _get_ram_gb()
         # On non-macOS, also consider GPU VRAM for model selection
@@ -1049,10 +1135,15 @@ class Config:
             return []
 
     def _pick_best_model(self, installed, ram_gb):
-        """Pick the best installed model that fits in RAM, using tier ranking."""
+        """Pick the best installed model that fits in RAM, using tier ranking.
+        When offline, cloud models are skipped."""
         installed_set = set(installed)
+        is_offline = self.network_status == "offline"
         for model_name, min_ram, _tier in self.MODEL_TIERS:
             if ram_gb < min_ram:
+                continue
+            # Skip cloud models when offline
+            if is_offline and _is_cloud_model(model_name):
                 continue
             # Exact match (e.g. "qwen3:235b" in {"qwen3:235b", ...})
             if model_name in installed_set:
@@ -1166,6 +1257,38 @@ class Config:
                 shutil.copy2(old_history, self.history_file)
             except (OSError, shutil.Error):
                 pass
+
+
+def _check_internet(timeout=3):
+    """Check internet connectivity by attempting DNS resolution + HTTP HEAD.
+    Returns True if internet is reachable, False otherwise."""
+    # Fast check: DNS resolution for a reliable host
+    import socket
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.getaddrinfo("dns.google", 443)
+    except (socket.gaierror, socket.timeout, OSError):
+        return False
+    # Confirm with a lightweight HTTP request
+    try:
+        req = urllib.request.Request("https://dns.google/resolve?name=example.com",
+                                     method="HEAD")
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        resp.close()
+        return True
+    except Exception:
+        # DNS resolved but HTTP failed — still considered online
+        # (some networks block specific endpoints but allow Ollama cloud)
+        return True
+
+
+def _is_cloud_model(model_name):
+    """Check if a model name indicates a cloud model.
+    Convention: model names containing ':cloud', '-cloud', or ':*-cloud'."""
+    if not model_name:
+        return False
+    lower = model_name.lower()
+    return ":cloud" in lower or "-cloud" in lower
 
 
 def _get_ram_gb():
@@ -6324,6 +6447,15 @@ class TUI:
                 _sc_tier_str = " %s[Tier %s]%s" % (_ansi(chr(27) + "[38;5;%sm" % _sc_tc), _sc_tier, C.RESET)
             print(f"  🔄 {info_dim}Sidecar{C.RESET} {info_bright}{config.sidecar_model}{C.RESET}{_sc_tier_str}")
         print(f"  🔒 {info_dim}Mode{C.RESET}   {mode_str}")
+        # Network status
+        if config.network_status == "online":
+            _net_color = _ansi(chr(27)+"[38;5;46m")
+            _net_str = f"{_net_color}● ONLINE{C.RESET}"
+        else:
+            _net_color = _ansi(chr(27)+"[38;5;208m")
+            _net_str = f"{_net_color}○ OFFLINE{C.RESET}"
+        _prof_str = f" {C.DIM}(profile: {config.profile}){C.RESET}" if config.profile != "auto" else ""
+        print(f"  🌐 {info_dim}Network{C.RESET} {_net_str}{_prof_str}")
         print(f"  🦙 {info_dim}Engine{C.RESET} {info_bright}Ollama{C.RESET} {C.DIM}({config.ollama_host}){C.RESET}")
         print(f"  💾 {info_dim}RAM{C.RESET}    {info_bright}{ram}GB{C.RESET} {C.DIM}(ctx: {config.context_window} tokens){C.RESET}")
         print(f"  📁 {info_dim}CWD{C.RESET}    {C.WHITE}{os.getcwd()}{C.RESET}")
@@ -7290,6 +7422,8 @@ class TUI:
             f"  {_c87}Messages{C.RESET}  {msgs}",
             f"  {_c87}Context{C.RESET}   [{bar}] {pct}%  ~{tokens}/{config.context_window}",
             f"  {_c87}Model{C.RESET}     {config.model}",
+            f"  {_c87}Network{C.RESET}   {'ONLINE' if config.network_status == 'online' else 'OFFLINE'}"
+            f"  (profile: {config.profile})",
             f"  {_c87}CWD{C.RESET}       {os.getcwd()}",
         ]
         if agent is not None:
@@ -7992,6 +8126,17 @@ def _exit_plan_mode(agent, session):
     _scroll_aware_print(f"  {_c46}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
 
 
+def _build_footer_status(config, pct):
+    """Build the footer status string with network indicator."""
+    if config.network_status == "online":
+        net = "\033[38;5;46m● ON\033[0m"
+    else:
+        net = "\033[38;5;208m○ OFF\033[0m"
+    return (f"\033[38;5;51m✦ Ready\033[0m "
+            f"\033[38;5;240m│\033[0m {net} "
+            f"\033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m")
+
+
 def main():
     # Parse config
     config = Config().load()
@@ -8262,7 +8407,7 @@ def main():
         # Store status BEFORE setup() so footer includes it in initial draw
         pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
         tui.scroll_region.update_status(
-            f"\033[38;5;51m✦ Ready\033[0m \033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m"
+            _build_footer_status(config, pct)
         )
         tui.scroll_region.update_hint("")
         tui.scroll_region.setup()
@@ -9065,7 +9210,7 @@ def main():
             if _scroll_mode and tui.scroll_region._active:
                 pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
                 tui.scroll_region.update_status(
-                    f"\033[38;5;51m✦ Ready\033[0m \033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m"
+                    _build_footer_status(config, pct)
                 )
                 tui.scroll_region.update_hint("")
 
@@ -9088,7 +9233,7 @@ def main():
             if _scroll_mode and tui.scroll_region._active:
                 pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
                 tui.scroll_region.update_status(
-                    f"\033[38;5;51m✦ Ready\033[0m \033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m"
+                    _build_footer_status(config, pct)
                 )
                 tui.scroll_region.update_hint("")
             continue

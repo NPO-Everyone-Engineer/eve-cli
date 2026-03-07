@@ -7,6 +7,7 @@
 ## 特徴
 
 - **ローカル + クラウド**: Ollamaのローカルモデルとクラウドモデル（`qwen3.5:397b-cloud` 等）を自由に切り替え
+- **自動プロファイル切替**: ネットワーク状態を検知し、オンライン/オフラインで最適なモデルを自動選択
 - **ゼロ依存**: Python標準ライブラリのみ、pip install不要
 - **16個の内蔵ツール**: Bash実行、ファイル操作、Web取得、サブエージェント、タスク管理など
 - **MCP統合**: JSON-RPC 2.0によるツール連携
@@ -68,6 +69,11 @@ eve-cli -y
 
 # セッション再開
 eve-cli --resume
+
+# プロファイル指定
+eve-cli --profile offline    # 常にオフラインモード
+eve-cli --profile online     # 常にオンラインモード
+eve-cli --profile cafe       # カスタムプロファイル
 ```
 
 ### 入力方法
@@ -134,6 +140,7 @@ eve-cli --resume
 |------|------|
 | `EVE_CLI_MODEL` | デフォルトモデル名 |
 | `EVE_CLI_SIDECAR_MODEL` | サイドカーモデル名 |
+| `EVE_CLI_PROFILE` | 接続プロファイル (`auto`, `online`, `offline`, カスタム名) |
 | `EVE_CLI_DEBUG` | デバッグモード (`1` で有効) |
 | `OLLAMA_HOST` | Ollamaホスト URL |
 
@@ -167,7 +174,42 @@ MODEL=qwen3:8b
 SIDECAR_MODEL=qwen3:4b
 OLLAMA_HOST=http://localhost:11434
 EVE_CLI_DEBUG=0
+
+# プロファイル: auto（デフォルト）、online、offline、カスタム名
+PROFILE=auto
 ```
+
+### プロファイル設定
+
+ネットワーク状態に応じたモデル自動切替が設定できます。起動時にインターネット接続を検知し、対応するプロファイルの設定を適用します。
+
+`~/.config/eve-cli/config` にプロファイルセクションを追加:
+
+```ini
+# デフォルト: 自動検知
+PROFILE=auto
+
+# オンライン時 → クラウドモデルを使用
+[profile:online]
+MODEL=qwen3.5:397b-cloud
+SIDECAR_MODEL=qwen3:8b
+
+# オフライン時 → ローカルモデルにフォールバック
+[profile:offline]
+MODEL=qwen3:8b
+SIDECAR_MODEL=qwen3:4b
+
+# カスタムプロファイル（例: カフェのWi-Fi環境）
+[profile:cafe]
+MODEL=qwen3:4b
+CONTEXT_WINDOW=8192
+```
+
+- `PROFILE=auto` — 起動時にネットワーク接続を自動検知し、`online` または `offline` プロファイルを選択
+- `PROFILE=online` / `PROFILE=offline` — 常に固定プロファイルを使用
+- `PROFILE=<カスタム名>` — 任意のプロファイルを使用
+- `--model` オプションはプロファイル設定より優先されます
+- フッターに `● ON` / `○ OFF` でネットワーク状態が常時表示されます
 
 ## ブラウザ操作（Playwright MCP）
 
