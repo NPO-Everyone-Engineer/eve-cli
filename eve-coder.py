@@ -5806,6 +5806,222 @@ class ParallelAgentTool(Tool):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Agent Teams
+# ════════════════════════════════════════════════════════════════════════════════
+
+class AgentTeam:
+    """Coordinates a team of agents working on a shared task list.
+
+    Lead agent: the main agent that creates and assigns tasks
+    Teammates: sub-agents that pick up and complete assigned tasks
+    Communication: via the shared _task_store
+    """
+
+    MAX_TEAMMATES = 4
+    MAX_TEAM_DURATION = 600  # 10 min hard cap
+
+    def __init__(self, config, client, registry, permissions):
+        self._config = config
+        self._client = client
+        self._registry = registry
+        self._permissions = permissions
+        self._teammates = {}   # name -> thread
+        self._results = {}     # name -> result_text
+        self._stop_event = threading.Event()
+
+    def run(self, goal, num_teammates=2, allow_writes=False):
+        """Run a team session: create tasks from goal, then dispatch teammates.
+
+        1. Use LLM to decompose the goal into tasks
+        2. Launch teammates that pick up pending tasks
+        3. Wait for all tasks to complete or timeout
+        4. Return combined results
+        """
+        num_teammates = max(1, min(num_teammates, self.MAX_TEAMMATES))
+
+        # Step 1: Decompose goal into tasks using LLM
+        with _print_lock:
+            _scroll_aware_print(
+                f"\n  {_ansi(chr(27)+'[38;5;198m')}Team Mode: {num_teammates} agents{C.RESET}")
+            _scroll_aware_print(
+                f"  {C.DIM}Goal: {goal[:100]}{'...' if len(goal) > 100 else ''}{C.RESET}")
+
+        decompose_prompt = (
+            f"Decompose this goal into {num_teammates + 1}-{num_teammates + 3} independent tasks "
+            f"that can be worked on in parallel. Output ONLY a JSON array of task objects:\n"
+            f'[{{"subject": "...", "description": "..."}}]\n\n'
+            f"Goal: {goal}"
+        )
+        try:
+            resp = self._client.chat_sync(
+                model=self._config.model,
+                messages=[
+                    {"role": "system", "content": "Output only valid JSON. No explanation."},
+                    {"role": "user", "content": decompose_prompt},
+                ],
+                tools=None,
+            )
+            content = resp.get("content", "")
+            # Extract JSON array from response
+            json_match = re.search(r'\[.*\]', content, re.DOTALL)
+            if json_match:
+                tasks_data = json.loads(json_match.group())
+            else:
+                tasks_data = json.loads(content)
+        except Exception as e:
+            return f"Failed to decompose goal: {e}"
+
+        if not isinstance(tasks_data, list) or not tasks_data:
+            return "Failed to decompose goal into tasks."
+
+        # Step 2: Create tasks in the task store
+        task_ids = []
+        with _task_store_lock:
+            for td in tasks_data[:8]:  # cap at 8 tasks
+                if not isinstance(td, dict) or not td.get("subject"):
+                    continue
+                tid = str(_task_store["next_id"])
+                _task_store["next_id"] += 1
+                _task_store["tasks"][tid] = {
+                    "id": tid,
+                    "subject": td["subject"],
+                    "description": td.get("description", td["subject"]),
+                    "activeForm": f"Working on: {td['subject']}",
+                    "status": "pending",
+                    "blocks": [],
+                    "blockedBy": [],
+                }
+                task_ids.append(tid)
+
+        if not task_ids:
+            return "No tasks created from goal decomposition."
+
+        with _print_lock:
+            _scroll_aware_print(
+                f"  {C.DIM}Created {len(task_ids)} tasks: "
+                f"{', '.join(f'#{t}' for t in task_ids)}{C.RESET}")
+
+        # Step 3: Launch teammate threads
+        self._stop_event.clear()
+        self._results.clear()
+
+        def _teammate_worker(name, teammate_idx):
+            """Teammate worker: pick up pending tasks and complete them."""
+            while not self._stop_event.is_set():
+                # Find a pending task to work on
+                task_to_work = None
+                with _task_store_lock:
+                    for tid in task_ids:
+                        t = _task_store["tasks"].get(tid)
+                        if t and t["status"] == "pending":
+                            # Check if blocked
+                            open_blockers = [
+                                b for b in t.get("blockedBy", [])
+                                if b in _task_store["tasks"] and
+                                _task_store["tasks"][b]["status"] != "completed"
+                            ]
+                            if not open_blockers:
+                                t["status"] = "in_progress"
+                                task_to_work = dict(t)
+                                break
+
+                if not task_to_work:
+                    # Check if all done
+                    with _task_store_lock:
+                        all_done = all(
+                            _task_store["tasks"].get(tid, {}).get("status") in ("completed", "deleted")
+                            for tid in task_ids
+                        )
+                    if all_done:
+                        break
+                    time.sleep(1)
+                    continue
+
+                # Execute the task
+                _tid = task_to_work["id"]
+                with _print_lock:
+                    _scroll_aware_print(
+                        f"  {_ansi(chr(27)+'[38;5;141m')}[{name}] "
+                        f"Starting task #{_tid}: {task_to_work['subject'][:60]}{C.RESET}")
+
+                sub = SubAgentTool(self._config, self._client, self._registry, self._permissions)
+                result = sub.execute({
+                    "prompt": (
+                        f"Complete this task:\n"
+                        f"Subject: {task_to_work['subject']}\n"
+                        f"Description: {task_to_work['description']}\n\n"
+                        f"Working directory: {self._config.cwd}"
+                    ),
+                    "max_turns": 15,
+                    "allow_writes": allow_writes,
+                    "_agent_label": name,
+                })
+
+                # Mark task complete
+                with _task_store_lock:
+                    t = _task_store["tasks"].get(_tid)
+                    if t:
+                        t["status"] = "completed"
+
+                self._results[f"{name}:#{_tid}"] = result
+                with _print_lock:
+                    _scroll_aware_print(
+                        f"  {_ansi(chr(27)+'[38;5;46m')}[{name}] "
+                        f"Completed task #{_tid}{C.RESET}")
+
+        threads = []
+        for i in range(num_teammates):
+            name = f"Agent-{i+1}"
+            t = threading.Thread(target=_teammate_worker, args=(name, i), daemon=True)
+            threads.append(t)
+            t.start()
+
+        # Step 4: Wait with timeout
+        team_start = time.time()
+        while time.time() - team_start < self.MAX_TEAM_DURATION:
+            alive = [t for t in threads if t.is_alive()]
+            if not alive:
+                break
+            time.sleep(2)
+            # Progress update
+            with _task_store_lock:
+                completed = sum(1 for tid in task_ids
+                              if _task_store["tasks"].get(tid, {}).get("status") == "completed")
+            elapsed = time.time() - team_start
+            if int(elapsed) % 10 == 0 and int(elapsed) > 0:
+                with _print_lock:
+                    _scroll_aware_print(
+                        f"  {C.DIM}Team progress: {completed}/{len(task_ids)} tasks, "
+                        f"{elapsed:.0f}s elapsed{C.RESET}")
+
+        self._stop_event.set()
+        for t in threads:
+            t.join(timeout=5)
+
+        # Step 5: Compile results
+        total_time = time.time() - team_start
+        output_parts = [f"Team Results ({num_teammates} agents, {total_time:.1f}s)\n"]
+
+        with _task_store_lock:
+            for tid in task_ids:
+                t = _task_store["tasks"].get(tid, {})
+                status_icon = "[done]" if t.get("status") == "completed" else "[open]"
+                output_parts.append(f"{status_icon} Task #{tid}: {t.get('subject', '?')} [{t.get('status', '?')}]")
+
+        output_parts.append("")
+        for key, result in self._results.items():
+            output_parts.append(f"--- {key} ---")
+            result_text = str(result)
+            if len(result_text) > 2000:
+                result_text = result_text[:2000] + "\n...(truncated)"
+            for line in result_text.split("\n"):
+                output_parts.append(f"| {line}")
+            output_parts.append(f"{'─' * 40}")
+
+        return "\n".join(output_parts)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Tool Registry
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -6849,6 +7065,7 @@ class TUI:
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/watch", "/skills",
                     "/browser", "/fork", "/index", "/pr", "/gh",
+                    "/team",
                 ]
                 def _completer(text, state):
                     try:
@@ -7983,6 +8200,8 @@ class TUI:
   {_c198}/skills{C.RESET}            List loaded skills
   {_c198}/hooks{C.RESET}             List loaded hooks
   {_c198}/index{C.RESET}             Code intelligence (symbols, definitions, references)
+  {_c51}━━ Teams {sep[8:]}{C.RESET}
+  {_c198}/team{C.RESET} <goal>       Launch agent team to work on goal collaboratively
   {_c51}━━ Keyboard {sep[11:]}{C.RESET}
   {_c198}Ctrl+C{C.RESET}             Stop current task
   {_c198}Ctrl+C x2{C.RESET}          Exit (within 1.5s)
