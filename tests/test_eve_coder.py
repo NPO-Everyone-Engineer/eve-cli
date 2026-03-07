@@ -357,5 +357,28 @@ class TestAutoTestRunner(unittest.TestCase):
         self.assertIn("FAILED", output)
 
 
+class TestMarkdownTableRendering(unittest.TestCase):
+    def test_render_table_wraps_long_cells_for_narrow_terminals(self):
+        rendered = []
+        table_lines = [
+            "| 項目 | 対策 |",
+            "|---|---|",
+            "| MCP (.eve-cli/mcp.json) | デフォルト無効 → 初回確認 → リポジトリごとに信頼保存（SHA-256） → コマンドallowlist |",
+            "| Hooks (.eve-cli/hooks.json) | shell=True を廃止して shlex.split + shell=False に変更 → SessionStart を停止 |",
+        ]
+
+        with mock.patch.object(eve, "_get_terminal_width", return_value=64):
+            eve.TUI._render_table(table_lines, rendered.append)
+
+        plain = [eve.TUI._ANSI_RE.sub("", line) for line in rendered]
+        self.assertTrue(plain[0].startswith("╭"))
+        self.assertTrue(plain[-1].startswith("╰"))
+        self.assertTrue(any(line.startswith("╞") for line in plain))
+        self.assertTrue(any(line.startswith("├") for line in plain))
+        self.assertTrue(any("shell=True" in line for line in plain))
+        self.assertTrue(any("SessionStart" in line for line in plain))
+        self.assertFalse(any("..." in line or "…" in line for line in plain))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

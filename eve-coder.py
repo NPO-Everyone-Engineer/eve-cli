@@ -8283,6 +8283,182 @@ class TUI:
                 i += 1
         return f"{_base}{''.join(result)}{C.RESET}"
 
+
+    @staticmethod
+    def _fit_table_widths(col_widths, term_w):
+        """Shrink table columns to fit the terminal while keeping cells readable."""
+        if not col_widths:
+            return []
+
+        widths = list(col_widths)
+        available = max(1, term_w - (len(widths) * 3 + 1))
+        min_width = 10
+        if available < len(widths) * min_width:
+            min_width = max(4, available // max(1, len(widths)))
+        min_widths = [min(width, min_width) for width in widths]
+
+        while sum(widths) > available:
+            reduced = False
+            for idx in sorted(range(len(widths)), key=lambda i: widths[i], reverse=True):
+                if widths[idx] > min_widths[idx]:
+                    widths[idx] -= 1
+                    reduced = True
+                    if sum(widths) <= available:
+                        break
+            if not reduced:
+                break
+        return widths
+
+    @staticmethod
+    def _wrap_table_cell(text, width):
+        """Wrap a table cell to display width, preferring natural breakpoints."""
+        if width <= 0:
+            return [""]
+
+        break_chars = set(" \t/-,:;)]}>+、。，・→")
+        logical_lines = text.splitlines() or [""]
+        wrapped = []
+
+        for logical_line in logical_lines:
+            remaining = logical_line.strip()
+            if not remaining:
+                wrapped.append("")
+                continue
+
+            while remaining:
+                if _display_width(remaining) <= width:
+                    wrapped.append(remaining)
+                    break
+
+                cur_width = 0
+                cut = 0
+                last_break = -1
+                for idx, ch in enumerate(remaining):
+                    ch_width = _char_display_width(ch)
+                    if cur_width + ch_width > width:
+                        break
+                    cur_width += ch_width
+                    cut = idx + 1
+                    if ch in break_chars or ch.isspace():
+                        last_break = idx + 1
+
+                if cut <= 0:
+                    cut = 1
+                elif last_break > 0:
+                    cut = last_break
+
+                part = remaining[:cut].rstrip()
+                if not part:
+                    part = remaining[:cut]
+                wrapped.append(part)
+                remaining = remaining[cut:].lstrip()
+
+        return wrapped or [""]
+
+    @staticmethod
+    def _render_table(table_lines, _p):
+        """Render a Markdown table with Unicode box-drawing characters."""
+        _border_outer = _ansi("\033[38;5;67m")
+        _border_inner = _ansi("\033[38;5;239m")
+        _border_header = _ansi("\033[1;38;5;81m")
+        _hdr = _ansi("\033[1;38;5;230m")
+        _label_color = _ansi("\033[38;5;153m")
+        _cell_color = _ansi("\033[38;5;252m")
+        _code_color = _ansi("\033[38;5;114m")
+        _bold_color = _ansi("\033[1m")
+        _rst = C.RESET
+
+        # Parse rows: split on | and strip
+        rows = []
+        separator_idx = -1
+        for idx, raw in enumerate(table_lines):
+            stripped = raw.strip()
+            if stripped.startswith("|"):
+                stripped = stripped[1:]
+            if stripped.endswith("|"):
+                stripped = stripped[:-1]
+            cells = [c.strip() for c in stripped.split("|")]
+            # Detect separator row (e.g. |---|---|)
+            if all(re.match(r'^[-:]+$', c) for c in cells if c):
+                separator_idx = idx
+                continue
+            rows.append(cells)
+
+        if not rows:
+            for tl in table_lines:
+                _p(tl)
+            return
+
+        # Determine column count and widths
+        n_cols = max(len(r) for r in rows)
+        # Pad rows to have equal columns
+        for r in rows:
+            while len(r) < n_cols:
+                r.append("")
+
+        col_widths = [0] * n_cols
+        for r in rows:
+            for j, cell in enumerate(r):
+                w = max((_display_width(part) for part in (cell.splitlines() or [""])), default=0)
+                if w > col_widths[j]:
+                    col_widths[j] = w
+
+        # Cap column widths to terminal width
+        term_w = _get_terminal_width() - 4
+        total = sum(col_widths) + n_cols * 3 + 1
+        if total > term_w and n_cols > 0:
+            col_widths = TUI._fit_table_widths(col_widths, term_w)
+
+        def _pad_cell(text, width):
+            clipped = _truncate_to_display_width(text, width)
+            return clipped + " " * max(0, width - _display_width(clipped))
+
+        # Render inline formatting within cells
+        def _format_cell(text, base_color):
+            s = text
+            # Inline code: `text`
+            s = re.sub(r'`([^`]+)`', _code_color + r'\1' + _rst + base_color, s)
+            # Bold: **text**
+            s = re.sub(r'\*\*([^*]+)\*\*', _bold_color + r'\1' + _rst + base_color, s)
+            return s
+
+        def _make_line(left, mid, right, fill, color):
+            parts = [left]
+            for j, w in enumerate(col_widths):
+                parts.append(fill * (w + 2))
+                if j < n_cols - 1:
+                    parts.append(mid)
+            parts.append(right)
+            return color + "".join(parts) + _rst
+
+        # Top border
+        _p(_make_line("╭", "┬", "╮", "─", _border_outer))
+
+        for row_idx, row in enumerate(rows):
+            is_hdr = (row_idx == 0 and separator_idx >= 0)
+            border_color = _border_header if is_hdr else _border_inner
+            wrapped_cells = [TUI._wrap_table_cell(cell, col_widths[j]) for j, cell in enumerate(row)]
+            row_height = max(len(cell_lines) for cell_lines in wrapped_cells)
+
+            for line_idx in range(row_height):
+                cells_str = border_color + "│" + _rst
+                for j, cell_lines in enumerate(wrapped_cells):
+                    cell_line = cell_lines[line_idx] if line_idx < len(cell_lines) else ""
+                    padded = _pad_cell(cell_line, col_widths[j])
+                    cell_color = _hdr if is_hdr else (_label_color if j == 0 else _cell_color)
+                    formatted = _format_cell(padded, cell_color)
+                    cells_str += " " + cell_color + formatted + _rst + " " + border_color + "│" + _rst
+                _p(cells_str)
+
+            # After header row, draw a thicker separator
+            if is_hdr:
+                _p(_make_line("╞", "╪", "╡", "═", _border_header))
+            elif row_idx < len(rows) - 1:
+                _p(_make_line("├", "┼", "┤", "─", _border_inner))
+
+        # Bottom border
+        _p(_make_line("╰", "┴", "╯", "─", _border_outer))
+
     def _render_markdown(self, text):
         """Render markdown using glow for beautiful tables and formatting."""
         _p = self._scroll_print
@@ -8301,7 +8477,9 @@ class TUI:
                         timeout=10
                     )
                     if proc.returncode == 0:
-                        _p(proc.stdout)
+                        # Output glow's rendered content line by line
+                        for line in proc.stdout.split('\n'):
+                            _p(line)
                         return
                 except Exception:
                     pass  # Fall back to simple rendering
@@ -8310,7 +8488,9 @@ class TUI:
         in_code_block = False
         code_lang = ""
         lines = text.split("\n")
-        for i, line in enumerate(lines):
+        i = 0
+        while i < len(lines):
+            line = lines[i]
             if line.startswith("```"):
                 in_code_block = not in_code_block
                 if in_code_block:
@@ -8321,10 +8501,26 @@ class TUI:
                     sep_w = min(40, _get_terminal_width() - 6)
                     _p(f"{C.DIM}{'─' * sep_w}{C.RESET}")
                     code_lang = ""
+                i += 1
                 continue
 
             if in_code_block:
                 _p(self._highlight_code_line(line, code_lang))
+                i += 1
+                continue
+
+            # Markdown table detection: collect consecutive | lines
+            # Check for lines containing | that look like table rows (at least 2 | characters)
+            if not in_code_block and line.strip() and line.count('|') >= 2:
+                table_lines = []
+                while i < len(lines) and lines[i].strip() and lines[i].count('|') >= 2:
+                    table_lines.append(lines[i])
+                    i += 1
+                if len(table_lines) >= 2:
+                    self._render_table(table_lines, _p)
+                else:
+                    for tl in table_lines:
+                        _p(tl)
                 continue
 
             # Headers
