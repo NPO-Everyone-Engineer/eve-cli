@@ -4,7 +4,7 @@
 # Trilingual: 日本語 / English / 中文
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main/install.sh -o install.sh
 #   bash install.sh
 #   bash install.sh --model qwen3:8b
 #   bash install.sh --lang en
@@ -449,6 +449,78 @@ run_with_spinner() {
     return $exit_code
 }
 
+sha256_file() {
+    local file="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
+download_to_temp() {
+    local url="$1"
+    local suffix="${2:-.tmp}"
+    local tmp
+    tmp="$(mktemp "/tmp/eve-cli-download-XXXXXX${suffix}" 2>/dev/null || true)"
+    if [ -z "$tmp" ]; then
+        tmp="/tmp/eve-cli-download-${RANDOM}-$$${suffix}"
+    fi
+    if ! curl -fsSL "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    printf '%s\n' "$tmp"
+}
+
+resolve_install_ref() {
+    if [ -n "${EVE_CLI_INSTALL_REF:-}" ]; then
+        printf '%s\n' "$EVE_CLI_INSTALL_REF"
+        return 0
+    fi
+    curl -fsSL "https://api.github.com/repos/NPO-Everyone-Engineer/eve-cli/commits/main" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
+}
+
+manifest_hash_for() {
+    local manifest="$1"
+    local name="$2"
+    python3 - "$manifest" "$name" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+print(data["files"][sys.argv[2]])
+PY
+}
+
+download_repo_file_verified() {
+    local ref="$1"
+    local manifest="$2"
+    local name="$3"
+    local dest="$4"
+    local expected actual tmp
+
+    expected="$(manifest_hash_for "$manifest" "$name" 2>/dev/null || true)"
+    if [ -z "$expected" ]; then
+        vapor_error "Checksum entry missing for ${name}"
+        return 1
+    fi
+
+    tmp="$(download_to_temp "https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/${ref}/${name}" ".download")" || return 1
+    actual="$(sha256_file "$tmp" 2>/dev/null || true)"
+    if [ -z "$actual" ] || [ "$actual" != "$expected" ]; then
+        vapor_error "Checksum verification failed for ${name}"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    mv "$tmp" "$dest"
+}
+
 step_header() {
     local num="$1"
     local title="$2"
@@ -730,18 +802,20 @@ if [ "$IS_MAC" -eq 1 ]; then
         vapor_warn "⚠️  You may also be asked for your Mac password (sudo)."
         vapor_info "Homebrew 🍺 $(msg installing)"
         echo ""
+        local_brew_installer="$(download_to_temp "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh" ".sh")"
         # NOTE: Do NOT use run_with_spinner here — Homebrew installer needs
         # interactive TTY for sudo password prompt. Spinner would swallow it.
-        if /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+        if [ -n "${local_brew_installer:-}" ] && /bin/bash "$local_brew_installer"; then
             if [ -f /opt/homebrew/bin/brew ]; then
                 eval "$(/opt/homebrew/bin/brew shellenv)"
             fi
             vapor_success "Homebrew 🍺 $(msg install_done)"
         else
             vapor_error "Homebrew 🍺 $(msg install_fail)"
-            vapor_warn "$(msg install_fail_hint): /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+            vapor_warn "$(msg install_fail_hint): curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o brew-install.sh && /bin/bash brew-install.sh"
             exit 1
         fi
+        [ -n "${local_brew_installer:-}" ] && rm -f "$local_brew_installer"
     fi
 fi
 
@@ -761,12 +835,14 @@ else
         # sudo internally and needs interactive TTY for password prompt.
         vapor_info "Ollama 🦙 $(msg installing)"
         echo ""
-        if bash -c "curl -fsSL https://ollama.com/install.sh | sh"; then
+        local_ollama_installer="$(download_to_temp "https://ollama.com/install.sh" ".sh")"
+        if [ -n "${local_ollama_installer:-}" ] && sh "$local_ollama_installer"; then
             vapor_success "Ollama 🦙 $(msg install_done)"
         else
             vapor_error "Ollama 🦙 $(msg install_fail)"
-            vapor_warn "$(msg install_fail_hint): curl -fsSL https://ollama.com/install.sh | sh"
+            vapor_warn "$(msg install_fail_hint): curl -fsSL https://ollama.com/install.sh -o ollama-install.sh && sh ollama-install.sh"
         fi
+        [ -n "${local_ollama_installer:-}" ] && rm -f "$local_ollama_installer"
     else
         vapor_error "Ollama 🦙 $(msg install_fail)"
     fi
@@ -971,19 +1047,33 @@ if [ -n "$SCRIPT_DIR" ] && [ -f "${SCRIPT_DIR}/eve-coder.py" ]; then
     cp "${SCRIPT_DIR}/eve-coder.py" "$LIB_DIR/"
     cp "${SCRIPT_DIR}/eve-cli.sh" "$BIN_DIR/eve-cli"
 else
-    REPO_RAW="https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main"
+    INSTALL_REF="$(resolve_install_ref 2>/dev/null || true)"
+    if [ -z "$INSTALL_REF" ]; then
+        vapor_error "Failed to resolve an immutable GitHub ref for installer downloads"
+        echo "  Re-run from a full checkout, or set EVE_CLI_INSTALL_REF=<commit-sha>."
+        exit 1
+    fi
+    MANIFEST_TMP="$(download_to_temp "https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/${INSTALL_REF}/install-manifest.json" ".json")"
+    if [ -z "${MANIFEST_TMP:-}" ]; then
+        vapor_error "Failed to download install-manifest.json from GitHub"
+        echo "  Ref: ${INSTALL_REF}"
+        exit 1
+    fi
     vapor_info "$(msg source_github)"
-    if ! curl -fsSL "${REPO_RAW}/eve-coder.py" -o "$LIB_DIR/eve-coder.py"; then
+    vapor_info "Verified ref: ${INSTALL_REF}"
+    if ! download_repo_file_verified "$INSTALL_REF" "$MANIFEST_TMP" "eve-coder.py" "$LIB_DIR/eve-coder.py"; then
         vapor_error "Failed to download eve-coder.py from GitHub"
-        echo "  Check your internet connection or try again later."
-        echo "  URL: ${REPO_RAW}/eve-coder.py"
+        echo "  Check your internet connection or verify install-manifest.json."
+        rm -f "$MANIFEST_TMP"
         exit 1
     fi
-    if ! curl -fsSL "${REPO_RAW}/eve-cli.sh" -o "$BIN_DIR/eve-cli"; then
+    if ! download_repo_file_verified "$INSTALL_REF" "$MANIFEST_TMP" "eve-cli.sh" "$BIN_DIR/eve-cli"; then
         vapor_error "Failed to download eve-cli.sh from GitHub"
-        echo "  Check your internet connection or try again later."
+        echo "  Check your internet connection or verify install-manifest.json."
+        rm -f "$MANIFEST_TMP"
         exit 1
     fi
+    rm -f "$MANIFEST_TMP"
 fi
 
 chmod +x "$BIN_DIR/eve-cli"

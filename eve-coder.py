@@ -603,7 +603,7 @@ class InputMonitor:
         """True if ESC was pressed since start()."""
         return self._pressed.is_set()
 
-    def get_typeahead(self):
+    def start(self):
         """Begin monitoring stdin for ESC key in a daemon thread."""
         if not HAS_TERMIOS or not sys.stdin.isatty():
             return
@@ -622,6 +622,16 @@ class InputMonitor:
             return
         self._thread = threading.Thread(target=self._poll, daemon=True)
         self._thread.start()
+
+    def get_typeahead(self):
+        """Return buffered type-ahead text typed during execution."""
+        with self._typeahead_lock:
+            if not self._typeahead:
+                return ""
+            try:
+                return b"".join(self._typeahead).decode("utf-8", errors="replace")
+            except Exception:
+                return ""
 
     def _poll(self):
         """Poll stdin for ESC (0x1b) with 0.2s timeout. Non-ESC chars are buffered."""
@@ -738,6 +748,10 @@ class Config:
         self.network_status = None  # "online" or "offline" (detected at startup)
         self._profiles = {}         # profile_name -> {key: value} from config file
         self._cli_model_set = False # True if --model was passed on CLI
+        self._cli_ollama_host_set = False
+        self._cli_max_tokens_set = False
+        self._cli_temperature_set = False
+        self._cli_context_window_set = False
 
         # RAG options
         self.rag = False
@@ -962,12 +976,16 @@ class Config:
             self.list_sessions = True
         if args.ollama_host:
             self.ollama_host = args.ollama_host
+            self._cli_ollama_host_set = True
         if args.max_tokens is not None:
             self.max_tokens = args.max_tokens
+            self._cli_max_tokens_set = True
         if args.temperature is not None:
             self.temperature = args.temperature
+            self._cli_temperature_set = True
         if args.context_window is not None:
             self.context_window = args.context_window
+            self._cli_context_window_set = True
         if args.profile:
             self.profile = args.profile
         # RAG args
@@ -1107,19 +1125,19 @@ class Config:
             self.model = prof["MODEL"]
         if prof.get("SIDECAR_MODEL") and not self._cli_model_set:
             self.sidecar_model = prof["SIDECAR_MODEL"]
-        if prof.get("OLLAMA_HOST"):
+        if prof.get("OLLAMA_HOST") and not self._cli_ollama_host_set:
             self.ollama_host = prof["OLLAMA_HOST"]
-        if prof.get("MAX_TOKENS"):
+        if prof.get("MAX_TOKENS") and not self._cli_max_tokens_set:
             try:
                 self.max_tokens = int(prof["MAX_TOKENS"])
             except ValueError:
                 pass
-        if prof.get("TEMPERATURE"):
+        if prof.get("TEMPERATURE") and not self._cli_temperature_set:
             try:
                 self.temperature = float(prof["TEMPERATURE"])
             except ValueError:
                 pass
-        if prof.get("CONTEXT_WINDOW"):
+        if prof.get("CONTEXT_WINDOW") and not self._cli_context_window_set:
             try:
                 self.context_window = int(prof["CONTEXT_WINDOW"])
             except ValueError:
@@ -1304,14 +1322,33 @@ class Config:
             except (OSError, shutil.Error):
                 pass
 
-    def load_custom_commands(self):
+    def load_custom_commands(self, prompt_if_needed=False):
         """Load custom commands from .eve-cli/commands/ and ~/.eve-cli/commands/."""
         global _custom_commands
         with _custom_commands_lock:
             _custom_commands.clear()
+            load_project_commands = False
+            project_paths = []
+            if os.path.isdir(self.project_commands_dir):
+                project_paths = [
+                    os.path.join(self.project_commands_dir, fname)
+                    for fname in os.listdir(self.project_commands_dir)
+                    if fname.endswith(".md")
+                ]
+                if prompt_if_needed:
+                    load_project_commands = _ensure_repo_scope_trusted(
+                        self,
+                        "commands",
+                        "Project Commands Trust Required",
+                        "Project custom commands can inject prompts and tool restrictions into agent runs.",
+                        project_paths,
+                        preview_paths=project_paths,
+                    )
             # Load from project directory first, then global (global can override)
             for cmd_dir in [self.project_commands_dir, self.commands_dir]:
                 if not os.path.isdir(cmd_dir):
+                    continue
+                if cmd_dir == self.project_commands_dir and not load_project_commands:
                     continue
                 for fname in os.listdir(cmd_dir):
                     if not fname.endswith(".md"):
@@ -1360,24 +1397,41 @@ class Config:
 def _check_internet(timeout=3):
     """Check internet connectivity by attempting DNS resolution + HTTP HEAD.
     Returns True if internet is reachable, False otherwise."""
-    # Fast check: DNS resolution for a reliable host
     import socket
     try:
-        socket.setdefaulttimeout(timeout)
-        socket.getaddrinfo("dns.google", 443)
-    except (socket.gaierror, socket.timeout, OSError):
+        with socket.create_connection(("1.1.1.1", 443), timeout=timeout):
+            pass
+    except OSError:
         return False
-    # Confirm with a lightweight HTTP request
     try:
         req = urllib.request.Request("https://dns.google/resolve?name=example.com",
                                      method="HEAD")
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        resp.close()
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(0)
         return True
     except Exception:
-        # DNS resolved but HTTP failed — still considered online
-        # (some networks block specific endpoints but allow Ollama cloud)
-        return True
+        return False
+
+
+def _resolve_allowed_tool_names(registry, tool_spec):
+    """Resolve custom-command allowed-tools names to registered tool names."""
+    if not isinstance(tool_spec, list):
+        return None, []
+
+    name_map = {name.lower(): name for name in registry.names()}
+    resolved = []
+    invalid = []
+    for raw_name in tool_spec:
+        name = str(raw_name).strip()
+        if not name:
+            continue
+        canonical = name_map.get(name.lower())
+        if not canonical:
+            invalid.append(name)
+            continue
+        if canonical not in resolved:
+            resolved.append(canonical)
+    return resolved, invalid
 
 
 def _is_cloud_model(model_name):
@@ -1688,9 +1742,30 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
         search_dir = parent
 
     # Load in order: most distant ancestor first, cwd last (so cwd overrides)
+    trusted_instruction_items = [
+        item for item in instruction_files
+        if item[1] != "CLAUDE.local.md"
+    ]
+    project_instruction_paths = [fpath for _, _, fpath in trusted_instruction_items]
+    should_load_project_instructions = True
+    if project_instruction_paths:
+        should_load_project_instructions = _ensure_repo_scope_trusted(
+            config,
+            "instructions",
+            "Project Instructions Trust Required",
+            "Repo instruction files are injected into the agent prompt. Trust only repositories you control.",
+            project_instruction_paths,
+            preview_paths=project_instruction_paths,
+        )
+
     total_loaded = 0
     max_total = 8000
-    for search_dir, fname, fpath in reversed(instruction_files):
+    instruction_items_to_load = (
+        instruction_files
+        if should_load_project_instructions
+        else [item for item in instruction_files if item[1] == "CLAUDE.local.md"]
+    )
+    for search_dir, fname, fpath in reversed(instruction_items_to_load):
         if total_loaded >= max_total:
             break
         remaining = max_total - total_loaded
@@ -1715,6 +1790,19 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
     mem_text = memory.format_for_prompt()
     if mem_text:
         prompt += mem_text
+
+    if config.system_prompt_file:
+        sp_path = config.system_prompt_file
+        if not os.path.isabs(sp_path):
+            sp_path = os.path.join(cwd, sp_path)
+        try:
+            if os.path.isfile(sp_path) and not os.path.islink(sp_path):
+                content, truncated = _load_instructions(sp_path, max_bytes=4000)
+                trunc_note = "\n[Note: file truncated, only first 4000 bytes loaded]" if truncated else ""
+                prompt += f"\n# User System Prompt File\n{content}{trunc_note}\n"
+        except Exception as e:
+            print(f"{C.YELLOW}Warning: Could not read system prompt file: {e}{C.RESET}",
+                  file=sys.stderr)
 
     return prompt
 
@@ -2748,10 +2836,16 @@ class Tool(ABC):
     description = ""
     parameters = {}  # JSON Schema
 
+    def __init__(self, cwd=None):
+        self.cwd = os.path.realpath(cwd) if cwd else None
+
     @abstractmethod
     def execute(self, params):
         """Execute the tool. Returns string output."""
         ...
+
+    def _base_dir(self):
+        return self.cwd or os.getcwd()
 
     def get_schema(self):
         """Return OpenAI function calling schema."""
@@ -2927,7 +3021,7 @@ class BashTool(Tool):
                         cmd, shell=True, stdin=subprocess.DEVNULL,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True, encoding="utf-8", errors="replace",
-                        cwd=os.getcwd(), env=bg_clean_env,
+                        cwd=self._base_dir(), env=bg_clean_env,
                         start_new_session=_bg_pgroup,
                     )
                     stdout, stderr = proc.communicate(timeout=t_s)
@@ -2988,7 +3082,7 @@ class BashTool(Tool):
                 "text": True,
                 "encoding": "utf-8",
                 "errors": "replace",
-                "cwd": os.getcwd(),
+                "cwd": self._base_dir(),
                 "env": clean_env,
             }
             if use_pgroup:
@@ -3181,7 +3275,7 @@ class ReadTool(Tool):
         if not file_path:
             return "Error: no file_path provided"
         if not os.path.isabs(file_path):
-            file_path = os.path.join(os.getcwd(), file_path)
+            file_path = os.path.join(self._base_dir(), file_path)
 
         # Resolve symlinks to detect escapes
         try:
@@ -3439,7 +3533,7 @@ class WriteTool(Tool):
             return (f"Error: content too large ({len(content) // 1_000_000}MB). "
                     f"Max write size is {self.MAX_WRITE_SIZE // (1024*1024)}MB. Split into smaller writes.")
         if not os.path.isabs(file_path):
-            file_path = os.path.join(os.getcwd(), file_path)
+            file_path = os.path.join(self._base_dir(), file_path)
 
         # Resolve symlinks to prevent symlink-based attacks
         # Check islink() BEFORE exists() — dangling symlinks return False for exists()
@@ -3539,7 +3633,7 @@ class EditTool(Tool):
         if old_string == new_string:
             return "Error: old_string and new_string are identical"
         if not os.path.isabs(file_path):
-            file_path = os.path.join(os.getcwd(), file_path)
+            file_path = os.path.join(self._base_dir(), file_path)
 
         if not os.path.exists(file_path):
             return f"Error: file not found: {file_path}"
@@ -3773,12 +3867,12 @@ class GlobTool(Tool):
     def execute(self, params):
         import heapq
         pattern = params.get("pattern", "")
-        base = params.get("path", os.getcwd())
+        base = params.get("path", self._base_dir())
 
         if not pattern:
             return "Error: no pattern provided"
         if not os.path.isabs(base):
-            base = os.path.join(os.getcwd(), base)
+            base = os.path.join(self._base_dir(), base)
 
         # Bounded heap to avoid collecting millions of matches into memory
         heap = []  # min-heap of (mtime, path) — keeps newest MAX_RESULTS items
@@ -3902,7 +3996,7 @@ class GrepTool(Tool):
 
     def execute(self, params):
         pat_str = params.get("pattern", "")
-        search_path = params.get("path", os.getcwd())
+        search_path = params.get("path", self._base_dir())
         glob_filter = params.get("glob")
         case_insensitive = params.get("-i", False)
         output_mode = params.get("output_mode", "files_with_matches")
@@ -3936,7 +4030,7 @@ class GrepTool(Tool):
         if _REDOS_RE.search(pat_str):
             return "Error: regex pattern contains nested quantifiers (potential ReDoS)"
         if not os.path.isabs(search_path):
-            search_path = os.path.join(os.getcwd(), search_path)
+            search_path = os.path.join(self._base_dir(), search_path)
 
         flags = re.IGNORECASE if case_insensitive else 0
         try:
@@ -4778,6 +4872,29 @@ class SubAgentTool(Tool):
         self._registry = registry
         self._permissions = permissions
 
+    @staticmethod
+    def _make_isolated_tool(name, cwd):
+        cwd_aware = {
+            "Bash": BashTool,
+            "Read": ReadTool,
+            "Write": WriteTool,
+            "Edit": EditTool,
+            "Glob": GlobTool,
+            "Grep": GrepTool,
+        }
+        tool_cls = cwd_aware.get(name)
+        return tool_cls(cwd=cwd) if tool_cls else None
+
+    def _build_tool_map(self, allowed_tools, cwd):
+        tool_map = {}
+        for name in allowed_tools:
+            tool = self._make_isolated_tool(name, cwd)
+            if tool is None:
+                tool = self._registry.get(name)
+            if tool is not None:
+                tool_map[tool.name] = tool
+        return tool_map
+
     @property
     def parameters(self):
         return {
@@ -4856,6 +4973,7 @@ class SubAgentTool(Tool):
         allowed_tools = set(self.READ_ONLY_TOOLS)
         if allow_writes:
             allowed_tools |= self.WRITE_TOOLS
+        sub_tools = self._build_tool_map(allowed_tools, sub_config.cwd)
 
         # Print minimal status (with optional agent label for parallel runs)
         agent_label = params.get("_agent_label", "")
@@ -4867,10 +4985,7 @@ class SubAgentTool(Tool):
                   flush=True)
 
         # Build tool schemas for the sub-agent (only allowed tools)
-        schemas = [
-            s for s in self._registry.get_schemas()
-            if s.get("function", {}).get("name") in allowed_tools
-        ]
+        schemas = [tool.get_schema() for tool in sub_tools.values()]
 
         # Build sub-agent conversation
         messages = [
@@ -4899,7 +5014,7 @@ class SubAgentTool(Tool):
             # Also check for XML tool calls in text (Qwen compatibility)
             if not tool_calls and text:
                 extracted, cleaned = _extract_tool_calls_from_text(
-                    text, known_tools=list(allowed_tools)
+                    text, known_tools=list(sub_tools.keys())
                 )
                 if extracted:
                     # Convert extracted format to chat_sync format
@@ -4950,7 +5065,7 @@ class SubAgentTool(Tool):
                 tc_id = tc["id"]
                 tc_args = tc["arguments"]
 
-                if tc_name not in allowed_tools:
+                if tc_name not in sub_tools:
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc_id,
@@ -4958,7 +5073,7 @@ class SubAgentTool(Tool):
                     })
                     continue
 
-                tool = self._registry.get(tc_name)
+                tool = sub_tools.get(tc_name)
                 if not tool:
                     messages.append({
                         "role": "tool",
@@ -5196,6 +5311,124 @@ def _is_allowed_mcp_command(command):
     return base in _MCP_COMMAND_ALLOWLIST
 
 
+def _repo_key(config):
+    return os.path.realpath(config.cwd)
+
+
+def _repo_relpath(config, fpath):
+    cwd = _repo_key(config)
+    real = os.path.realpath(fpath)
+    return os.path.relpath(real, cwd) if real != cwd else "."
+
+
+def _compute_repo_hashes(config, paths):
+    """Return {repo-relative path: sha256} for regular files inside the repo."""
+    cwd = _repo_key(config)
+    hashes = {}
+    for fpath in sorted(set(paths)):
+        try:
+            real = os.path.realpath(fpath)
+        except (OSError, ValueError):
+            continue
+        if real != cwd and not real.startswith(cwd + os.sep):
+            continue
+        if not os.path.isfile(real) or os.path.islink(real):
+            continue
+        digest = _compute_file_hash(real)
+        if digest:
+            hashes[_repo_relpath(config, real)] = digest
+    return hashes
+
+
+def _get_repo_scope_hashes(entry, scope):
+    if not isinstance(entry, dict):
+        return None
+    if scope == "mcp" and entry.get("mcp_hash"):
+        return {os.path.join(".eve-cli", "mcp.json"): entry.get("mcp_hash")}
+    scope_data = entry.get(scope)
+    if not isinstance(scope_data, dict):
+        return None
+    hashes = scope_data.get("hashes")
+    if not isinstance(hashes, dict):
+        return None
+    return {str(k): str(v) for k, v in hashes.items()}
+
+
+def _remember_repo_scope_trust(config, scope, hashes):
+    trusted = _load_trusted_repos(config)
+    cwd = _repo_key(config)
+    entry = trusted.get(cwd)
+    if not isinstance(entry, dict):
+        entry = {}
+    entry[scope] = {
+        "trusted": True,
+        "trusted_at": datetime.now().isoformat(),
+        "hashes": dict(hashes),
+    }
+    if scope == "mcp":
+        entry["trusted"] = True
+        entry["mcp_hash"] = hashes.get(os.path.join(".eve-cli", "mcp.json"), "")
+        entry["trusted_at"] = datetime.now().isoformat()
+    trusted[cwd] = entry
+    _save_trusted_repos(config, trusted)
+
+
+def _prompt_repo_trust(config, scope, title, warning, hashes, preview_paths=None):
+    """Prompt once to trust repo-controlled content for a specific scope."""
+    if not hashes:
+        return False
+    if not sys.stdin.isatty():
+        return False
+
+    preview_paths = preview_paths or []
+    print(f"\n{C.YELLOW}╭─ {title} ─{C.RESET}")
+    print(f"{C.YELLOW}│{C.RESET} Scope: {scope}")
+    print(f"{C.YELLOW}│{C.RESET} Repo: {_repo_key(config)}")
+    print(f"{C.YELLOW}│{C.RESET} Files:")
+    for rel in hashes.keys():
+        print(f"{C.YELLOW}│{C.RESET}   {C.WHITE}{rel}{C.RESET}")
+    if preview_paths:
+        print(f"{C.YELLOW}│{C.RESET}")
+        for fpath in preview_paths[:2]:
+            rel = _repo_relpath(config, fpath)
+            print(f"{C.YELLOW}│{C.RESET} Preview: {C.WHITE}{rel}{C.RESET}")
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f.read(600).splitlines()[:6]:
+                        print(f"{C.YELLOW}│{C.RESET} {C.DIM}{line}{C.RESET}")
+            except OSError:
+                print(f"{C.YELLOW}│{C.RESET} {C.DIM}[unreadable]{C.RESET}")
+    print(f"{C.YELLOW}│{C.RESET}")
+    print(f"{C.YELLOW}│{C.RESET} {_ansi(chr(27)+'[38;5;196m')}{warning}{C.RESET}")
+    print(f"{C.YELLOW}│{C.RESET}  [y] Trust  [n] Skip (default)")
+    print(f"{C.YELLOW}╰──────────────────────────────────────────{C.RESET}")
+    try:
+        ans = input(f"  {C.YELLOW}? {C.RESET}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    if ans in ("y", "yes"):
+        _remember_repo_scope_trust(config, scope, hashes)
+        print(f"{C.GREEN}Repo content trusted for scope: {scope}.{C.RESET}")
+        return True
+    return False
+
+
+def _ensure_repo_scope_trusted(config, scope, title, warning, paths, preview_paths=None):
+    """Return True if repo-controlled files for a scope are trusted."""
+    hashes = _compute_repo_hashes(config, paths)
+    if not hashes:
+        return False
+    trusted = _load_trusted_repos(config)
+    entry = trusted.get(_repo_key(config))
+    previous_hashes = _get_repo_scope_hashes(entry, scope)
+    if previous_hashes == hashes:
+        return True
+    if previous_hashes:
+        print(f"{C.YELLOW}Warning: trusted repo content for scope '{scope}' has changed.{C.RESET}",
+              file=sys.stderr)
+    return _prompt_repo_trust(config, scope, title, warning, hashes, preview_paths=preview_paths)
+
+
 def _get_trusted_repos_path(config):
     return os.path.join(config.config_dir, "trusted_repos.json")
 
@@ -5232,46 +5465,14 @@ def _compute_file_hash(fpath):
 
 def _is_mcp_trusted(config, proj_mcp_path):
     """Check if the project MCP config is trusted. Prompt user if not."""
-    cwd = os.path.realpath(config.cwd)
-    trusted = _load_trusted_repos(config)
-    current_hash = _compute_file_hash(proj_mcp_path)
-
-    entry = trusted.get(cwd)
-    if entry and isinstance(entry, dict):
-        if entry.get("trusted") and entry.get("mcp_hash") == current_hash:
-            return True
-        if entry.get("trusted") and entry.get("mcp_hash") != current_hash:
-            print(f"{C.YELLOW}Warning: .eve-cli/mcp.json has changed since it was trusted.{C.RESET}")
-            print(f"{C.YELLOW}Re-approval required.{C.RESET}")
-
-    try:
-        with open(proj_mcp_path, encoding="utf-8") as f:
-            content = f.read(4000)
-        print(f"\n{C.YELLOW}\u256d\u2500 MCP Trust Required \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{C.RESET}")
-        print(f"{C.YELLOW}\u2502{C.RESET} Project MCP config found: .eve-cli/mcp.json")
-        print(f"{C.YELLOW}\u2502{C.RESET}")
-        for line in content.split("\n")[:15]:
-            print(f"{C.YELLOW}\u2502{C.RESET} {C.DIM}{line}{C.RESET}")
-        print(f"{C.YELLOW}\u2502{C.RESET}")
-        print(f"{C.YELLOW}\u2502{C.RESET} {C.WHITE}Trust this repo's MCP servers?{C.RESET}")
-        print(f"{C.YELLOW}\u2502{C.RESET}  [y] Trust  [n] Skip (default)")
-        print(f"{C.YELLOW}\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{C.RESET}")
-        try:
-            ans = input(f"  {C.YELLOW}? {C.RESET}").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = ""
-        if ans in ("y", "yes"):
-            trusted[cwd] = {
-                "trusted": True,
-                "trusted_at": datetime.now().isoformat(),
-                "mcp_hash": current_hash,
-            }
-            _save_trusted_repos(config, trusted)
-            print(f"{C.GREEN}MCP servers trusted for this repo.{C.RESET}")
-            return True
-        return False
-    except OSError:
-        return False
+    return _ensure_repo_scope_trusted(
+        config,
+        "mcp",
+        "MCP Trust Required",
+        "Project MCP files can start local processes and expose external tools.",
+        [proj_mcp_path],
+        preview_paths=[proj_mcp_path],
+    )
 
 
 def _load_mcp_servers(config):
@@ -6600,6 +6801,53 @@ class HookManager:
         "cat", "grep", "test", "true", "false",
     })
 
+    def _get_project_hook_assets(self, command):
+        """Return repo-local files referenced by a project hook command."""
+        if isinstance(command, list):
+            cmd_list = [str(part) for part in command]
+        else:
+            try:
+                cmd_list = shlex.split(command)
+            except ValueError:
+                return None, "invalid command syntax"
+
+        repo_root = os.path.realpath(self.config.cwd)
+        assets = []
+        for token in cmd_list[1:]:
+            if not token or token.startswith("-") or "://" in token:
+                continue
+            if not os.path.isabs(token) and os.sep not in token and (os.altsep is None or os.altsep not in token):
+                continue
+            candidate = token if os.path.isabs(token) else os.path.join(self.config.cwd, token)
+            try:
+                real = os.path.realpath(candidate)
+            except (OSError, ValueError):
+                return None, f"could not resolve asset path '{token}'"
+            if not os.path.exists(candidate):
+                continue
+            if real != repo_root and not real.startswith(repo_root + os.sep):
+                return None, f"repo hooks cannot reference files outside the repo: {token}"
+            if os.path.islink(candidate) or os.path.islink(real):
+                return None, f"repo hooks cannot reference symlinks: {token}"
+            if os.path.isfile(real) and real not in assets:
+                assets.append(real)
+        return assets, None
+
+    def _compute_hooks_trust_hashes(self, hooks_path):
+        hashes = _compute_repo_hashes(self.config, [hooks_path])
+        try:
+            with open(hooks_path, encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return hashes
+        for hook in data.get("hooks", []):
+            if not isinstance(hook, dict):
+                continue
+            assets, _ = self._get_project_hook_assets(hook.get("command", ""))
+            if assets:
+                hashes.update(_compute_repo_hashes(self.config, assets))
+        return hashes
+
     def _load_hooks(self):
         """Load hooks from config files."""
         # Global hooks are always trusted
@@ -6644,6 +6892,11 @@ class HookManager:
                         print(f"{C.YELLOW}Warning: Hook command '{base_cmd}' blocked "
                               f"(not in allowlist){C.RESET}", file=sys.stderr)
                         continue
+                    assets, asset_error = self._get_project_hook_assets(command)
+                    if asset_error:
+                        print(f"{C.YELLOW}Warning: Hook blocked ({asset_error}){C.RESET}",
+                              file=sys.stderr)
+                        continue
                 timeout = min(
                     h.get("timeout", self.DEFAULT_TIMEOUT),
                     self.MAX_TIMEOUT
@@ -6684,15 +6937,19 @@ class HookManager:
     def _is_hooks_trusted(self, hooks_path):
         cwd = os.path.realpath(self.config.cwd)
         trusted = self._load_trusted_hooks()
-        try:
-            with open(hooks_path, "rb") as f:
-                current_hash = hashlib.sha256(f.read()).hexdigest()
-        except OSError:
-            return False
+        current_hashes = self._compute_hooks_trust_hashes(hooks_path)
         entry = trusted.get(cwd)
         if entry and isinstance(entry, dict):
-            if entry.get("trusted") and entry.get("hooks_hash") == current_hash:
+            saved_hashes = entry.get("hashes")
+            if isinstance(saved_hashes, dict) and entry.get("trusted") and saved_hashes == current_hashes:
                 return True
+            if entry.get("trusted") and entry.get("hooks_hash"):
+                legacy_hash = current_hashes.get(os.path.join(".eve-cli", "hooks.json"))
+                if legacy_hash and entry.get("hooks_hash") == legacy_hash and len(current_hashes) == 1:
+                    return True
+            if entry.get("trusted"):
+                print(f"{C.YELLOW}Warning: project hook files changed since trust was granted.{C.RESET}",
+                      file=sys.stderr)
         return False
 
     def _ask_hooks_trust(self, hooks_path):
@@ -6712,12 +6969,12 @@ class HookManager:
             ans = input(f"  {C.YELLOW}? {C.RESET}").strip().lower()
             if ans in ("y", "yes"):
                 cwd = os.path.realpath(self.config.cwd)
-                with open(hooks_path, "rb") as f:
-                    hooks_hash = hashlib.sha256(f.read()).hexdigest()
+                hook_hashes = self._compute_hooks_trust_hashes(hooks_path)
                 trusted = self._load_trusted_hooks()
                 trusted[cwd] = {
                     "trusted": True,
-                    "hooks_hash": hooks_hash,
+                    "hooks_hash": hook_hashes.get(os.path.join(".eve-cli", "hooks.json"), ""),
+                    "hashes": hook_hashes,
                     "trusted_at": datetime.now().isoformat(),
                 }
                 self._save_trusted_hooks(trusted)
@@ -9197,6 +9454,7 @@ class Agent:
         self._tui_lock = threading.Lock()
         self._plan_mode = False
         self._active_plan_path = None     # current plan file path
+        self.allowed_tool_names = None
 
         self.git_checkpoint = GitCheckpoint(config.cwd)
         self.change_tracker = GitChangeTracker(config.cwd)
@@ -9259,6 +9517,21 @@ class Agent:
     def run(self, user_input):
         """Run the agent loop for a single user request."""
         self._run_impl(user_input, skip_add=False)
+
+    def _get_allowed_tool_names(self):
+        names = set(self.registry.names())
+        if self.allowed_tool_names is not None:
+            names &= set(self.allowed_tool_names)
+        if self._plan_mode:
+            names &= self.PLAN_MODE_TOOLS
+        return names
+
+    def _get_tool_schemas(self):
+        allowed_names = self._get_allowed_tool_names()
+        return [
+            schema for schema in self.registry.get_schemas()
+            if schema.get("function", {}).get("name") in allowed_names
+        ]
 
     def _run_impl(self, user_input, skip_add=False):
         """Internal agent loop implementation."""
@@ -9343,11 +9616,7 @@ class Agent:
                         _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}👁 {len(fw_changes)} file change(s) detected{C.RESET}")
 
                 # 1. Call Ollama (with retry for malformed responses)
-                tools = self.registry.get_schemas()
-                # In plan mode, only allow read-only tools
-                if self._plan_mode:
-                    tools = [t for t in tools
-                             if t.get("function", {}).get("name") in self.PLAN_MODE_TOOLS]
+                tools = self._get_tool_schemas()
                 _esc_hint = " — ESC: stop" if HAS_TERMIOS else ""
                 if iteration == 0:
                     self.tui.start_spinner(("Planning" if self._plan_mode else "Thinking") + _esc_hint)
@@ -9498,6 +9767,14 @@ class Agent:
                     # Canonicalize tool_name to registered name (defense-in-depth
                     # against case variations like "bash" vs "Bash")
                     tool_name = tool.name
+                    if tool_name not in self._get_allowed_tool_names():
+                        results.append(ToolResult(
+                            tc_id,
+                            f"Error: tool '{tool_name}' is not allowed in this run.",
+                            True,
+                        ))
+                        self.tui.show_tool_result(tool_name, "Blocked: tool not allowed", True)
+                        continue
                     # Show what we're about to do FIRST
                     self.tui.show_tool_call(tool_name, tool_params)
                     # PreToolUse hook: allow hooks to deny tool execution
@@ -11612,6 +11889,7 @@ def main():
 
                 # ── Custom Commands ───────────────────────────────────
                 elif cmd in ("/custom", "/cmd"):
+                    config.load_custom_commands(prompt_if_needed=True)
                     parts = user_input.split(None, 1)
                     if len(parts) < 2:
                         print(f"{C.YELLOW}Usage: /custom <name> [args]{C.RESET}")
@@ -11668,18 +11946,15 @@ Review this code for:
                     _allowed_tools = None
                     _frontmatter = cmd_info.get("frontmatter", {})
                     if "allowed-tools" in _frontmatter:
-                        _tools_spec = _frontmatter["allowed-tools"]
-                        if isinstance(_tools_spec, list):
-                            _allowed_tools = []
-                            for t in _tools_spec:
-                                t_lower = t.lower()
-                                if t_lower in ("bash", "read", "write", "edit", "glob", "grep",
-                                               "webfetch", "websearch", "notebookedit",
-                                               "taskcreate", "tasklist", "taskget", "taskupdate",
-                                               "subagent", "parallelagents", "askuserquestion"):
-                                    _allowed_tools.append(tool_registry.get(t_lower))
-                            if not _allowed_tools:
-                                _allowed_tools = None  # Fall back to default
+                        _allowed_tools, invalid_tools = _resolve_allowed_tool_names(
+                            registry, _frontmatter["allowed-tools"]
+                        )
+                        if invalid_tools:
+                            print(f"{C.YELLOW}Ignoring unknown tools in {cmd_name}: "
+                                  f"{', '.join(invalid_tools)}{C.RESET}")
+                        if not _allowed_tools:
+                            print(f"{C.RED}Custom command '{cmd_name}' did not resolve any allowed tools.{C.RESET}")
+                            continue
                     
                     # Inject the custom command prompt
                     user_input = cmd_body
@@ -11690,8 +11965,8 @@ Review this code for:
                     # But restrict tools if allowed-tools was specified
                     if _allowed_tools is not None:
                         # Temporarily override available tools
-                        _orig_tools = agent.available_tools
-                        agent.available_tools = _allowed_tools
+                        _orig_tools = agent.allowed_tool_names
+                        agent.allowed_tool_names = set(_allowed_tools)
                         # Will restore after agent.run
                         # Store in session for restoration
                         session._custom_command_tools_override = _orig_tools
@@ -11851,7 +12126,7 @@ Review this code for:
                 agent.run(user_input)
             # Restore tools if custom command had tool restrictions
             if hasattr(session, '_custom_command_tools_override'):
-                agent.available_tools = session._custom_command_tools_override
+                agent.allowed_tool_names = session._custom_command_tools_override
                 del session._custom_command_tools_override
             # Capture type-ahead for next prompt (text typed during execution)
             _typeahead_text = agent.get_typeahead()

@@ -86,7 +86,8 @@
 ### ステップ1: インストール
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main/install.sh -o install.sh
+bash install.sh
 ```
 
 ### ステップ2: 起動
@@ -107,10 +108,11 @@ eve-cli
 
 ## インストール
 
-### ワンライナー（推奨）
+### ダウンロードして実行（推奨）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main/install.sh -o install.sh
+bash install.sh
 ```
 
 これだけで以下が自動で行われます:
@@ -205,7 +207,6 @@ eve-cli -p "バージョンを教えて" --output-format json
 | **Tab** | ファイルパス・コマンドの自動補完 |
 | **@ファイル名** | ファイル内容を自動添付（例: `@src/main.py を修正して`） |
 | **ESC** | エージェントの実行を中断 |
-| **Ctrl+K** | ローカルモデル ↔ クラウドモデルを即時切り替え |
 
 ### 画像を添付する方法
 
@@ -635,6 +636,11 @@ AIが指定したファイルのユニットテストを自動生成します。
 
 親ディレクトリからカレントディレクトリまでの全階層を探索し、見つかった設定ファイルをすべてマージします。合計サイズは8KBに制限されます。
 
+### セキュリティ
+
+プロジェクト内の `CLAUDE.md` / `.eve-cli/CLAUDE.md` / `.eve-coder.json` などは、**初回に信頼確認が必要**です。
+信頼後にファイル内容が変わった場合は再確認が必要で、状態は `~/.config/eve-cli/trusted_repos.json` に保存されます。
+
 ### コンテキスト自動収集
 
 設定ファイルに加えて、起動時に以下の情報を自動収集してAIに提供します:
@@ -682,9 +688,8 @@ CONTEXT_WINDOW=8192
 | `PROFILE=offline` | 常にオフラインプロファイルを使用 |
 | `PROFILE=<カスタム名>` | 指定したプロファイルを使用 |
 
-- `--model` オプションはプロファイル設定より優先されます
+- `--model` / `--ollama-host` / `--max-tokens` / `--temperature` / `--context-window` はプロファイル設定より優先されます
 - フッターに `● ON` / `○ OFF` でネットワーク状態が常時表示されます
-- **Ctrl+K** でローカル ↔ クラウドモデルを即時切り替え
 
 ---
 
@@ -701,13 +706,14 @@ CONTEXT_WINDOW=8192
 > 悪意あるリポジトリがフックを通じて任意のコマンドを実行する可能性があるため、
 > 初回読み込み時に内容を表示して明示的な許可を求めます。
 > 信頼状態は `~/.config/eve-cli/trusted_hooks.json` にリポジトリごとに保存されます。
-> **ファイルが変更されると信頼は無効化され、再確認が必要になります。**
+> `hooks.json` または参照しているリポジトリ内スクリプトが変更されると信頼は無効化され、再確認が必要になります。
 
 ### セキュリティ制限
 
 | 制限 | 内容 |
 |------|------|
 | **コマンドallowlist** | プロジェクトフックは `echo`, `bash`, `python3`, `node`, `grep` 等の安全なコマンドのみ実行可能 |
+| **リポジトリ内スクリプト検証** | フックが参照する repo 内スクリプトもハッシュ検証対象。symlink や repo 外参照は拒否 |
 | **SessionStart制限** | プロジェクトフックからの `SessionStart` イベントはデフォルトでブロック |
 | **shell=False実行** | シェルインジェクション防止のため、コマンドは配列として安全に実行 |
 | **タイムアウト** | フックごとに設定可能（最大30秒） |
