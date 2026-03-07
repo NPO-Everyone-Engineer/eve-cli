@@ -6763,6 +6763,41 @@ class Session:
                 total += len(json.dumps(m["tool_calls"], ensure_ascii=False)) // 4
         self._token_estimate = total
 
+    def auto_compact(self, client, config):
+        """Auto-compact when token usage exceeds 80% of context window."""
+        usage_pct = self.get_token_estimate() / config.context_window
+        if usage_pct < 0.80:
+            return False
+        if len(self.messages) < 6:
+            return False
+        model = config.sidecar_model or config.model
+        to_summarize = self.messages[:-4]
+        keep = self.messages[-4:]
+        summary_text = "\n".join(
+            f"[{m.get('role','?')}] {str(m.get('content',''))[:200]}"
+            for m in to_summarize
+        )
+        if not summary_text.strip():
+            return False
+        summary_prompt = [
+            {"role": "system", "content": "Summarize this conversation concisely in the same language. Keep key decisions, file paths, and code changes. Output only the summary."},
+            {"role": "user", "content": summary_text[:3000]},
+        ]
+        try:
+            resp = client.chat(model=model, messages=summary_prompt, tools=None, stream=False)
+            summary = ""
+            if isinstance(resp, dict):
+                choices = resp.get("choices", [])
+                if choices:
+                    summary = choices[0].get("message", {}).get("content", "").strip()
+            if not summary:
+                return False
+            self.messages = [{"role": "system", "content": f"[Auto-compacted conversation summary]\n{summary}"}] + keep
+            self._recalculate_tokens()
+            return True
+        except Exception:
+            return False
+
     def add_user_message(self, text):
         self.messages.append({"role": "user", "content": text})
         self._token_estimate += self._estimate_tokens(text)
@@ -8470,6 +8505,26 @@ class Agent:
                 return tasks
         return []
 
+    MAX_AUTO_FIX = 2  # max auto-fix attempts per run
+
+    def _auto_fix_error(self, tool_name, tool_params, error_output):
+        """Inject error context into session so LLM can auto-fix on next iteration."""
+        if not error_output or len(error_output) < 10:
+            return
+        if tool_name not in ("Bash", "Edit", "Write"):
+            return
+        if self._auto_fix_count >= self.MAX_AUTO_FIX:
+            return
+        self._auto_fix_count += 1
+        error_snippet = error_output[:1500]
+        hint = (
+            f"The previous {tool_name} call failed with this error:\n"
+            f"```\n{error_snippet}\n```\n"
+            f"Please analyze the error, identify the root cause, and fix it. "
+            f"Do not ask the user — fix it directly."
+        )
+        self.session.add_system_note(hint)
+
     def _run_without_add(self, user_input):
         """Run agent loop without adding user message (already added by caller)."""
         self._run_impl(user_input, skip_add=True)
@@ -8517,6 +8572,7 @@ class Agent:
         if not skip_add:
             self.session.add_user_message(user_input)
         self._interrupted.clear()
+        self._auto_fix_count = 0
         _recent_tool_calls = []  # track recent calls for loop detection
         _empty_retries = 0     # cap empty response retries
         _start_time = time.time()
@@ -8567,6 +8623,11 @@ class Agent:
                     _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
                     self._interrupted.set()
                 break
+
+            # Auto-compact if context is getting full
+            if iteration > 0 and iteration % 5 == 0:
+                if self.session.auto_compact(self.client, self.config):
+                    _p(f"\n  {C.DIM}[auto-compacted: context was >80% full]{C.RESET}")
 
             text = ""
             try:
@@ -8817,6 +8878,8 @@ class Agent:
                         self.tui.show_tool_result(tool_name, result.output, result.is_error,
                                                   duration=_pdur, params=tool_params)
                         results.append(result)
+                        if result.is_error and result.output:
+                            self._auto_fix_error(tool_name, tool_params, result.output)
                         # PostToolUse hook (parallel path)
                         if self.hook_mgr and self.hook_mgr.has_hooks:
                             self.hook_mgr.fire_post_tool(tool_name, result.output, result.is_error)
@@ -8852,6 +8915,8 @@ class Agent:
                             self.tui.show_tool_result(tool_name, output, is_error=_is_err,
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
+                            if _is_err and output:
+                                self._auto_fix_error(tool_name, tool_params, output)
                             # PostToolUse hook (sequential path)
                             if self.hook_mgr and self.hook_mgr.has_hooks:
                                 self.hook_mgr.fire_post_tool(tool_name, output, _is_err)
@@ -8907,6 +8972,7 @@ class Agent:
                             error_msg = f"Tool error: {e}"
                             self.tui.show_tool_result(tool_name, error_msg, True, duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, error_msg, True))
+                            self._auto_fix_error(tool_name, tool_params, error_msg)
 
                 # 6. Add tool results to history
                 # If interrupted mid-tool-loop, pad missing results so the
@@ -9857,18 +9923,31 @@ def main():
                         if len(diff_text) > 4000:
                             diff_text = diff_text[:4000] + "\n... (truncated)"
 
-                        # 4. Generate commit message via LLM
+                        # 4. Get recent commit messages for style reference
+                        log_result = subprocess.run(
+                            ["git", "log", "--oneline", "-5"],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        recent_commits = log_result.stdout.strip() if log_result.returncode == 0 else ""
+
+                        # 5. Generate commit message via LLM
                         tui.start_spinner("Generating commit message")
                         gen_messages = [
                             {"role": "system", "content": (
-                                "You are a commit message generator. Given a git diff, write a concise, "
-                                "conventional commit message. Use format: <type>: <description>\n"
+                                "You are a commit message generator. Given a git diff and recent commit history, "
+                                "write a concise conventional commit message that matches the project's style.\n"
+                                "Format: <type>(<scope>): <description>\n"
                                 "Types: feat, fix, refactor, docs, style, test, chore, perf\n"
-                                "Keep the first line under 72 characters. "
-                                "Add a blank line and bullet points for details if needed.\n"
-                                "Output ONLY the commit message, nothing else."
+                                "Rules:\n"
+                                "- First line under 72 characters\n"
+                                "- Match the language/style of recent commits (Japanese OK if project uses it)\n"
+                                "- Add bullet points for multiple changes\n"
+                                "- Output ONLY the commit message, nothing else"
                             )},
-                            {"role": "user", "content": f"Generate a commit message for this diff:\n\n{diff_text}"},
+                            {"role": "user", "content": (
+                                f"Recent commits:\n{recent_commits}\n\n"
+                                f"Diff to commit:\n{diff_text}"
+                            )},
                         ]
                         try:
                             resp = client.chat(
@@ -9889,10 +9968,19 @@ def main():
                         # Strip <think> tags from Qwen/reasoning models
                         commit_msg = re.sub(r'<think>.*?</think>\s*', '', commit_msg, flags=re.DOTALL).strip()
                         if not commit_msg:
-                            print(f"{C.RED}Failed to generate commit message.{C.RESET}")
-                            continue
+                            # Fallback: auto-generate from file names
+                            fb_files = subprocess.run(
+                                ["git", "diff", "--cached", "--name-only"],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            file_list = [f for f in fb_files.stdout.strip().split("\n") if f][:5]
+                            if file_list:
+                                commit_msg = f"chore: update {', '.join(file_list)}"
+                            else:
+                                print(f"{C.RED}Failed to generate commit message.{C.RESET}")
+                                continue
 
-                        # 5. Show message and confirm
+                        # 6. Show message and confirm
                         print(f"\n{C.CYAN}Proposed commit message:{C.RESET}")
                         print(f"{C.BOLD}{commit_msg}{C.RESET}\n")
 
@@ -9918,7 +10006,7 @@ def main():
                                 print(f"{C.YELLOW}Commit aborted.{C.RESET}")
                                 continue
 
-                        # 6. Commit
+                        # 7. Commit
                         result = subprocess.run(
                             ["git", "commit", "-m", commit_msg],
                             capture_output=True, text=True, timeout=30
