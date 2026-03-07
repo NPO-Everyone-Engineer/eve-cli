@@ -25,6 +25,9 @@ node_modules/
 *.pem
 *.key
 
+# Claude Code
+.claude/
+
 # IDE
 .vscode/
 .idea/
