@@ -454,7 +454,7 @@ class ScrollRegion:
         buf += f"\033[{status_row};1H\033[2K {status}{_rst}"
 
         hint = self._hint_text or ""
-        hint_prefix = f" {_dim}ESC: stop, Ctrl+M: mode"
+        hint_prefix = f" {_dim}ESC: stop, Ctrl+K: mode"
         if hint:
             buf += f"\033[{hint_row};1H\033[2K{hint_prefix} | type-ahead: \"{hint}\"{_rst}"
         else:
@@ -515,7 +515,7 @@ def _debug_scroll_region(tui):
     print(f"\n  {_c51}Test 1: Footer before DECSTBM (setup pattern){_rst}")
     footer = f"\033[{sep_row};1H\033[2K{_sep_c}{'═' * cols}{_r}"
     footer += f"\033[{status_row};1H\033[2K {_c87}[fixed] Status row{_r}"
-    footer += f"\033[{hint_row};1H\033[2K {_dim}[fixed] ESC: stop, Ctrl+M: mode{_r}"
+    footer += f"\033[{hint_row};1H\033[2K {_dim}[fixed] ESC: stop, Ctrl+K: mode{_r}"
     buf = footer
     buf += f"\033[1;{scroll_end}r"
     buf += f"\033[{scroll_end};1H"
@@ -568,7 +568,7 @@ class InputMonitor:
     buffered and can be injected into readline's next input() call via
     get_typeahead() + readline.set_startup_hook.
     
-    Mode switching: Ctrl+M toggles between local/cloud models (auto mode).
+    Mode switching: Ctrl+K toggles between local/cloud models (auto mode).
     """
 
     def __init__(self, on_typeahead=None, on_mode_switch=None):
@@ -580,8 +580,8 @@ class InputMonitor:
         self._typeahead = []      # buffered keystrokes (bytes)
         self._typeahead_lock = threading.Lock()
         self._on_typeahead = on_typeahead  # callback(text) for live type-ahead display
-        self._on_mode_switch = on_mode_switch  # callback() for mode switch (Ctrl+M)
-        self._mode_switched = threading.Event()  # True if Ctrl+M was pressed
+        self._on_mode_switch = on_mode_switch  # callback() for mode switch (Ctrl+K)
+        self._mode_switched = threading.Event()  # True if Ctrl+K was pressed
 
     @property
     def pressed(self):
@@ -590,7 +590,7 @@ class InputMonitor:
 
     @property
     def mode_switched(self):
-        """True if Ctrl+M was pressed since start()."""
+        """True if Ctrl+K was pressed since start()."""
         return self._mode_switched.is_set()
 
     def reset_mode_switch(self):
@@ -664,7 +664,7 @@ class InputMonitor:
                 elif ch == b'\x03':  # Ctrl+C
                     self._pressed.set()
                     break
-                elif ch == b'\x0d':  # Ctrl+M (ASCII 13 = carriage return)
+                elif ch == b'\x0b':  # Ctrl+K (ASCII 11 = vertical tab)
                     # Mode switch shortcut
                     self._mode_switched.set()
                     if self._on_mode_switch:
@@ -1667,6 +1667,37 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
 # OllamaClient — Direct communication with Ollama OpenAI-compatible API
 # ════════════════════════════════════════════════════════════════════════════════
 
+class ResponseCache:
+    """Simple in-memory LRU cache for LLM responses."""
+
+    def __init__(self, max_size=50):
+        self._cache = collections.OrderedDict()
+        self._max_size = max_size
+
+    @staticmethod
+    def _hash_messages(messages, model):
+        key_data = json.dumps({"model": model, "messages": messages[-3:]},
+                              ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(key_data.encode("utf-8")).hexdigest()[:32]
+
+    def get(self, key):
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+
+    def put(self, key, value):
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        else:
+            if len(self._cache) >= self._max_size:
+                self._cache.popitem(last=False)
+        self._cache[key] = value
+
+    def clear(self):
+        self._cache.clear()
+
+
 class OllamaClient:
     """Communicates with Ollama via /v1/chat/completions."""
 
@@ -1678,6 +1709,7 @@ class OllamaClient:
         self.debug = config.debug
         self.timeout = 300
         self._supports_tool_streaming = None  # None=untested, True/False=detected
+        self._response_cache = ResponseCache()
 
     def check_connection(self, retries=3):
         """Check if Ollama is reachable. Returns (ok, model_list)."""
@@ -1916,6 +1948,14 @@ class OllamaClient:
         num_ctx are properly respected.  Returns OpenAI-compatible format via
         an adapter layer so all downstream consumers work unchanged.
         """
+        # Cache lookup for non-streaming, no-tools calls
+        _cache_key = None
+        if not stream and not tools:
+            _cache_key = self._response_cache._hash_messages(messages, model)
+            cached = self._response_cache.get(_cache_key)
+            if cached is not None:
+                return cached
+
         temp = self.temperature
         if tools:
             # Lower temperature for tool-calling (improves JSON reliability)
@@ -1997,6 +2037,8 @@ class OllamaClient:
                 usage = openai_resp.get("usage", {})
                 print(f"{C.DIM}[debug] Response: prompt={usage.get('prompt_tokens',0)} "
                       f"completion={usage.get('completion_tokens',0)}{C.RESET}", file=sys.stderr)
+            if _cache_key and openai_resp:
+                self._response_cache.put(_cache_key, openai_resp)
             return openai_resp
 
     def _iter_ndjson(self, resp):
@@ -7955,24 +7997,35 @@ class TUI:
             path_display = path if len(path) <= max_display else "..." + path[-(max_display-3):]
             _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{path_display}{C.RESET}"
                f" {_ansi(chr(27)+'[38;5;46m')}(+{lines} lines){C.RESET}")
+            _dg = _ansi(chr(27)+'[38;5;46m')
+            for ln in content.split('\n')[:4]:
+                _p(f"  {_dg}  {ln[:100]}{C.RESET}")
+            if lines > 4:
+                _p(f"  {_ansi(chr(27)+'[38;5;240m')}  ... ({lines} lines total){C.RESET}")
         elif name == "Edit":
             path = params.get("file_path", "")
             old = params.get("old_string", "")
             new = params.get("new_string", "")
             path_display = path if len(path) <= max_display else "..." + path[-(max_display-3):]
-            # Show diff-style preview
             _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{path_display}{C.RESET}")
-            # Show abbreviated old/new for review
-            old_first = old.split('\n')[0] if old else ""
-            new_first = new.split('\n')[0] if new else ""
-            old_preview = old_first[:60]
-            new_preview = new_first[:60]
-            old_truncated = len(old_first) > 60 or '\n' in old
-            new_truncated = len(new_first) > 60 or '\n' in new
-            if old_preview:
-                _p(f"  {_ansi(chr(27)+'[38;5;196m')}  - {old_preview}{'...' if old_truncated else ''}{C.RESET}")
-            if new_preview:
-                _p(f"  {_ansi(chr(27)+'[38;5;46m')}  + {new_preview}{'...' if new_truncated else ''}{C.RESET}")
+            _dr = _ansi(chr(27)+'[38;5;196m')
+            _dg = _ansi(chr(27)+'[38;5;46m')
+            old_lines = old.split('\n') if old else []
+            new_lines = new.split('\n') if new else []
+            shown = 0
+            for ln in old_lines:
+                if shown >= 6:
+                    _p(f"  {_dr}  - ... ({len(old_lines)} lines total){C.RESET}")
+                    break
+                _p(f"  {_dr}  - {ln[:100]}{C.RESET}")
+                shown += 1
+            shown = 0
+            for ln in new_lines:
+                if shown >= 6:
+                    _p(f"  {_dg}  + ... ({len(new_lines)} lines total){C.RESET}")
+                    break
+                _p(f"  {_dg}  + {ln[:100]}{C.RESET}")
+                shown += 1
         elif name in ("Glob", "Grep"):
             pat = params.get("pattern", "")
             search_path = params.get("path", "")
@@ -8125,27 +8178,44 @@ class TUI:
         self.stop_spinner()
 
         # Show full command/detail (no truncation for security review)
+        _w = _ansi("\033[38;5;255m")
         detail = ""
         detail_extra = []  # additional preview lines
         if tool_name == "Bash":
             cmd = params.get("command", "")
-            detail = cmd
+            highlighted = cmd
+            for kw in ["sudo", "rm", "mv", "cp", "chmod", "chown", "kill", "pkill"]:
+                highlighted = re.sub(
+                    r'\b(' + re.escape(kw) + r')\b',
+                    _ansi(chr(27)+'[38;5;196m') + r'\1' + _w,
+                    highlighted
+                )
+            for kw in ["git", "python3", "pip3", "npm", "brew", "curl", "wget"]:
+                highlighted = re.sub(
+                    r'\b(' + re.escape(kw) + r')\b',
+                    _ansi(chr(27)+'[38;5;51m') + r'\1' + _w,
+                    highlighted
+                )
+            detail = highlighted
         elif tool_name == "Edit":
             detail = params.get("file_path", "")
             old_s = params.get("old_string", "")
             new_s = params.get("new_string", "")
             _dr = _ansi("\033[38;5;196m")
             _dg = _ansi("\033[38;5;46m")
+            old_count = old_s.count("\n") + 1 if old_s else 0
+            new_count = new_s.count("\n") + 1 if new_s else 0
+            detail_extra.append(f"{_dr}  -{old_count} lines{C.RESET} {_dg}+{new_count} lines{C.RESET}")
             if old_s:
-                for ln in old_s.split("\n")[:5]:
-                    detail_extra.append(f"{_dr}- {ln}{C.RESET}")
-                if old_s.count("\n") > 5:
-                    detail_extra.append(f"{_dr}  ... ({old_s.count(chr(10))+1} lines){C.RESET}")
+                for ln in old_s.split("\n")[:8]:
+                    detail_extra.append(f"{_dr}- {ln[:100]}{C.RESET}")
+                if old_s.count("\n") >= 8:
+                    detail_extra.append(f"{_dr}  ... ({old_count} lines total){C.RESET}")
             if new_s:
-                for ln in new_s.split("\n")[:5]:
-                    detail_extra.append(f"{_dg}+ {ln}{C.RESET}")
-                if new_s.count("\n") > 5:
-                    detail_extra.append(f"{_dg}  ... ({new_s.count(chr(10))+1} lines){C.RESET}")
+                for ln in new_s.split("\n")[:8]:
+                    detail_extra.append(f"{_dg}+ {ln[:100]}{C.RESET}")
+                if new_s.count("\n") >= 8:
+                    detail_extra.append(f"{_dg}  ... ({new_count} lines total){C.RESET}")
         elif tool_name == "Write":
             detail = params.get("file_path", "")
             content = params.get("content", "")
@@ -8179,7 +8249,8 @@ class TUI:
         for extra_line in detail_extra:
             print(f"  {_y}│{C.RESET} {extra_line}")
         print(f"  {_y}│{C.RESET}")
-        print(f"  {_y}│{C.RESET}  [y] Allow once   [a] Allow all {tool_name} this session")
+        persist_hint = " (saved)" if tool_name not in {"Bash", "Write", "Edit", "NotebookEdit"} else ""
+        print(f"  {_y}│{C.RESET}  [y] Allow once   [a] Allow all{persist_hint}")
         print(f"  {_y}│{C.RESET}  [n] Deny (Enter)  [d] Deny all   [Y] Approve everything")
         print(f"  {_y}╰{'─' * box_w}{C.RESET}")
         try:
@@ -8582,7 +8653,7 @@ class Agent:
 
         # Mode switch callback: toggle between local and cloud model
         def _on_mode_switch():
-            """Toggle between local and cloud model when Ctrl+M is pressed."""
+            """Toggle between local and cloud model when Ctrl+K is pressed."""
             current = self.config.model or ""
             if _is_cloud_model(current):
                 # Switch to local: pick best local model from tiers
@@ -8612,11 +8683,11 @@ class Agent:
         _esc_monitor.start()
 
         for iteration in range(self.MAX_ITERATIONS):
-            # Check for mode switch (Ctrl+M)
+            # Check for mode switch (Ctrl+K)
             if _esc_monitor.mode_switched:
                 _esc_monitor.reset_mode_switch()
                 # Update spinner hint to show current mode
-                _esc_hint = " — ESC: stop, Ctrl+M: toggle mode" if HAS_TERMIOS else ""
+                _esc_hint = " — ESC: stop, Ctrl+K: toggle mode" if HAS_TERMIOS else ""
             
             if self._interrupted.is_set() or _esc_monitor.pressed:
                 if _esc_monitor.pressed:
@@ -8645,7 +8716,7 @@ class Agent:
                 if self._plan_mode:
                     tools = [t for t in tools
                              if t.get("function", {}).get("name") in self.PLAN_MODE_TOOLS]
-                _esc_hint = " — ESC: stop, Ctrl+M: toggle mode" if HAS_TERMIOS else ""
+                _esc_hint = " — ESC: stop, Ctrl+K: toggle mode" if HAS_TERMIOS else ""
                 if iteration == 0:
                     self.tui.start_spinner(("Planning" if self._plan_mode else "Thinking") + _esc_hint)
                 else:
