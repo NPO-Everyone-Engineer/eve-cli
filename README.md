@@ -90,12 +90,14 @@ eve-cli --resume
 | `/image <path>` | 画像ファイルを添付 |
 | `/commit` | Git コミット作成 |
 | `/diff` | 変更差分を表示 |
+| `/status` | セッション・Git・checkpoint の状態を表示 |
 | `/undo` | 直前のファイル変更を元に戻す |
-| `/checkpoint` | Gitチェックポイント作成 |
+| `/checkpoint` | 非破壊の Git checkpoint を作成 |
+| `/checkpoint list` | 保存済み checkpoint 一覧を表示 |
 | `/rollback` | チェックポイントに戻す |
 | `/compact` | 会話を要約して圧縮 |
 | `/watch` | ファイル監視モード |
-| `/autotest` | 自動テストループ |
+| `/autotest` | 編集後に構文チェック + テストを自動実行 |
 | `/browser setup` | ブラウザ操作のセットアップ（Playwright MCP） |
 | `/browser status` | ブラウザツールの接続状態を確認 |
 | `/config` | 現在の設定を表示 |
@@ -113,6 +115,13 @@ eve-cli --resume
 | `n` / Enter | 拒否 |
 | `d` | このツールを今後すべて拒否 |
 | `Y` | すべてのツールを自動許可 |
+
+### 安全性・復旧・自動検証
+
+- `Write` / `Edit` / `NotebookEdit` の前に、作業ツリーを汚さない checkpoint を自動作成
+- `/rollback` は最新 checkpoint の状態に戻し、checkpoint 作成時点の未追跡ファイルも復元
+- `/status` で dirty file 数、最近の変更、checkpoint 数、自動検証コマンドを確認可能
+- `/autotest` は Python では既定で `py_compile` を実行し、`tests/` があれば `unittest` を自動検出
 
 ## 環境変数
 

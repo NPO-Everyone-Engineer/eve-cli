@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 import urllib.parse
@@ -175,6 +176,84 @@ class TestProtectedPathAndSkills(unittest.TestCase):
         self.assertNotIn("link", skills)
 
 
+class TestGitChangeTracker(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.repo = os.path.join(self.tmpdir, "repo")
+        os.makedirs(self.repo)
+        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True, text=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_records_recent_changes(self):
+        tracker = eve.GitChangeTracker(self.repo)
+        tracker.record("create", os.path.join(self.repo, "alpha.py"))
+        tracker.record("edit", os.path.join(self.repo, "beta.py"))
+        lines = tracker.format_recent(limit=2)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("beta.py", lines[0])
+
+    def test_git_dirty_summary_reports_modified_files(self):
+        tracked = os.path.join(self.repo, "tracked.txt")
+        with open(tracked, "w", encoding="utf-8") as handle:
+            handle.write("hello\n")
+        tracker = eve.GitChangeTracker(self.repo)
+        summary = tracker.git_dirty_summary(limit=3)
+        self.assertEqual(summary["count"], 1)
+        self.assertIn("tracked.txt", summary["paths"][0])
+
+
+class TestGitCheckpoint(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        subprocess.run(["git", "init"], cwd=self.tmpdir, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.tmpdir, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=self.tmpdir, check=True)
+        self.tracked = os.path.join(self.tmpdir, "tracked.txt")
+        with open(self.tracked, "w", encoding="utf-8") as handle:
+            handle.write("base\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=self.tmpdir, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=self.tmpdir, check=True, capture_output=True, text=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_rollback_restores_checkpoint_state_and_untracked_files(self):
+        keep_path = os.path.join(self.tmpdir, "notes.txt")
+        with open(keep_path, "w", encoding="utf-8") as handle:
+            handle.write("keep me\n")
+        with open(self.tracked, "w", encoding="utf-8") as handle:
+            handle.write("draft\n")
+
+        checkpoint = eve.GitCheckpoint(self.tmpdir)
+        self.assertTrue(checkpoint.create("before-agent"))
+
+        with open(self.tracked, "w", encoding="utf-8") as handle:
+            handle.write("after\n")
+        generated = os.path.join(self.tmpdir, "generated.txt")
+        with open(generated, "w", encoding="utf-8") as handle:
+            handle.write("generated\n")
+
+        ok, message = checkpoint.rollback()
+        self.assertTrue(ok, message)
+        self.assertIn("before-agent", message)
+        with open(self.tracked, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "draft\n")
+        with open(keep_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "keep me\n")
+        self.assertFalse(os.path.exists(generated))
+
+    def test_list_checkpoints_includes_summary(self):
+        with open(self.tracked, "w", encoding="utf-8") as handle:
+            handle.write("draft\n")
+        checkpoint = eve.GitCheckpoint(self.tmpdir)
+        checkpoint.create("manual")
+        items = checkpoint.list_checkpoints()
+        self.assertEqual(items[0]["label"], "manual")
+        self.assertIn("tracked.txt", items[0]["summary"])
+
+
 class TestToolCallParsing(unittest.TestCase):
     def test_try_parse_json_value_converts_json_literals(self):
         self.assertIs(eve._try_parse_json_value("true"), True)
@@ -226,6 +305,56 @@ class TestSessionHelpers(unittest.TestCase):
         config = eve.Config()
         config.cwd = "."
         self.assertEqual(len(eve.Session._cwd_hash(config)), 16)
+
+
+class TestAutoTestRunner(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.module_path = os.path.join(self.tmpdir, "app.py")
+        with open(self.module_path, "w", encoding="utf-8") as handle:
+            handle.write("def add(a, b):\n    return a + b\n")
+        tests_dir = os.path.join(self.tmpdir, "tests")
+        os.makedirs(tests_dir)
+        open(os.path.join(tests_dir, "__init__.py"), "w", encoding="utf-8").close()
+        self.test_path = os.path.join(tests_dir, "test_app.py")
+        with open(self.test_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import unittest\n"
+                "import app\n\n"
+                "class AppTest(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(app.add(1, 2), 3)\n"
+            )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_auto_detect_prefers_unittest_for_importable_tests_package(self):
+        runner = eve.AutoTestRunner(self.tmpdir)
+        self.assertEqual(
+            runner.test_cmd,
+            ["python3", "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
+        )
+
+    def test_run_after_edit_returns_none_when_checks_pass(self):
+        runner = eve.AutoTestRunner(self.tmpdir)
+        runner.enabled = True
+        self.assertIsNone(runner.run_after_edit(self.module_path))
+
+    def test_run_after_edit_reports_test_failures(self):
+        with open(self.test_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import unittest\n"
+                "import app\n\n"
+                "class AppTest(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(app.add(1, 2), 4)\n"
+            )
+        runner = eve.AutoTestRunner(self.tmpdir)
+        runner.enabled = True
+        output = runner.run_after_edit(self.module_path)
+        self.assertIn("Test failure", output)
+        self.assertIn("FAILED", output)
 
 
 if __name__ == "__main__":

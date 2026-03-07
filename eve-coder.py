@@ -4601,6 +4601,101 @@ def _load_skills(config):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Git Change Tracker
+# ════════════════════════════════════════════════════════════════════════════════
+
+class GitChangeTracker:
+    """Tracks files changed by agent tool execution during the current session."""
+
+    MAX_EVENTS = 100
+
+    def __init__(self, cwd):
+        self.cwd = cwd
+        self._events = []  # list of (action, rel_path, timestamp)
+        self._lock = threading.Lock()
+        self._is_git_repo = os.path.isdir(os.path.join(cwd, ".git"))
+
+    def _relpath(self, file_path):
+        try:
+            real = os.path.realpath(file_path)
+            cwd_real = os.path.realpath(self.cwd)
+            if real.startswith(cwd_real + os.sep):
+                return os.path.relpath(real, cwd_real)
+        except (OSError, ValueError):
+            pass
+        return file_path
+
+    def record(self, action, file_path):
+        rel_path = self._relpath(file_path)
+        with self._lock:
+            self._events.append((action, rel_path, time.time()))
+            if len(self._events) > self.MAX_EVENTS:
+                self._events = self._events[-self.MAX_EVENTS:]
+
+    def recent_events(self, limit=5):
+        with self._lock:
+            items = list(self._events)
+        seen = set()
+        recent = []
+        for action, rel_path, ts in reversed(items):
+            if rel_path in seen:
+                continue
+            seen.add(rel_path)
+            recent.append((action, rel_path, ts))
+            if len(recent) >= limit:
+                break
+        return recent
+
+    def format_recent(self, limit=5):
+        icons = {
+            "create": "+",
+            "write": "~",
+            "edit": "~",
+            "notebook": "~",
+            "delete": "-",
+        }
+        lines = []
+        for action, rel_path, _ts in self.recent_events(limit):
+            lines.append(f"{icons.get(action, '~')} {rel_path} ({action})")
+        return lines
+
+    def git_dirty_summary(self, limit=5):
+        if not self._is_git_repo:
+            return None
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=self.cwd, capture_output=True, text=True, timeout=5
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        lines = [line.rstrip() for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            return {"count": 0, "paths": []}
+        paths = []
+        for line in lines[:limit]:
+            raw = _git_status_path(line)
+            if " -> " in raw:
+                raw = raw.split(" -> ", 1)[1]
+            paths.append(raw)
+        return {"count": len(lines), "paths": paths}
+
+
+def _git_status_path(line):
+    """Extract the file path from a git status --porcelain line."""
+    if not line:
+        return ""
+    if len(line) > 3 and line[2] == " ":
+        return line[3:]
+    stripped = line.lstrip()
+    if len(stripped) > 2 and stripped[1] == " ":
+        return stripped[2:]
+    return stripped
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Git Checkpoint & Rollback
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -4611,7 +4706,7 @@ class GitCheckpoint:
 
     def __init__(self, cwd):
         self.cwd = cwd
-        self._checkpoints = []  # list of (stash_ref, label, timestamp)
+        self._checkpoints = []  # list of dicts with stash snapshot metadata
         self._is_git_repo = self._check_git()
 
     def _check_git(self):
@@ -4632,26 +4727,136 @@ class GitCheckpoint:
                 ["git"] + args,
                 cwd=self.cwd, capture_output=True, text=True, timeout=timeout
             )
-            return result.returncode == 0, result.stdout.strip()
+            output = result.stdout.strip()
+            if not output:
+                output = result.stderr.strip()
+            return result.returncode == 0, output
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False, ""
 
-    def create(self, label="auto"):
-        """Create a checkpoint (git stash). Returns True if created."""
-        if not self._is_git_repo:
-            return False
-        # Check if there are changes to stash
+    def _get_status_lines(self):
         ok, status = self._run_git(["status", "--porcelain"])
-        if not ok or not status.strip():
-            return False  # nothing to checkpoint
-        # Include untracked files in stash
-        ok, ref = self._run_git(["stash", "push", "-u", "-m", f"eve-checkpoint: {label}"])
-        if ok:
-            self._checkpoints.append((len(self._checkpoints), label, time.time()))
-            if len(self._checkpoints) > self.MAX_CHECKPOINTS:
-                self._checkpoints = self._checkpoints[-self.MAX_CHECKPOINTS:]
-            return True
-        return False
+        if not ok:
+            return []
+        return [line for line in status.splitlines() if line.strip()]
+
+    def _get_untracked_files(self):
+        try:
+            result = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                cwd=self.cwd, capture_output=True, timeout=10
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+        if result.returncode != 0:
+            return []
+        raw = result.stdout.decode("utf-8", errors="replace")
+        return [path for path in raw.split("\0") if path]
+
+    def _snapshot_untracked_files(self, files):
+        snapshot_dir = tempfile.mkdtemp(prefix="eve-checkpoint-")
+        saved = []
+        try:
+            for rel_path in files:
+                abs_path = os.path.join(self.cwd, rel_path)
+                if os.path.islink(abs_path) or not os.path.isfile(abs_path):
+                    continue
+                dst_path = os.path.join(snapshot_dir, rel_path)
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                shutil.copy2(abs_path, dst_path)
+                saved.append(rel_path)
+        except Exception:
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
+            raise
+        return snapshot_dir, saved
+
+    def _trim_checkpoints(self):
+        if len(self._checkpoints) <= self.MAX_CHECKPOINTS:
+            return
+        old = self._checkpoints.pop(0)
+        self._drop_stash_entry(old.get("git_ref"))
+        snap_dir = old.get("snapshot_dir")
+        if snap_dir:
+            shutil.rmtree(snap_dir, ignore_errors=True)
+
+    def _drop_stash_entry(self, git_ref):
+        if not git_ref:
+            return
+        ok, output = self._run_git(["stash", "list", "--format=%H%x00%gd"])
+        if not ok or not output:
+            return
+        for line in output.splitlines():
+            parts = line.split("\x00", 1)
+            if len(parts) != 2:
+                continue
+            sha, stash_ref = parts
+            if sha == git_ref:
+                self._run_git(["stash", "drop", stash_ref])
+                return
+
+    def _build_checkpoint(self, label):
+        if not self._is_git_repo:
+            return None
+        status_lines = self._get_status_lines()
+        if not status_lines:
+            return None
+        ok, ref = self._run_git(["stash", "create"])
+        git_ref = ref.strip() if ok else ""
+        if git_ref:
+            self._run_git(["stash", "store", "-m", f"eve-checkpoint: {label}", git_ref])
+        untracked_files = self._get_untracked_files()
+        snapshot_dir = None
+        saved_untracked = []
+        if untracked_files:
+            snapshot_dir, saved_untracked = self._snapshot_untracked_files(untracked_files)
+        return {
+            "git_ref": git_ref,
+            "label": label,
+            "timestamp": time.time(),
+            "status_lines": status_lines,
+            "snapshot_dir": snapshot_dir,
+            "untracked_files": saved_untracked,
+        }
+
+    def create(self, label="auto"):
+        """Create a non-invasive checkpoint. Returns True if created."""
+        checkpoint = self._build_checkpoint(label)
+        if checkpoint is None:
+            return False
+        self._checkpoints.append(checkpoint)
+        self._trim_checkpoints()
+        return True
+
+    def _restore_untracked(self, checkpoint):
+        snap_dir = checkpoint.get("snapshot_dir")
+        if not snap_dir:
+            return True, ""
+        for rel_path in checkpoint.get("untracked_files", []):
+            src_path = os.path.join(snap_dir, rel_path)
+            dst_path = os.path.join(self.cwd, rel_path)
+            try:
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                shutil.copy2(src_path, dst_path)
+            except Exception as e:
+                return False, f"Failed to restore untracked file '{rel_path}': {e}"
+        return True, ""
+
+    def _apply_checkpoint(self, checkpoint):
+        ok, output = self._run_git(["reset", "--hard", "HEAD"], timeout=20)
+        if not ok:
+            return False, f"Rollback failed during reset: {output}"
+        ok, output = self._run_git(["clean", "-fd"], timeout=20)
+        if not ok:
+            return False, f"Rollback failed during clean: {output}"
+        git_ref = checkpoint.get("git_ref")
+        if git_ref:
+            ok, output = self._run_git(["stash", "apply", "--index", git_ref], timeout=20)
+            if not ok:
+                return False, f"Rollback failed while applying checkpoint: {output}"
+        ok, output = self._restore_untracked(checkpoint)
+        if not ok:
+            return False, output
+        return True, f"Rolled back to checkpoint: {checkpoint['label']}"
 
     def rollback(self):
         """Rollback to the last checkpoint. Returns (success, message)."""
@@ -4659,21 +4864,50 @@ class GitCheckpoint:
             return False, "Not a git repository"
         if not self._checkpoints:
             return False, "No checkpoints available"
-        # Pop the most recent stash
-        ok, output = self._run_git(["stash", "pop"])
+        checkpoint = self._checkpoints[-1]
+        backup = self._build_checkpoint("rollback-backup")
+        ok, message = self._apply_checkpoint(checkpoint)
         if ok:
-            cp = self._checkpoints.pop()
-            return True, f"Rolled back to checkpoint: {cp[1]}"
-        return False, f"Rollback failed: {output}"
+            self._checkpoints.pop()
+            self._drop_stash_entry(checkpoint.get("git_ref"))
+            snap_dir = checkpoint.get("snapshot_dir")
+            if snap_dir:
+                shutil.rmtree(snap_dir, ignore_errors=True)
+            if backup is not None:
+                self._drop_stash_entry(backup.get("git_ref"))
+                snap_dir = backup.get("snapshot_dir")
+                if snap_dir:
+                    shutil.rmtree(snap_dir, ignore_errors=True)
+            return True, message
+        if backup is not None:
+            restore_ok, restore_msg = self._apply_checkpoint(backup)
+            if not restore_ok:
+                message = f"{message}. Also failed to restore current changes: {restore_msg}"
+            self._drop_stash_entry(backup.get("git_ref"))
+            snap_dir = backup.get("snapshot_dir")
+            if snap_dir:
+                shutil.rmtree(snap_dir, ignore_errors=True)
+        return False, message
+
+    def summary(self):
+        return {
+            "count": len(self._checkpoints),
+            "latest": self._checkpoints[-1]["label"] if self._checkpoints else None,
+        }
 
     def list_checkpoints(self):
         """List available checkpoints."""
-        if not self._is_git_repo:
-            return []
-        ok, output = self._run_git(["stash", "list"])
-        if ok and output:
-            return [line for line in output.split("\n") if "eve-checkpoint" in line]
-        return []
+        items = []
+        for cp in reversed(self._checkpoints):
+            summary = ", ".join(_git_status_path(line).strip() for line in cp.get("status_lines", [])[:3])
+            if len(cp.get("status_lines", [])) > 3:
+                summary += ", ..."
+            items.append({
+                "label": cp["label"],
+                "timestamp": cp["timestamp"],
+                "summary": summary or "working tree snapshot",
+            })
+        return items
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -4686,24 +4920,64 @@ class AutoTestRunner:
     def __init__(self, cwd):
         self.cwd = cwd
         self.enabled = False
-        self.test_cmd = None  # e.g., "python3 -m pytest -x --tb=short"
-        self.lint_cmd = None  # e.g., "python3 -m py_compile"
+        self.test_cmd = None
+        self.lint_cmd = ["python3", "-m", "py_compile"]
         self._auto_detect()
+
+    @staticmethod
+    def _cmd_to_text(cmd):
+        return " ".join(cmd) if cmd else "(none)"
+
+    def describe(self):
+        return {
+            "lint": self._cmd_to_text(self.lint_cmd),
+            "test": self._cmd_to_text(self.test_cmd),
+        }
+
+    def _pytest_available(self):
+        return shutil.which("pytest") is not None
+
+    def _looks_like_pytest_config(self, path):
+        if not os.path.isfile(path):
+            return False
+        if os.path.basename(path) == "pytest.ini":
+            return True
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(20000)
+        except OSError:
+            return False
+        return ("[tool.pytest.ini_options]" in content
+                or "[pytest]" in content
+                or "tool:pytest" in content)
 
     def _auto_detect(self):
         """Auto-detect test/lint commands from project files."""
-        # Detect pytest
+        tests_dir = os.path.join(self.cwd, "tests")
+        has_tests_dir = os.path.isdir(tests_dir)
+        has_tests_pkg = os.path.isfile(os.path.join(tests_dir, "__init__.py"))
+        has_test_files = False
+        if has_tests_dir:
+            try:
+                has_test_files = any(
+                    name.startswith("test") and name.endswith(".py")
+                    for name in os.listdir(tests_dir)
+                )
+            except OSError:
+                has_test_files = False
+
         for marker in ["pytest.ini", "setup.cfg", "pyproject.toml"]:
-            if os.path.isfile(os.path.join(self.cwd, marker)):
-                self.test_cmd = "python3 -m pytest -x --tb=short -q"
+            cfg_path = os.path.join(self.cwd, marker)
+            if self._looks_like_pytest_config(cfg_path) and self._pytest_available():
+                self.test_cmd = ["python3", "-m", "pytest", "-x", "--tb=short", "-q"]
                 break
-        # Detect tests/ directory
-        if not self.test_cmd and os.path.isdir(os.path.join(self.cwd, "tests")):
-            self.test_cmd = "python3 -m pytest -x --tb=short -q"
-        # Detect package.json (npm test)
-        if os.path.isfile(os.path.join(self.cwd, "package.json")):
-            if not self.test_cmd:
-                self.test_cmd = "npm test"
+
+        if not self.test_cmd and has_tests_pkg:
+            self.test_cmd = ["python3", "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"]
+        elif not self.test_cmd and has_test_files:
+            self.test_cmd = ["python3", "-m", "unittest", "discover", "-s", ".", "-p", "test*.py", "-v"]
+        elif not self.test_cmd and os.path.isfile(os.path.join(self.cwd, "package.json")):
+            self.test_cmd = ["npm", "test"]
 
     def run_after_edit(self, file_path):
         """Run tests/lint after a file was modified. Returns error output or None."""
@@ -4716,22 +4990,11 @@ class AutoTestRunner:
         if file_path.endswith(".py") and self.lint_cmd:
             try:
                 result = subprocess.run(
-                    self.lint_cmd.split() + [file_path],
+                    self.lint_cmd + [file_path],
                     cwd=self.cwd, capture_output=True, text=True, timeout=30
                 )
                 if result.returncode != 0:
                     results.append(f"Lint error:\n{result.stderr or result.stdout}")
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
-        elif file_path.endswith(".py"):
-            # Default: py_compile check
-            try:
-                result = subprocess.run(
-                    ["python3", "-m", "py_compile", file_path],
-                    cwd=self.cwd, capture_output=True, text=True, timeout=15
-                )
-                if result.returncode != 0:
-                    results.append(f"Syntax error:\n{result.stderr}")
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass
 
@@ -4739,7 +5002,7 @@ class AutoTestRunner:
         if self.test_cmd:
             try:
                 result = subprocess.run(
-                    self.test_cmd.split(),
+                    self.test_cmd,
                     cwd=self.cwd, capture_output=True, text=True, timeout=120
                 )
                 if result.returncode != 0:
@@ -6947,7 +7210,7 @@ class TUI:
   {_c198}/clear{C.RESET}             Clear conversation
   {_c198}/model{C.RESET} <name>      Switch model
   {_c198}/models{C.RESET}            List installed models with tier info
-  {_c198}/status{C.RESET}            Session info
+  {_c198}/status{C.RESET}            Session, git, and recovery info
   {_c198}/save{C.RESET}              Save session
   {_c198}/compact{C.RESET}           Compress context to save memory
   {_c198}/undo{C.RESET}              Undo last file change
@@ -6972,10 +7235,11 @@ class TUI:
   {_c198}/plan{C.RESET}              Enter plan mode (explore + write plan)
   {_c198}/plan list{C.RESET}         List recent plan files
   {_c198}/approve{C.RESET}, {_c198}/act{C.RESET}     Exit plan → act mode (inject plan)
-  {_c198}/checkpoint{C.RESET}        Save git checkpoint
+  {_c198}/checkpoint{C.RESET}        Save non-invasive git checkpoint
+  {_c198}/checkpoint list{C.RESET}   List available checkpoints
   {_c198}/rollback{C.RESET}          Rollback to last checkpoint
   {_c51}━━ Extensions {sep[13:]}{C.RESET}
-  {_c198}/autotest{C.RESET}          Toggle auto lint+test after edits
+  {_c198}/autotest{C.RESET}          Toggle auto syntax+test after edits
   {_c198}/watch{C.RESET}             Toggle file watcher
   {_c198}/skills{C.RESET}            List loaded skills
   {_c51}━━ Keyboard {sep[11:]}{C.RESET}
@@ -6999,7 +7263,7 @@ class TUI:
   {_c51}{sep}{C.RESET}{ime_hint}
 """)
 
-    def show_status(self, session, config):
+    def show_status(self, session, config, agent=None):
         """Show session status with visual bar."""
         _c51 = _ansi("\033[38;5;51m")
         _c87 = _ansi("\033[38;5;87m")
@@ -7013,15 +7277,44 @@ class TUI:
         bar = bar_color + "█" * filled + _c240 + "░" * (bar_len - filled) + C.RESET
         sep_w = min(35, self._term_cols - 4)
         sep = "━" * sep_w
-        print(f"""
-  {_c51}━━ Status {sep[9:]}{C.RESET}
-  {_c87}Session{C.RESET}   {session.session_id}
-  {_c87}Messages{C.RESET}  {msgs}
-  {_c87}Context{C.RESET}   [{bar}] {pct}%  ~{tokens}/{config.context_window}
-  {_c87}Model{C.RESET}     {config.model}
-  {_c87}CWD{C.RESET}       {os.getcwd()}
-  {_c51}{sep}{C.RESET}
-""")
+        lines = [
+            "",
+            f"  {_c51}━━ Status {sep[9:]}{C.RESET}",
+            f"  {_c87}Session{C.RESET}   {session.session_id}",
+            f"  {_c87}Messages{C.RESET}  {msgs}",
+            f"  {_c87}Context{C.RESET}   [{bar}] {pct}%  ~{tokens}/{config.context_window}",
+            f"  {_c87}Model{C.RESET}     {config.model}",
+            f"  {_c87}CWD{C.RESET}       {os.getcwd()}",
+        ]
+        if agent is not None:
+            cp_summary = agent.git_checkpoint.summary()
+            lines.append(
+                f"  {_c87}Recovery{C.RESET}  checkpoints={cp_summary['count']} "
+                f"(latest: {cp_summary['latest'] or 'none'})"
+            )
+            auto_desc = agent.auto_test.describe()
+            lines.append(
+                f"  {_c87}Auto-test{C.RESET} {'ON' if agent.auto_test.enabled else 'OFF'}"
+                f"  lint={auto_desc['lint']}"
+            )
+            if agent.auto_test.test_cmd:
+                lines.append(f"  {_c240}            test={auto_desc['test']}{C.RESET}")
+            dirty = agent.change_tracker.git_dirty_summary()
+            if dirty is not None:
+                if dirty["count"] == 0:
+                    lines.append(f"  {_c87}Git{C.RESET}       working tree clean")
+                else:
+                    lines.append(f"  {_c87}Git{C.RESET}       {dirty['count']} file(s) modified")
+                    for path in dirty["paths"]:
+                        lines.append(f"  {_c240}            {path}{C.RESET}")
+            recent = agent.change_tracker.format_recent(limit=3)
+            if recent:
+                lines.append(f"  {_c87}Recent{C.RESET}    {recent[0]}")
+                for item in recent[1:]:
+                    lines.append(f"  {_c240}            {item}{C.RESET}")
+        lines.append(f"  {_c51}{sep}{C.RESET}")
+        lines.append("")
+        print("\n".join(lines))
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -7063,6 +7356,7 @@ class Agent:
         self._active_plan_path = None     # current plan file path
 
         self.git_checkpoint = GitCheckpoint(config.cwd)
+        self.change_tracker = GitChangeTracker(config.cwd)
         self.auto_test = AutoTestRunner(config.cwd)
         self.file_watcher = FileWatcher(config.cwd)
 
@@ -7411,8 +7705,19 @@ class Agent:
                         if self._interrupted.is_set() or _esc_monitor.pressed:
                             break
                         try:
+                            tracked_path = None
+                            if tool_name == "Write":
+                                tracked_path = tool_params.get("file_path", "")
+                            elif tool_name == "Edit":
+                                tracked_path = tool_params.get("file_path", "")
+                            elif tool_name == "NotebookEdit":
+                                tracked_path = tool_params.get("notebook_path", "")
+                            if tracked_path and not os.path.isabs(tracked_path):
+                                tracked_path = os.path.join(os.getcwd(), tracked_path)
+                            tracked_exists = bool(tracked_path and os.path.exists(tracked_path))
+
                             # Git checkpoint before write/edit operations
-                            if tool_name in ("Write", "Edit") and self.git_checkpoint._is_git_repo:
+                            if tool_name in ("Write", "Edit", "NotebookEdit") and self.git_checkpoint._is_git_repo:
                                 self.git_checkpoint.create(f"before-{tool_name.lower()}")
 
                             self.tui.start_tool_status(tool_name)
@@ -7427,6 +7732,15 @@ class Agent:
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
 
+                            if tracked_path and not _is_err and tool_name in ("Write", "Edit", "NotebookEdit"):
+                                if tool_name == "Write":
+                                    action = "write" if tracked_exists else "create"
+                                elif tool_name == "NotebookEdit":
+                                    action = "notebook"
+                                else:
+                                    action = "edit"
+                                self.change_tracker.record(action, tracked_path)
+
                             # Detect plan file creation
                             if tool_name == "Write" and self._plan_mode and not _is_err:
                                 fpath = tool_params.get("file_path", "")
@@ -7438,12 +7752,12 @@ class Agent:
                                     pass
 
                             # Refresh file watcher snapshot after writes
-                            if tool_name in ("Write", "Edit") and self.file_watcher.enabled:
+                            if tool_name in ("Write", "Edit", "NotebookEdit") and self.file_watcher.enabled:
                                 self.file_watcher.refresh_snapshot()
 
-                            # Auto test after Write/Edit
-                            if tool_name in ("Write", "Edit") and self.auto_test.enabled:
-                                fpath = tool_params.get("file_path", "")
+                            # Auto test after file modifications
+                            if tool_name in ("Write", "Edit", "NotebookEdit") and self.auto_test.enabled:
+                                fpath = tracked_path
                                 if fpath:
                                     test_errors = self.auto_test.run_after_edit(fpath)
                                     if test_errors:
@@ -7652,16 +7966,7 @@ def _exit_plan_mode(agent, session):
     agent._plan_mode = False
     # Non-invasive checkpoint: create stash ref without modifying working tree
     if agent.git_checkpoint._is_git_repo:
-        ok, ref = agent.git_checkpoint._run_git(["stash", "create"])
-        if ok and ref.strip():
-            agent.git_checkpoint._run_git(
-                ["stash", "store", "-m", "eve-checkpoint: plan-to-act", ref.strip()]
-            )
-            agent.git_checkpoint._checkpoints.append(
-                (len(agent.git_checkpoint._checkpoints), "plan-to-act", time.time())
-            )
-            if len(agent.git_checkpoint._checkpoints) > agent.git_checkpoint.MAX_CHECKPOINTS:
-                agent.git_checkpoint._checkpoints = agent.git_checkpoint._checkpoints[-agent.git_checkpoint.MAX_CHECKPOINTS:]
+        agent.git_checkpoint.create("plan-to-act")
     # Inject plan into session context
     if plan_content:
         session.add_system_note(
@@ -8012,7 +8317,7 @@ def main():
                     print(f"{C.DIM}Previous session saved as: {old_sid}{C.RESET}")
                     continue
                 elif cmd == "/status":
-                    tui.show_status(session, config)
+                    tui.show_status(session, config, agent=agent)
                     continue
                 elif cmd == "/save":
                     session.save()
@@ -8366,7 +8671,21 @@ def main():
 
                 # ── Git checkpoint & rollback ────────────────────────
                 elif cmd == "/checkpoint":
-                    if not agent.git_checkpoint._is_git_repo:
+                    parts = user_input.split(maxsplit=1)
+                    subcmd = parts[1].strip().lower() if len(parts) > 1 else ""
+                    if subcmd == "list":
+                        checkpoints = agent.git_checkpoint.list_checkpoints()
+                        if not checkpoints:
+                            print(f"{C.DIM}No checkpoints available.{C.RESET}")
+                        else:
+                            _c226 = _ansi(chr(27) + '[38;5;226m')
+                            _c240 = _ansi(chr(27) + '[38;5;240m')
+                            print(f"\n  {_c226}━━ Checkpoints ━━━━━━━━━━━━━━━━━━━{C.RESET}")
+                            for cp in checkpoints:
+                                ts = datetime.fromtimestamp(cp["timestamp"]).strftime("%H:%M:%S")
+                                print(f"  {cp['label']}  {_c240}({ts}) {cp['summary']}{C.RESET}")
+                            print(f"  {_c226}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    elif not agent.git_checkpoint._is_git_repo:
                         print(f"{C.YELLOW}Not a git repository. Initialize with: git init{C.RESET}")
                     else:
                         if agent.git_checkpoint.create("manual"):
@@ -8389,10 +8708,12 @@ def main():
                     state = f"{C.GREEN}ON{C.RESET}" if agent.auto_test.enabled else f"{C.RED}OFF{C.RESET}"
                     print(f"  Auto-test: {state}")
                     if agent.auto_test.enabled:
+                        desc = agent.auto_test.describe()
+                        print(f"  {C.DIM}Syntax command: {desc['lint']}{C.RESET}")
                         if agent.auto_test.test_cmd:
-                            print(f"  {C.DIM}Test command: {agent.auto_test.test_cmd}{C.RESET}")
+                            print(f"  {C.DIM}Test command: {desc['test']}{C.RESET}")
                         else:
-                            print(f"  {C.DIM}No test command detected. Tests will only run syntax checks.{C.RESET}")
+                            print(f"  {C.DIM}No test command detected. Only syntax checks will run.{C.RESET}")
                     continue
 
                 # ── File watcher toggle ───────────────────────────────
