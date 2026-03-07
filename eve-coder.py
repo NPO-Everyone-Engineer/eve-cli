@@ -751,6 +751,17 @@ class Config:
         self.permissions_file = os.path.join(self.config_dir, "permissions.json")
         self.sessions_dir = os.path.join(self.state_dir, "sessions")
         self.history_file = os.path.join(self.state_dir, "history")
+        # Settings JSON files (Claude CLI compatible hierarchy)
+        self.user_settings_file = os.path.join(self.config_dir, "settings.json")
+        # Project-level settings (set after cwd is known)
+        self.project_settings_file = None    # .claude/settings.json (shared/committed)
+        self.local_settings_file = None      # .claude/settings.local.json (local, gitignored)
+        # Merged settings from all layers
+        self.settings = {}
+        # Hooks config from settings
+        self.hooks = {}
+        # Status line script path
+        self.statusline_script = None
 
     def load(self, argv=None):
         """Load config from file, then env, then CLI args (later overrides earlier)."""
@@ -760,7 +771,48 @@ class Config:
         self._auto_detect_model()
         self._validate_ollama_host()
         self._ensure_dirs()
+        self._load_settings_json()
         return self
+
+    def _load_settings_json(self):
+        """Load layered settings.json files: user → project → local (later overrides)."""
+        cwd = self.cwd
+        self.project_settings_file = os.path.join(cwd, ".claude", "settings.json")
+        self.local_settings_file = os.path.join(cwd, ".claude", "settings.local.json")
+
+        merged = {}
+        for path in [self.user_settings_file, self.project_settings_file, self.local_settings_file]:
+            if not path or not os.path.isfile(path) or os.path.islink(path):
+                continue
+            try:
+                if os.path.getsize(path) > 65536:
+                    continue
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    # Merge: top-level keys overwrite, 'permissions' and 'hooks' merge deeply
+                    for k, v in data.items():
+                        if k in ("permissions", "hooks") and isinstance(v, dict) and isinstance(merged.get(k), dict):
+                            merged[k].update(v)
+                        else:
+                            merged[k] = v
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        self.settings = merged
+
+        # Apply settings to config fields
+        if "model" in merged and not self.model:
+            self.model = merged["model"]
+        if "hooks" in merged and isinstance(merged["hooks"], dict):
+            self.hooks = merged["hooks"]
+        if "statusline" in merged and isinstance(merged["statusline"], str):
+            self.statusline_script = merged["statusline"]
+        # Apply env vars from settings
+        if "env" in merged and isinstance(merged["env"], dict):
+            for k, v in merged["env"].items():
+                if isinstance(k, str) and isinstance(v, str) and k not in os.environ:
+                    os.environ[k] = v
 
     def _load_config_file(self):
         # Check old eve-coder config for backward compatibility, then current config
@@ -1359,8 +1411,8 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
                 '[BLOCKED]', safe, flags=re.DOTALL)
         return safe
 
-    def _load_instructions(fpath, max_bytes=4000):
-        """Load instructions file, returning (content, truncated_bool)."""
+    def _load_instructions(fpath, max_bytes=8000):
+        """Load instructions file with @file import support, returning (content, truncated_bool)."""
         try:
             file_size = os.path.getsize(fpath)
         except OSError:
@@ -1368,6 +1420,22 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
         with open(fpath, encoding="utf-8") as f:
             content = f.read(max_bytes)
         truncated = file_size > max_bytes
+        # Resolve @file imports (e.g. @.claude/rules/style.md)
+        base_dir = os.path.dirname(os.path.abspath(fpath))
+        def _resolve_import(m):
+            import_path = m.group(1).strip()
+            if import_path.startswith("/"):
+                full_path = import_path
+            else:
+                full_path = os.path.join(base_dir, import_path)
+            if os.path.isfile(full_path) and not os.path.islink(full_path):
+                try:
+                    with open(full_path, encoding="utf-8") as rf:
+                        return rf.read(4000)
+                except Exception:
+                    return m.group(0)
+            return m.group(0)
+        content = re.sub(r'^@(\S+)', _resolve_import, content, flags=re.MULTILINE)
         return content, truncated
 
     # 1. Global instructions (~/.config/eve-cli/CLAUDE.md)
@@ -1375,31 +1443,37 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
     if os.path.isfile(global_md) and not os.path.islink(global_md):
         try:
             content, truncated = _load_instructions(global_md)
-            trunc_note = "\n[Note: file truncated, only first 4000 bytes loaded]" if truncated else ""
+            trunc_note = "\n[Note: file truncated, only first 8000 bytes loaded]" if truncated else ""
             prompt += f"\n# Global Instructions\n{_sanitize_instructions(content)}{trunc_note}\n"
         except Exception:
             pass
 
     # 2. Parent directory hierarchy → cwd (walk up from cwd to find CLAUDE.md in parent dirs)
+    # Checks both root CLAUDE.md and .claude/CLAUDE.md at each level
     instruction_files = []
     search_dir = cwd
     for _ in range(10):  # max 10 levels up
-        for fname in [".eve-coder.json", "CLAUDE.md"]:
+        for fname in [".eve-coder.json", ".claude/CLAUDE.md", "CLAUDE.md"]:
             fpath = os.path.join(search_dir, fname)
             if os.path.isfile(fpath) and not os.path.islink(fpath):
                 instruction_files.append((search_dir, fname, fpath))
-                break  # prefer .eve-coder.json over CLAUDE.md at same level
+                if fname == ".eve-coder.json":
+                    break  # .eve-coder.json takes precedence at same level
         parent = os.path.dirname(search_dir)
         if parent == search_dir:
             break  # reached filesystem root
         search_dir = parent
 
     # Load in order: most distant ancestor first, cwd last (so cwd overrides)
+    seen_paths = set()
     for search_dir, fname, fpath in reversed(instruction_files):
+        if fpath in seen_paths:
+            continue
+        seen_paths.add(fpath)
         try:
             content, truncated = _load_instructions(fpath)
             safe_content = _sanitize_instructions(content)
-            trunc_note = "\n[Note: file truncated, only first 4000 bytes loaded]" if truncated else ""
+            trunc_note = "\n[Note: file truncated, only first 8000 bytes loaded]" if truncated else ""
             rel = os.path.relpath(search_dir, cwd) if search_dir != cwd else "."
             prompt += f"\n# Project Instructions (from {rel}/{fname})\n{safe_content}{trunc_note}\n"
         except PermissionError:
@@ -4086,6 +4160,102 @@ class TaskUpdateTool(Tool):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# TodoWrite — Claude CLI compatible todo list management
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TodoWriteTool(Tool):
+    """Claude CLI compatible todo list management.
+
+    Replaces the entire todo list in one call. Use this to:
+    - Create the initial task list at the start of complex work
+    - Update task statuses (pending → in_progress → completed)
+    - Mark tasks complete immediately after finishing them
+
+    Only ONE task should be in_progress at a time.
+    """
+    name = "TodoWrite"
+    description = (
+        "Create and manage a structured task list. Replaces the entire todo list. "
+        "Use for multi-step tasks to track progress. "
+        "Each todo needs: content (imperative form), status (pending/in_progress/completed), "
+        "and activeForm (present-continuous form shown during execution). "
+        "Keep exactly ONE task in_progress at a time. "
+        "Mark tasks completed IMMEDIATELY after finishing."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "todos": {
+                "type": "array",
+                "description": "The complete updated todo list",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "Imperative form of the task (e.g. 'Fix login bug')",
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                            "description": "Task status",
+                        },
+                        "activeForm": {
+                            "type": "string",
+                            "description": "Present-continuous form shown during execution (e.g. 'Fixing login bug')",
+                        },
+                    },
+                    "required": ["content", "status", "activeForm"],
+                },
+            },
+        },
+        "required": ["todos"],
+    }
+
+    def execute(self, params):
+        todos = params.get("todos", [])
+        if not isinstance(todos, list):
+            return "Error: todos must be an array"
+
+        in_progress_count = sum(1 for t in todos if t.get("status") == "in_progress")
+        if in_progress_count > 1:
+            return f"Error: only 1 task can be in_progress at a time (found {in_progress_count})"
+
+        # Replace the entire task store with new todos
+        with _task_store_lock:
+            _task_store["tasks"].clear()
+            _task_store["next_id"] = 1
+            for i, todo in enumerate(todos):
+                if not isinstance(todo, dict):
+                    continue
+                content = str(todo.get("content", "")).strip()
+                status = str(todo.get("status", "pending")).strip()
+                active_form = str(todo.get("activeForm", "")).strip()
+                if not content:
+                    continue
+                if status not in ("pending", "in_progress", "completed"):
+                    status = "pending"
+                tid = str(_task_store["next_id"])
+                _task_store["next_id"] += 1
+                _task_store["tasks"][tid] = {
+                    "id": tid,
+                    "subject": content,
+                    "description": content,
+                    "activeForm": active_form or f"Working on: {content}",
+                    "status": status,
+                    "blocks": [],
+                    "blockedBy": [],
+                }
+
+        # Show a compact summary
+        lines = []
+        for tid, t in _task_store["tasks"].items():
+            icon = {"pending": "○", "in_progress": "◉", "completed": "✓"}.get(t["status"], "○")
+            lines.append(f"  {icon} {t['subject']}")
+        return "Todo list updated:\n" + "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # AskUserQuestion — Interactive prompt during execution
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -5098,7 +5268,7 @@ class ToolRegistry:
         for cls in [BashTool, ReadTool, WriteTool, EditTool, GlobTool,
                     GrepTool, WebFetchTool, WebSearchTool, NotebookEditTool,
                     TaskCreateTool, TaskListTool, TaskGetTool, TaskUpdateTool,
-                    AskUserQuestionTool]:
+                    TodoWriteTool, AskUserQuestionTool]:
             self.register(cls())
         return self
 
@@ -5111,7 +5281,7 @@ class PermissionMgr:
     """Manages tool execution permissions."""
 
     SAFE_TOOLS = {"Read", "Glob", "Grep", "SubAgent", "AskUserQuestion",
-                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate"}
+                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TodoWrite"}
     ASK_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit"}
     NETWORK_TOOLS = {"WebFetch", "WebSearch"}
 
@@ -5214,6 +5384,125 @@ class PermissionMgr:
     def session_allow(self, tool_name):
         """Allow a tool for the rest of this session."""
         self._session_allows.add(tool_name)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Auto Memory — Session-to-session memory persistence (Claude CLI compatible)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class AutoMemory:
+    """Persistent memory that survives across sessions, per-project.
+
+    Stored at: ~/.local/state/eve-cli/projects/<cwd_hash>/MEMORY.md
+    First 200 lines are loaded into every session's system prompt.
+    The AI can write to memory via the Memory tool or /memory command.
+    """
+    MAX_LOAD_LINES = 200
+    MAX_FILE_BYTES = 65536  # 64KB cap
+
+    def __init__(self, config):
+        self.config = config
+        cwd_hash = hashlib.sha256(
+            os.path.abspath(config.cwd).encode("utf-8")
+        ).hexdigest()[:16]
+        self._dir = os.path.join(config.state_dir, "projects", cwd_hash)
+        self._path = os.path.join(self._dir, "MEMORY.md")
+        self._lock = threading.Lock()
+
+    @property
+    def path(self):
+        return self._path
+
+    def load(self):
+        """Load first MAX_LOAD_LINES lines of memory. Returns '' if not found."""
+        if not os.path.isfile(self._path) or os.path.islink(self._path):
+            return ""
+        try:
+            if os.path.getsize(self._path) > self.MAX_FILE_BYTES:
+                return ""
+            with open(self._path, encoding="utf-8") as f:
+                lines = []
+                for i, line in enumerate(f):
+                    if i >= self.MAX_LOAD_LINES:
+                        break
+                    lines.append(line)
+            return "".join(lines).strip()
+        except (OSError, IOError):
+            return ""
+
+    def append(self, content):
+        """Append content to memory file. Creates file and dirs if needed."""
+        content = content.strip()
+        if not content:
+            return "Error: content is empty"
+        with self._lock:
+            try:
+                os.makedirs(self._dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                with open(self._path, "a", encoding="utf-8") as f:
+                    f.write(f"\n<!-- {timestamp} -->\n{content}\n")
+                return f"Memory saved to {self._path}"
+            except (OSError, IOError) as e:
+                return f"Error saving memory: {e}"
+
+    def replace(self, content):
+        """Replace entire memory file content."""
+        with self._lock:
+            try:
+                os.makedirs(self._dir, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(dir=self._dir, suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    os.chmod(tmp, 0o600)
+                    os.replace(tmp, self._path)
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+                return f"Memory replaced in {self._path}"
+            except (OSError, IOError) as e:
+                return f"Error replacing memory: {e}"
+
+
+class MemoryTool(Tool):
+    """Write notes to persistent memory that persists across sessions."""
+    name = "Memory"
+    description = (
+        "Save important information to persistent memory that survives across sessions. "
+        "Use for: key findings, user preferences, project patterns, learned context. "
+        "Content is automatically loaded at each session start (first 200 lines). "
+        "Use action='append' to add notes, action='replace' to rewrite entire memory."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["append", "replace"],
+                "description": "append: add to existing memory; replace: overwrite entire memory",
+            },
+            "content": {
+                "type": "string",
+                "description": "Markdown content to save",
+            },
+        },
+        "required": ["action", "content"],
+    }
+
+    def __init__(self, auto_memory):
+        self._auto_memory = auto_memory
+
+    def execute(self, params):
+        action = params.get("action", "append")
+        content = params.get("content", "")
+        if not content:
+            return "Error: content is required"
+        if action == "replace":
+            return self._auto_memory.replace(content)
+        return self._auto_memory.append(content)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -6952,7 +7241,9 @@ class TUI:
   {_c198}/compact{C.RESET}           Compress context to save memory
   {_c198}/undo{C.RESET}              Undo last file change
   {_c198}/config{C.RESET}            Show configuration
-  {_c198}/tokens{C.RESET}            Show token usage
+  {_c198}/tokens{C.RESET}, {_c198}/cost{C.RESET}     Show token usage & session cost
+  {_c198}/context{C.RESET}           Show context usage as colored grid
+  {_c198}/memory{C.RESET}            View/manage auto memory (per-project notes)
   {_c198}/init{C.RESET}              Create CLAUDE.md template
   {_c198}/yes{C.RESET}               Auto-approve ON
   {_c198}/no{C.RESET}                Auto-approve OFF
@@ -6994,8 +7285,9 @@ class TUI:
   {_c51}━━ Tools {sep[8:]}{C.RESET}
   {_c87}Bash, Read, Write, Edit, Glob, Grep,{C.RESET}
   {_c87}WebFetch, WebSearch, NotebookEdit,{C.RESET}
-  {_c87}TaskCreate/List/Get/Update, SubAgent,{C.RESET}
-  {_c87}ParallelAgents, AskUserQuestion{C.RESET}
+  {_c87}TaskCreate/List/Get/Update, TodoWrite,{C.RESET}
+  {_c87}Memory, SubAgent, ParallelAgents,{C.RESET}
+  {_c87}AskUserQuestion{C.RESET}
   {_c51}{sep}{C.RESET}{ime_hint}
 """)
 
@@ -7028,6 +7320,74 @@ class TUI:
 # Agent — The core agent loop
 # ════════════════════════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════════════════════════
+# Hook Manager — Event-based automation (Claude CLI compatible)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class HookManager:
+    """Run shell command hooks on lifecycle events.
+
+    Hook events: SessionStart, PreToolUse, PostToolUse, Stop
+    Hooks are configured in settings.json under the "hooks" key:
+      {
+        "hooks": {
+          "SessionStart": [{"command": "echo 'Session started'"}],
+          "PreToolUse":   [{"matcher": "Bash", "command": "echo 'Running bash'"}],
+          "PostToolUse":  [{"command": "echo done"}],
+          "Stop":         [{"command": "echo 'All done'"}]
+        }
+      }
+    Hook commands receive JSON on stdin with event context.
+    Exit code 2 from PreToolUse blocks the tool call.
+    """
+
+    VALID_EVENTS = {"SessionStart", "PreToolUse", "PostToolUse", "Stop"}
+
+    def __init__(self, config):
+        self._hooks = config.hooks if hasattr(config, "hooks") else {}
+        self._debug = config.debug
+
+    def fire(self, event, payload=None):
+        """Fire hooks for an event. Returns (blocked, message) for PreToolUse."""
+        if event not in self.VALID_EVENTS:
+            return False, None
+        hooks = self._hooks.get(event, [])
+        if not hooks:
+            return False, None
+
+        stdin_data = json.dumps(payload or {}, ensure_ascii=False)
+        for hook in hooks:
+            if not isinstance(hook, dict):
+                continue
+            command = hook.get("command", "")
+            if not command:
+                continue
+            # Matcher: only fire if tool name matches (for PreToolUse/PostToolUse)
+            matcher = hook.get("matcher", "")
+            if matcher and payload and not re.search(matcher, payload.get("tool", ""), re.IGNORECASE):
+                continue
+            try:
+                result = subprocess.run(
+                    command, shell=True, input=stdin_data, capture_output=True,
+                    text=True, timeout=30,
+                )
+                if self._debug:
+                    print(f"[hook:{event}] exit={result.returncode}", file=sys.stderr)
+                    if result.stdout.strip():
+                        print(f"[hook:{event}] stdout: {result.stdout.strip()}", file=sys.stderr)
+                # Exit code 2 = block (only meaningful for PreToolUse)
+                if event == "PreToolUse" and result.returncode == 2:
+                    msg = result.stdout.strip() or "Blocked by hook"
+                    return True, msg
+            except subprocess.TimeoutExpired:
+                if self._debug:
+                    print(f"[hook:{event}] timed out", file=sys.stderr)
+            except Exception as e:
+                if self._debug:
+                    print(f"[hook:{event}] error: {e}", file=sys.stderr)
+        return False, None
+
+
 class Agent:
     """The main agent that orchestrates LLM calls and tool execution."""
 
@@ -7041,7 +7401,7 @@ class Agent:
         "Read", "Glob", "Grep", "WebFetch", "WebSearch",
         "Write",              # restricted to .eve-cli/plans/ only (runtime guard)
         "AskUserQuestion",    # clarify requirements during planning
-        "TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
+        "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TodoWrite",
         "SubAgent",
     }
 
@@ -7065,6 +7425,7 @@ class Agent:
         self.git_checkpoint = GitCheckpoint(config.cwd)
         self.auto_test = AutoTestRunner(config.cwd)
         self.file_watcher = FileWatcher(config.cwd)
+        self.hooks = HookManager(config)
 
     @staticmethod
     def _detect_parallel_tasks(user_input):
@@ -7263,8 +7624,13 @@ class Agent:
                 # 3. Add to history
                 self.session.add_assistant_message(text, tool_calls if tool_calls else None)
 
-                # 4. If no tool calls, we're done
+                # 4. If no tool calls, we're done — fire Stop hook
                 if not tool_calls:
+                    self.hooks.fire("Stop", {
+                        "session_id": self.session.session_id,
+                        "iterations": iteration,
+                        "msgs": len(self.session.messages),
+                    })
                     break
 
                 # 5. Detect infinite tool call loops
@@ -7354,6 +7720,14 @@ class Agent:
                         results.append(ToolResult(tc_id, "Permission denied by user. Do not retry this operation.", True))
                         self.tui.show_tool_result(tool_name, "Permission denied", True)
                         continue
+                    # PreToolUse hook — exit code 2 blocks the call
+                    _hook_blocked, _hook_msg = self.hooks.fire(
+                        "PreToolUse", {"tool": tool_name, "params": tool_params}
+                    )
+                    if _hook_blocked:
+                        results.append(ToolResult(tc_id, f"Blocked by hook: {_hook_msg}", True))
+                        self.tui.show_tool_result(tool_name, f"Blocked by hook: {_hook_msg}", True)
+                        continue
                     validated_calls.append((tc_id, tool_name, tool_params, tool))
 
                 # Phase 3: Execute — parallel for read-only tools, sequential otherwise
@@ -7426,6 +7800,11 @@ class Agent:
                             self.tui.show_tool_result(tool_name, output, is_error=_is_err,
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
+                            # PostToolUse hook (fire-and-forget, non-blocking)
+                            self.hooks.fire("PostToolUse", {
+                                "tool": tool_name, "params": tool_params,
+                                "output": str(output)[:500], "is_error": _is_err,
+                            })
 
                             # Detect plan file creation
                             if tool_name == "Write" and self._plan_mode and not _is_err:
@@ -7826,6 +8205,12 @@ def main():
             print(f"{C.YELLOW}RAG initialization warning: {e}{C.RESET}")
             _rag_engine = None
 
+    # Auto memory: load persistent per-project notes into system prompt
+    auto_memory = AutoMemory(config)
+    memory_content = auto_memory.load()
+    if memory_content:
+        system_prompt += f"\n\n# Auto Memory (per-project notes from previous sessions)\n{memory_content}\n"
+
     session = Session(config, system_prompt)
     session.set_client(client)  # enable sidecar model for context compaction
     registry = ToolRegistry().register_defaults()
@@ -7833,6 +8218,7 @@ def main():
     registry.register(SubAgentTool(config, client, registry, permissions))
     coordinator = MultiAgentCoordinator(config, client, registry, permissions)
     registry.register(ParallelAgentTool(coordinator))
+    registry.register(MemoryTool(auto_memory))
 
     # Initialize MCP servers
     _mcp_clients = []
@@ -7861,6 +8247,14 @@ def main():
 
     agent = Agent(config, client, registry, permissions, session, tui,
                   rag_engine=_rag_engine)
+
+    # Fire SessionStart hook
+    agent.hooks.fire("SessionStart", {
+        "session_id": session.session_id,
+        "cwd": config.cwd,
+        "model": config.model,
+        "resumed": config.resume,
+    })
 
     # Handle Ctrl+C gracefully
     def signal_handler(sig, frame):
@@ -7945,14 +8339,44 @@ def main():
 
     # Scroll region: activate for the entire interactive session
     global _active_scroll_region
+    def _build_status_line(pct, model, state="Ready"):
+        """Build the status line text. If config.statusline_script is set, run it."""
+        if config.statusline_script and shutil.which(config.statusline_script.split()[0]):
+            try:
+                stdin_data = json.dumps({
+                    "pct": pct, "model": model, "state": state,
+                    "tokens": session.get_token_estimate(),
+                    "context_window": config.context_window,
+                    "msgs": len(session.messages),
+                    "cwd": config.cwd,
+                    "session_id": session.session_id,
+                })
+                result = subprocess.run(
+                    config.statusline_script, shell=True, input=stdin_data,
+                    capture_output=True, text=True, timeout=2,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            except Exception:
+                pass
+        # Default built-in status line
+        if pct >= 80:
+            ctx_color = "\033[38;5;196m"
+        elif pct >= 50:
+            ctx_color = "\033[38;5;226m"
+        else:
+            ctx_color = "\033[38;5;51m"
+        return (
+            f"\033[38;5;51m✦ {state}\033[0m "
+            f"\033[38;5;240m│ {ctx_color}ctx:{pct}%\033[38;5;240m │ {model}\033[0m"
+        )
+
     _scroll_mode = tui.scroll_region.supported()
     if _scroll_mode:
         _active_scroll_region = tui.scroll_region
         # Store status BEFORE setup() so footer includes it in initial draw
         pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
-        tui.scroll_region.update_status(
-            f"\033[38;5;51m✦ Ready\033[0m \033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m"
-        )
+        tui.scroll_region.update_status(_build_status_line(pct, config.model))
         tui.scroll_region.update_hint("")
         tui.scroll_region.setup()
 
@@ -8086,7 +8510,7 @@ def main():
                     permissions.yes_mode = False
                     print(f"{C.GREEN}Auto-approve disabled. Tool calls will require confirmation.{C.RESET}")
                     continue
-                elif cmd == "/tokens":
+                elif cmd in ("/tokens", "/cost"):
                     tokens = session.get_token_estimate()
                     msgs = len(session.messages)
                     pct = min(int((tokens / config.context_window) * 100), 100)
@@ -8097,12 +8521,52 @@ def main():
                     _c240 = _ansi("\033[38;5;240m")
                     bar_color = _ansi("\033[38;5;46m") if pct < 50 else _ansi("\033[38;5;226m") if pct < 80 else _ansi("\033[38;5;196m")
                     bar = bar_color + "█" * filled + _c240 + "░" * (bar_len - filled) + C.RESET
-                    print(f"\n  {_c51}━━ Token Usage ━━━━━━━━━━━━━━━━━━━━{C.RESET}")
-                    print(f"  [{bar}] {pct}%")
+                    # Session duration
+                    _elapsed = int(time.time() - _session_start_time)
+                    _mins, _secs = divmod(_elapsed, 60)
+                    _dur_str = f"{_mins}m {_secs}s" if _mins else f"{_secs}s"
+                    # New messages this session
+                    _new_msgs = len(session.messages) - _session_start_msgs
+                    print(f"\n  {_c51}━━ Session Cost & Token Usage ━━━━━{C.RESET}")
+                    print(f"  [{bar}] {pct}%  context")
                     print(f"  {_c87}~{tokens:,}{C.RESET} / {_c240}{config.context_window:,} tokens{C.RESET}")
-                    print(f"  {_c87}{msgs}{C.RESET} {_c240}messages in session{C.RESET}")
+                    print(f"  {_c87}{msgs}{C.RESET} {_c240}total messages  ({_new_msgs} this session){C.RESET}")
+                    print(f"  {_c87}Duration:{C.RESET} {_c240}{_dur_str}{C.RESET}  {_c87}Model:{C.RESET} {_c240}{config.model}{C.RESET}")
                     if pct >= 80:
                         print(f"  {_ansi(chr(27)+'[38;5;196m')}⚠ Context almost full! Use /compact or /clear{C.RESET}")
+                    print(f"  {_c51}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    continue
+                elif cmd == "/context":
+                    # Visual context grid (each cell = ~1% of context window)
+                    tokens = session.get_token_estimate()
+                    pct = min(int((tokens / config.context_window) * 100), 100)
+                    _c51 = _ansi("\033[38;5;51m")
+                    _c87 = _ansi("\033[38;5;87m")
+                    _c240 = _ansi("\033[38;5;240m")
+                    # 10x10 grid = 100 cells, each cell = 1%
+                    COLS = 20
+                    ROWS = 5
+                    TOTAL = COLS * ROWS  # 100 cells
+                    filled_cells = min(int(pct * TOTAL / 100), TOTAL)
+                    if pct < 50:
+                        cell_color = _ansi("\033[38;5;46m")    # green
+                    elif pct < 80:
+                        cell_color = _ansi("\033[38;5;226m")   # yellow
+                    else:
+                        cell_color = _ansi("\033[38;5;196m")   # red
+                    print(f"\n  {_c51}━━ Context Usage ━━━━━━━━━━━━━━━━━━{C.RESET}")
+                    for row in range(ROWS):
+                        line = "  "
+                        for col in range(COLS):
+                            cell_idx = row * COLS + col
+                            if cell_idx < filled_cells:
+                                line += cell_color + "▓" + C.RESET
+                            else:
+                                line += _c240 + "░" + C.RESET
+                        print(line)
+                    print(f"  {_c87}{pct}%{C.RESET} {_c240}({tokens:,} / {config.context_window:,} tokens){C.RESET}")
+                    if pct >= 80:
+                        print(f"  {_ansi(chr(27)+'[38;5;196m')}⚠ Context nearly full — use /compact to free space{C.RESET}")
                     print(f"  {_c51}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
                     continue
                 # ── Git commands ──────────────────────────────────────
@@ -8516,6 +8980,25 @@ def main():
                             print(f"{C.RED}Failed to create CLAUDE.md: {e}{C.RESET}")
                     continue
 
+                elif cmd == "/memory":
+                    _c51m = _ansi("\033[38;5;51m")
+                    _c87m = _ansi("\033[38;5;87m")
+                    _c240m = _ansi("\033[38;5;240m")
+                    mem_content = auto_memory.load()
+                    print(f"\n  {_c51m}━━ Auto Memory ━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+                    print(f"  {_c240m}File: {auto_memory.path}{C.RESET}")
+                    if mem_content:
+                        print(f"  {_c87m}Content:{C.RESET}")
+                        for line in mem_content.split("\n")[:20]:
+                            print(f"  {line}")
+                        if mem_content.count("\n") > 20:
+                            print(f"  {_c240m}... (use editor to view full file){C.RESET}")
+                    else:
+                        print(f"  {_c240m}(empty — the AI will write notes here automatically){C.RESET}")
+                    print(f"  {_c240m}Tip: AI writes here with Memory tool; you can edit directly{C.RESET}")
+                    print(f"  {_c51m}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    continue
+
                 elif cmd == "/config":
                     _c51x = _ansi("\033[38;5;51m")
                     _c87x = _ansi("\033[38;5;87m")
@@ -8531,6 +9014,12 @@ def main():
                     print(f"  {_c87x}Debug{C.RESET}         {'ON' if config.debug else 'OFF'}")
                     print(f"\n  {_c240x}Config: {config.config_file}{C.RESET}")
                     print(f"  {_c240x}Format: KEY=VALUE (MODEL=qwen3:8b){C.RESET}")
+                    if config.project_settings_file and os.path.isfile(config.project_settings_file):
+                        print(f"  {_c240x}Project settings: {config.project_settings_file}{C.RESET}")
+                    if config.local_settings_file and os.path.isfile(config.local_settings_file):
+                        print(f"  {_c240x}Local settings: {config.local_settings_file}{C.RESET}")
+                    if config.statusline_script:
+                        print(f"  {_c240x}Statusline: {config.statusline_script}{C.RESET}")
                     print(f"  {_c51x}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
                     continue
 
@@ -8737,9 +9226,7 @@ def main():
             # Update scroll region status back to "Ready"
             if _scroll_mode and tui.scroll_region._active:
                 pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
-                tui.scroll_region.update_status(
-                    f"\033[38;5;51m✦ Ready\033[0m \033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m"
-                )
+                tui.scroll_region.update_status(_build_status_line(pct, config.model))
                 tui.scroll_region.update_hint("")
 
         except KeyboardInterrupt:
@@ -8760,9 +9247,7 @@ def main():
             # Restore "Ready" status after interrupt
             if _scroll_mode and tui.scroll_region._active:
                 pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
-                tui.scroll_region.update_status(
-                    f"\033[38;5;51m✦ Ready\033[0m \033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m"
-                )
+                tui.scroll_region.update_status(_build_status_line(pct, config.model))
                 tui.scroll_region.update_hint("")
             continue
         except EOFError:
