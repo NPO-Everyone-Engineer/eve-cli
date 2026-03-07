@@ -28,6 +28,9 @@ node_modules/
 # Claude Code
 .claude/
 
+# qwen3.5 rules
+.qwen/
+
 # IDE
 .vscode/
 .idea/

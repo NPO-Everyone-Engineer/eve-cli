@@ -236,6 +236,7 @@ class ScrollRegion:
         self._scroll_end = 0
         self._status_text = ""
         self._hint_text = ""
+        self._mode_display = ""  # Display current mode (model name) in footer
         # TUI debug logging: set EVE_DEBUG_TUI=1 to log escape sequences
         self._debug_log = None
         if os.environ.get("EVE_DEBUG_TUI") == "1":
@@ -434,6 +435,16 @@ class ScrollRegion:
         with self._lock:
             self._status_text = ""
 
+    def update_mode_display(self, text):
+        """Store mode display text (model name) for footer."""
+        with self._lock:
+            self._mode_display = text
+
+    def clear_mode_display(self):
+        """Clear stored mode display text."""
+        with self._lock:
+            self._mode_display = ""
+
     def _build_footer_buf(self):
         """Build the footer escape sequences as a single string.
         Returns empty string if scroll region is not active.
@@ -455,7 +466,10 @@ class ScrollRegion:
         buf += f"\033[{status_row};1H\033[2K {status}{_rst}"
 
         hint = self._hint_text or ""
-        hint_prefix = f" {_dim}ESC: stop, Ctrl+K: mode"
+        mode_display = self._mode_display or ""
+        hint_prefix = f" {_dim}ESC: stop"
+        if mode_display:
+            hint_prefix += f" {_dim}| {mode_display}"
         if hint:
             buf += f"\033[{hint_row};1H\033[2K{hint_prefix} | type-ahead: \"{hint}\"{_rst}"
         else:
@@ -516,7 +530,7 @@ def _debug_scroll_region(tui):
     print(f"\n  {_c51}Test 1: Footer before DECSTBM (setup pattern){_rst}")
     footer = f"\033[{sep_row};1H\033[2K{_sep_c}{'═' * cols}{_r}"
     footer += f"\033[{status_row};1H\033[2K {_c87}[fixed] Status row{_r}"
-    footer += f"\033[{hint_row};1H\033[2K {_dim}[fixed] ESC: stop, Ctrl+K: mode{_r}"
+    footer += f"\033[{hint_row};1H\033[2K {_dim}[fixed] ESC: stop{_r}"
     buf = footer
     buf += f"\033[1;{scroll_end}r"
     buf += f"\033[{scroll_end};1H"
@@ -568,11 +582,9 @@ class InputMonitor:
     Type-ahead: any non-ESC characters typed during agent execution are
     buffered and can be injected into readline's next input() call via
     get_typeahead() + readline.set_startup_hook.
-    
-    Mode switching: Ctrl+K toggles between local/cloud models (auto mode).
     """
 
-    def __init__(self, on_typeahead=None, on_mode_switch=None):
+    def __init__(self, on_typeahead=None):
         self._pressed = threading.Event()
 
         self._stop_event = threading.Event()
@@ -581,36 +593,13 @@ class InputMonitor:
         self._typeahead = []      # buffered keystrokes (bytes)
         self._typeahead_lock = threading.Lock()
         self._on_typeahead = on_typeahead  # callback(text) for live type-ahead display
-        self._on_mode_switch = on_mode_switch  # callback() for mode switch (Ctrl+K)
-        self._mode_switched = threading.Event()  # True if Ctrl+K was pressed
 
     @property
     def pressed(self):
         """True if ESC was pressed since start()."""
         return self._pressed.is_set()
 
-    @property
-    def mode_switched(self):
-        """True if Ctrl+K was pressed since start()."""
-        return self._mode_switched.is_set()
-
-    def reset_mode_switch(self):
-        """Reset the mode switch flag."""
-        self._mode_switched.clear()
-
     def get_typeahead(self):
-        """Return and clear any buffered type-ahead text (decoded as utf-8)."""
-        with self._typeahead_lock:
-            if not self._typeahead:
-                return ""
-            raw = b"".join(self._typeahead)
-            self._typeahead.clear()
-        try:
-            return raw.decode("utf-8", errors="replace")
-        except Exception:
-            return ""
-
-    def start(self):
         """Begin monitoring stdin for ESC key in a daemon thread."""
         if not HAS_TERMIOS or not sys.stdin.isatty():
             return
@@ -665,15 +654,6 @@ class InputMonitor:
                 elif ch == b'\x03':  # Ctrl+C
                     self._pressed.set()
                     break
-                elif ch == b'\x0b':  # Ctrl+K (ASCII 11 = vertical tab)
-                    # Mode switch shortcut
-                    self._mode_switched.set()
-                    if self._on_mode_switch:
-                        try:
-                            self._on_mode_switch()
-                        except Exception:
-                            pass
-                    # Don't break — allow continued monitoring
                 elif ch == b'\n' or ch == b'\r':
                     # Enter during execution — ignore (don't buffer newlines)
                     pass
@@ -8283,7 +8263,6 @@ class TUI:
                 i += 1
         return f"{_base}{''.join(result)}{C.RESET}"
 
-
     @staticmethod
     def _fit_table_widths(col_widths, term_w):
         """Shrink table columns to fit the terminal while keeping cells readable."""
@@ -8536,6 +8515,7 @@ class TUI:
                 # Bold
                 rendered = re.sub(r'\*\*([^*]+)\*\*', f'{C.BOLD}\\1{C.RESET}', rendered)
                 _p(rendered)
+            i += 1
 
     # Tool icons with neon color
     @staticmethod
@@ -9256,44 +9236,20 @@ class Agent:
         # Check if scroll region is already active (managed by main loop)
         _scroll_mode = self.tui.scroll_region._active
 
-        # Mode switch callback: toggle between local and cloud model
-        def _on_mode_switch():
-            """Toggle between local and cloud model when Ctrl+K is pressed."""
-            current = self.config.model or ""
-            if _is_cloud_model(current):
-                # Switch to local: pick best local model from tiers
-                installed = self.client._query_installed_models()
-                if installed:
-                    new_model = self.config._pick_best_model(installed, self.config._get_effective_ram())
-                    if new_model:
-                        self.config.model = new_model
-                        _p(f"\n{C.CYAN}Mode switched to LOCAL: {new_model}{C.RESET}")
-                        return
-                # Fallback
-                self.config.model = "qwen3:8b"
-                _p(f"\n{C.CYAN}Mode switched to LOCAL: qwen3:8b (fallback){C.RESET}")
-            else:
-                # Switch to cloud: use qwen3.5:397b-cloud
-                self.config.model = "qwen3.5:397b-cloud"
-                _p(f"\n{C.CYAN}Mode switched to CLOUD: qwen3.5:397b-cloud{C.RESET}")
-        
+        # Display current model in footer
+        if self.tui.scroll_region._active:
+            self.tui.scroll_region.update_mode_display(f"Model: {self.config.model}")
+
         # ESC key monitor for real-time interrupt (with type-ahead → scroll region hint)
         def _on_typeahead(text):
             if self.tui.scroll_region._active:
                 self.tui.scroll_region.update_hint(text)
         _esc_monitor = InputMonitor(
-            on_typeahead=_on_typeahead if _scroll_mode else None,
-            on_mode_switch=_on_mode_switch
+            on_typeahead=_on_typeahead if _scroll_mode else None
         )
         _esc_monitor.start()
 
         for iteration in range(self.MAX_ITERATIONS):
-            # Check for mode switch (Ctrl+K)
-            if _esc_monitor.mode_switched:
-                _esc_monitor.reset_mode_switch()
-                # Update spinner hint to show current mode
-                _esc_hint = " — ESC: stop, Ctrl+K: toggle mode" if HAS_TERMIOS else ""
-            
             if self._interrupted.is_set() or _esc_monitor.pressed:
                 if _esc_monitor.pressed:
                     _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
@@ -9321,7 +9277,7 @@ class Agent:
                 if self._plan_mode:
                     tools = [t for t in tools
                              if t.get("function", {}).get("name") in self.PLAN_MODE_TOOLS]
-                _esc_hint = " — ESC: stop, Ctrl+K: toggle mode" if HAS_TERMIOS else ""
+                _esc_hint = " — ESC: stop" if HAS_TERMIOS else ""
                 if iteration == 0:
                     self.tui.start_spinner(("Planning" if self._plan_mode else "Thinking") + _esc_hint)
                 else:
@@ -11258,6 +11214,26 @@ def main():
                     _c51x = _ansi("\033[38;5;51m")
                     _c87x = _ansi("\033[38;5;87m")
                     _c240x = _ansi("\033[38;5;240m")
+                    _c28x = _ansi("\033[38;5;28m")  # green for input prompt
+                    
+                    # Check if user wants to change model
+                    parts = user_input.split(None, 1)
+                    if len(parts) > 1 and parts[0] == "/config":
+                        new_model = parts[1].strip()
+                        if new_model:
+                            # Validate model name (same validation as Config._validate_ollama_host)
+                            _SAFE_MODEL_RE = re.compile(r'^[a-zA-Z0-9_.:\-/]+$')
+                            if _SAFE_MODEL_RE.match(new_model):
+                                config.model = new_model
+                                # Update footer mode display
+                                if agent.tui.scroll_region._active:
+                                    agent.tui.scroll_region.update_mode_display(f"Model: {new_model}")
+                                print(f"\n  {C.GREEN}Model changed to: {new_model}{C.RESET}")
+                                print(f"  {_c240x}To make this permanent, add MODEL={new_model} to {config.config_file}{C.RESET}\n")
+                            else:
+                                print(f"\n  {C.RED}Invalid model name. Use only alphanumeric, dots, colons, hyphens, underscores, and slashes.{C.RESET}\n")
+                            continue
+                    
                     print(f"\n  {_c51x}━━ Configuration ━━━━━━━━━━━━━━━━━━{C.RESET}")
                     print(f"  {_c87x}Model{C.RESET}         {config.model}")
                     print(f"  {_c87x}Sidecar{C.RESET}       {config.sidecar_model or '(none)'}")
@@ -11269,6 +11245,7 @@ def main():
                     print(f"  {_c87x}Debug{C.RESET}         {'ON' if config.debug else 'OFF'}")
                     print(f"\n  {_c240x}Config: {config.config_file}{C.RESET}")
                     print(f"  {_c240x}Format: KEY=VALUE (MODEL=qwen3:8b){C.RESET}")
+                    print(f"  {_c240x}Change model: /config <model_name>{C.RESET}")
                     print(f"  {_c51x}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
                     continue
 
