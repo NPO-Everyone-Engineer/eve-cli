@@ -964,10 +964,13 @@ class Config:
         ("deepseek-r1:671b",        768, "S"),
         ("deepseek-v3:671b",        768, "S"),
         # Tier A — Expert: excellent coding + reasoning
+        ("qwen3.5:397b-cloud",      256, "A"),  # Cloud model
+        ("qwen3.5:35b-a3b",         256, "A"),  # MoE 35B (3B active)
         ("qwen3:235b",              256, "A"),
         ("deepseek-coder-v2:236b",  256, "A"),
         ("llama3.1:405b",           512, "A"),
         # Tier B — Advanced: very strong coding, sweet spot for high-RAM machines
+        ("qwen3.5:32b",              24, "B"),
         ("qwen3-coder-next",         96, "B"),  # MoE 80B (3B active), ~27tok/s, 256K ctx, coding agent
         ("qwen3-next",               96, "B"),  # MoE 80B (3B active), ~25tok/s, 256K ctx, general
         ("gpt-oss:120b",             96, "B"),  # MoE 117B (5.1B active), ~70tok/s, 131K ctx
@@ -977,16 +980,19 @@ class Config:
         ("mixtral:8x22b",           128, "B"),
         ("command-r-plus",           96, "B"),
         # Tier C — Solid: good balance of speed and quality
+        ("qwen3.5:14b",              16, "C"),
         ("qwen3-coder:30b",          24, "C"),
         ("qwen2.5-coder:32b",        24, "C"),
         ("starcoder2:15b",           16, "C"),
         ("qwen3:14b",                16, "C"),
         # Tier D — Lightweight: fast, decent quality
+        ("qwen3.5:9b",                8, "D"),
         ("qwen3:8b",                  8, "D"),
         ("llama3.1:8b",               8, "D"),
         ("deepseek-coder:6.7b",       8, "D"),
         ("codellama:7b",              8, "D"),
         # Tier E — Minimal: runs on anything
+        ("qwen3.5:3b",                4, "E"),
         ("qwen3:4b",                  4, "E"),
         ("qwen3:1.7b",                2, "E"),
         ("llama3.2:3b",               4, "E"),
