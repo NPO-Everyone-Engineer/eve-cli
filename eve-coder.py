@@ -2351,6 +2351,170 @@ class RAGEngine:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Code Intelligence — lightweight symbol indexing
+# ════════════════════════════════════════════════════════════════════════════════
+
+class CodeIntelligence:
+    """Lightweight code intelligence: symbol index, go-to-definition, find-references.
+    Uses regex-based parsing (no external dependencies)."""
+
+    # Language-specific patterns for symbol extraction
+    _PATTERNS = {
+        ".py": [
+            (r'^\s*(?:async\s+)?def\s+(\w+)\s*\(', "function"),
+            (r'^\s*class\s+(\w+)', "class"),
+            (r'^(\w+)\s*=', "variable"),
+        ],
+        ".js": [
+            (r'(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(?.*?\)?\s*=>|(?:const|let|var)\s+(\w+)\s*=\s*function)', "function"),
+            (r'class\s+(\w+)', "class"),
+            (r'(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=', "variable"),
+        ],
+        ".ts": [
+            (r'(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*(?::\s*\S+\s*)?=\s*(?:async\s+)?\(?.*?\)?\s*=>|(?:const|let|var)\s+(\w+)\s*(?::\s*\S+\s*)?=\s*function)', "function"),
+            (r'(?:export\s+)?(?:abstract\s+)?class\s+(\w+)', "class"),
+            (r'(?:export\s+)?interface\s+(\w+)', "interface"),
+            (r'(?:export\s+)?type\s+(\w+)', "type"),
+        ],
+        ".go": [
+            (r'^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\(', "function"),
+            (r'^type\s+(\w+)\s+struct', "struct"),
+            (r'^type\s+(\w+)\s+interface', "interface"),
+        ],
+        ".rs": [
+            (r'(?:pub\s+)?fn\s+(\w+)', "function"),
+            (r'(?:pub\s+)?struct\s+(\w+)', "struct"),
+            (r'(?:pub\s+)?trait\s+(\w+)', "trait"),
+            (r'(?:pub\s+)?enum\s+(\w+)', "enum"),
+        ],
+        ".rb": [
+            (r'^\s*def\s+(\w+)', "method"),
+            (r'^\s*class\s+(\w+)', "class"),
+            (r'^\s*module\s+(\w+)', "module"),
+        ],
+        ".java": [
+            (r'(?:public|private|protected|static|\s)+[\w<>\[\]]+\s+(\w+)\s*\(', "method"),
+            (r'(?:public\s+)?(?:abstract\s+)?class\s+(\w+)', "class"),
+            (r'(?:public\s+)?interface\s+(\w+)', "interface"),
+        ],
+    }
+    # Map extensions to canonical groups
+    _EXT_MAP = {
+        ".jsx": ".js", ".mjs": ".js", ".cjs": ".js",
+        ".tsx": ".ts", ".mts": ".ts",
+    }
+
+    _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                  "dist", "build", ".next", ".nuxt", "target", ".tox"}
+
+    def __init__(self, cwd, max_files=500):
+        self.cwd = cwd
+        self.max_files = max_files
+        self._index = {}  # symbol_name -> list of {file, line, kind}
+
+    def build_index(self):
+        """Scan project files and build symbol index."""
+        self._index.clear()
+        file_count = 0
+        for root, dirs, files in os.walk(self.cwd):
+            # Skip hidden and build directories
+            dirs[:] = [d for d in dirs if d not in self._SKIP_DIRS and not d.startswith(".")]
+            for fname in files:
+                if file_count >= self.max_files:
+                    return len(self._index)
+                ext = os.path.splitext(fname)[1].lower()
+                canon_ext = self._EXT_MAP.get(ext, ext)
+                if canon_ext not in self._PATTERNS:
+                    continue
+                fpath = os.path.join(root, fname)
+                if os.path.islink(fpath):
+                    continue
+                try:
+                    fsize = os.path.getsize(fpath)
+                    if fsize > 500_000:  # 500KB max
+                        continue
+                    with open(fpath, encoding="utf-8", errors="replace") as f:
+                        self._index_file(f, fpath, canon_ext)
+                    file_count += 1
+                except (OSError, UnicodeDecodeError):
+                    pass
+        return len(self._index)
+
+    def _index_file(self, f, fpath, canon_ext):
+        """Index symbols from a single file."""
+        rel = os.path.relpath(fpath, self.cwd)
+        patterns = self._PATTERNS[canon_ext]
+        compiled = [(re.compile(p), kind) for p, kind in patterns]
+        for line_num, line in enumerate(f, 1):
+            for pat, kind in compiled:
+                m = pat.search(line)
+                if m:
+                    # Get first non-None group
+                    name = None
+                    for g in m.groups():
+                        if g:
+                            name = g
+                            break
+                    if name and len(name) > 1:  # skip single-char vars
+                        self._index.setdefault(name, []).append({
+                            "file": rel, "line": line_num, "kind": kind
+                        })
+
+    def find_definition(self, symbol):
+        """Find definitions of a symbol. Returns list of {file, line, kind}."""
+        results = self._index.get(symbol, [])
+        # Prioritize class/function over variable
+        priority = {"class": 0, "struct": 0, "trait": 0, "interface": 0,
+                    "function": 1, "method": 1, "module": 1,
+                    "type": 2, "enum": 2, "variable": 3}
+        return sorted(results, key=lambda r: priority.get(r["kind"], 9))
+
+    def find_references(self, symbol, max_results=50):
+        """Find references to a symbol across the codebase using grep."""
+        refs = []
+        for root, dirs, files in os.walk(self.cwd):
+            dirs[:] = [d for d in dirs if d not in self._SKIP_DIRS and not d.startswith(".")]
+            for fname in files:
+                ext = os.path.splitext(fname)[1].lower()
+                canon = self._EXT_MAP.get(ext, ext)
+                if canon not in self._PATTERNS:
+                    continue
+                fpath = os.path.join(root, fname)
+                if os.path.islink(fpath):
+                    continue
+                try:
+                    with open(fpath, encoding="utf-8", errors="replace") as f:
+                        for line_num, line in enumerate(f, 1):
+                            if symbol in line:
+                                refs.append({
+                                    "file": os.path.relpath(fpath, self.cwd),
+                                    "line": line_num,
+                                    "text": line.strip()[:120],
+                                })
+                                if len(refs) >= max_results:
+                                    return refs
+                except (OSError, UnicodeDecodeError):
+                    pass
+        return refs
+
+    def search_symbols(self, query, max_results=20):
+        """Fuzzy search symbols by name prefix or substring."""
+        query_lower = query.lower()
+        results = []
+        for name, defs in self._index.items():
+            if query_lower in name.lower():
+                for d in defs:
+                    results.append({"name": name, **d})
+                    if len(results) >= max_results:
+                        return results
+        return results
+
+    @property
+    def symbol_count(self):
+        return sum(len(v) for v in self._index.values())
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Tool Base Class + Registry
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -5635,6 +5799,191 @@ class PermissionMgr:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Hooks System
+# ════════════════════════════════════════════════════════════════════════════════
+
+class HookManager:
+    """Manages lifecycle hooks for agent events.
+
+    Hooks are user-defined shell commands that run in response to agent
+    lifecycle events (SessionStart, PreToolUse, PostToolUse, Stop).
+
+    Configuration files:
+        ~/.config/eve-cli/hooks.json   (global)
+        .eve-cli/hooks.json            (project-level, additive)
+    """
+
+    VALID_EVENTS = frozenset({"SessionStart", "PreToolUse", "PostToolUse", "Stop"})
+    MAX_HOOKS = 50      # safety limit per config file
+    DEFAULT_TIMEOUT = 10  # seconds
+    MAX_TIMEOUT = 30     # hard cap
+
+    def __init__(self, config):
+        self.config = config
+        self._hooks = []  # list of hook dicts
+        self._load_hooks()
+
+    def _load_hooks(self):
+        """Load hooks from config files (project-level is additive to global)."""
+        paths = [
+            os.path.join(self.config.config_dir, "hooks.json"),
+            os.path.join(self.config.cwd, ".eve-cli", "hooks.json"),
+        ]
+        for path in paths:
+            # Security: skip symlinks to prevent symlink attacks
+            if not os.path.isfile(path) or os.path.islink(path):
+                continue
+            try:
+                # Size cap: reject oversized config files
+                if os.path.getsize(path) > 65536:
+                    continue
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    data = json.load(f)
+                hooks = data.get("hooks", [])
+                if not isinstance(hooks, list):
+                    continue
+                for h in hooks[:self.MAX_HOOKS]:
+                    if not isinstance(h, dict):
+                        continue
+                    event = h.get("event", "")
+                    command = h.get("command", "")
+                    if event in self.VALID_EVENTS and command:
+                        self._hooks.append({
+                            "event": event,
+                            "command": command,
+                            "matcher": h.get("matcher", {}),
+                            "timeout": h.get("timeout", self.DEFAULT_TIMEOUT),
+                            "source": path,
+                        })
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    def fire(self, event, context=None):
+        """Fire hooks for the given event. Returns list of result dicts.
+
+        Context is a dict passed as environment variables with EVE_HOOK_ prefix.
+        """
+        if not self._hooks:
+            return []
+        results = []
+        for hook in self._hooks:
+            if hook["event"] != event:
+                continue
+            # Check matcher: all matcher keys must match context values
+            matcher = hook.get("matcher")
+            if matcher and isinstance(matcher, dict) and context:
+                match = True
+                for key, val in matcher.items():
+                    if str(context.get(key, "")) != str(val):
+                        match = False
+                        break
+                if not match:
+                    continue
+            elif matcher and isinstance(matcher, dict) and not context:
+                # Matcher specified but no context — skip
+                continue
+            # Build environment with EVE_HOOK_ prefixed variables
+            env = os.environ.copy()
+            env["EVE_HOOK_EVENT"] = event
+            if context:
+                for k, v in context.items():
+                    env_key = "EVE_HOOK_" + k.upper()
+                    env[env_key] = str(v)[:4096]  # cap value size
+            timeout = min(hook.get("timeout", self.DEFAULT_TIMEOUT), self.MAX_TIMEOUT)
+            try:
+                proc = subprocess.run(
+                    hook["command"],
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                    cwd=self.config.cwd,
+                )
+                result = {
+                    "event": event,
+                    "command": hook["command"],
+                    "exit_code": proc.returncode,
+                    "stdout": proc.stdout[:4096] if proc.stdout else "",
+                    "stderr": proc.stderr[:1024] if proc.stderr else "",
+                }
+                results.append(result)
+                # Print hook output if debug mode is on
+                if proc.stdout.strip() and self.config.debug:
+                    _scroll_aware_print(
+                        f"{C.DIM}[hook:{event}] {proc.stdout.strip()[:200]}{C.RESET}"
+                    )
+            except subprocess.TimeoutExpired:
+                results.append({
+                    "event": event,
+                    "command": hook["command"],
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": "timeout",
+                })
+            except Exception as e:
+                results.append({
+                    "event": event,
+                    "command": hook["command"],
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": str(e)[:200],
+                })
+        return results
+
+    def fire_pre_tool(self, tool_name, params):
+        """Fire PreToolUse hooks.
+
+        Returns "deny" if any hook exits with code 1, else "allow".
+        """
+        ctx = {"tool_name": tool_name}
+        # Add selected safe params as context
+        if isinstance(params, dict):
+            if "command" in params:
+                ctx["command"] = str(params["command"])[:1024]
+            if "file_path" in params:
+                ctx["file_path"] = str(params["file_path"])[:512]
+        results = self.fire("PreToolUse", ctx)
+        for r in results:
+            if r.get("exit_code") == 1:
+                return "deny"
+        return "allow"
+
+    def fire_post_tool(self, tool_name, output, is_error):
+        """Fire PostToolUse hooks."""
+        ctx = {
+            "tool_name": tool_name,
+            "is_error": str(is_error).lower(),
+            "output_preview": str(output)[:512] if output else "",
+        }
+        self.fire("PostToolUse", ctx)
+
+    @property
+    def has_hooks(self):
+        """Return True if any hooks are loaded."""
+        return len(self._hooks) > 0
+
+    def list_hooks(self):
+        """Return a formatted string listing all loaded hooks."""
+        if not self._hooks:
+            return "No hooks loaded."
+        lines = []
+        for i, h in enumerate(self._hooks, 1):
+            cmd_preview = h["command"][:60]
+            if len(h["command"]) > 60:
+                cmd_preview += "..."
+            matcher_str = ""
+            if h.get("matcher"):
+                matcher_str = " matcher=" + json.dumps(h["matcher"])
+            source = os.path.basename(os.path.dirname(h["source"]))
+            lines.append(
+                f"  {i}. [{h['event']}] {cmd_preview}"
+                f"{matcher_str} (timeout={h.get('timeout', self.DEFAULT_TIMEOUT)}s, {source})"
+            )
+        return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # XML Tool Call Extraction
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -6202,6 +6551,24 @@ class Session:
         except Exception:
             pass  # non-critical
 
+    def fork(self, new_session_id=None):
+        """Create a fork (copy) of this session with a new ID.
+        Returns the new session ID. The current session is saved first."""
+        self.save()
+        fork_id = new_session_id or (
+            datetime.now().strftime("%Y%m%d_%H%M%S") + "_fork_" + uuid.uuid4().hex[:6]
+        )
+        fork_id = re.sub(r'[^A-Za-z0-9_\-]', '', fork_id)[:64]
+        # Copy current session file to new session
+        src = os.path.join(self.config.sessions_dir, f"{self.session_id}.jsonl")
+        dst = os.path.join(self.config.sessions_dir, f"{fork_id}.jsonl")
+        if os.path.isfile(src) and not os.path.islink(src):
+            try:
+                shutil.copy2(src, dst)
+            except (OSError, shutil.Error):
+                return None
+        return fork_id
+
     MAX_SESSION_FILE_SIZE = 50 * 1024 * 1024  # 50MB safety limit
 
     def load(self, session_id=None):
@@ -6325,7 +6692,7 @@ class TUI:
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/watch", "/skills",
-                    "/browser",
+                    "/browser", "/fork", "/index",
                 ]
                 def _completer(text, state):
                     try:
@@ -6959,8 +7326,28 @@ class TUI:
         return f"{_base}{''.join(result)}{C.RESET}"
 
     def _render_markdown(self, text):
-        """Simple markdown-ish rendering for terminal."""
+        """Render markdown using glow for beautiful tables and formatting."""
         _p = self._scroll_print
+        
+        # Try to use glow for beautiful markdown rendering (tables, etc.)
+        glow_path = shutil.which("glow")
+        if glow_path:
+            try:
+                # Use glow to render markdown with proper table support
+                proc = subprocess.run(
+                    [glow_path, "--style", "dark", "--width", str(min(120, _get_terminal_width()))],
+                    input=text,
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if proc.returncode == 0:
+                    _p(proc.stdout)
+                    return
+            except Exception:
+                pass  # Fall back to simple rendering
+        
+        # Fallback: simple markdown-ish rendering for terminal
         in_code_block = False
         code_lang = ""
         lines = text.split("\n")
@@ -7417,6 +7804,7 @@ class TUI:
   {_c198}/debug{C.RESET}             Toggle debug mode
   {_c198}/debug-scroll{C.RESET}      Test scroll region (DECSTBM)
   {_c198}/resume{C.RESET}            Switch to a different session
+  {_c198}/fork{C.RESET} [name]       Fork current session (explore different approach)
   {_c198}\"\"\"{C.RESET}                Multi-line input
   {_c51}━━ Git {sep[6:]}{C.RESET}
   {_c198}/commit{C.RESET}            Generate AI commit message
@@ -7433,6 +7821,8 @@ class TUI:
   {_c198}/autotest{C.RESET}          Toggle auto syntax+test after edits
   {_c198}/watch{C.RESET}             Toggle file watcher
   {_c198}/skills{C.RESET}            List loaded skills
+  {_c198}/hooks{C.RESET}             List loaded hooks
+  {_c198}/index{C.RESET}             Code intelligence (symbols, definitions, references)
   {_c51}━━ Keyboard {sep[11:]}{C.RESET}
   {_c198}Ctrl+C{C.RESET}             Stop current task
   {_c198}Ctrl+C x2{C.RESET}          Exit (within 1.5s)
@@ -7535,7 +7925,7 @@ class Agent:
     ACT_ONLY_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit"}
 
     def __init__(self, config, client, registry, permissions, session, tui,
-                 rag_engine=None):
+                 rag_engine=None, hook_mgr=None):
         self.config = config
         self.client = client
         self.registry = registry
@@ -7543,6 +7933,7 @@ class Agent:
         self.session = session
         self.tui = tui
         self.rag_engine = rag_engine
+        self.hook_mgr = hook_mgr
         self._interrupted = threading.Event()
         self._tui_lock = threading.Lock()
         self._plan_mode = False
@@ -7818,6 +8209,13 @@ class Agent:
                     tool_name = tool.name
                     # Show what we're about to do FIRST
                     self.tui.show_tool_call(tool_name, tool_params)
+                    # PreToolUse hook: allow hooks to deny tool execution
+                    if self.hook_mgr and self.hook_mgr.has_hooks:
+                        _hook_result = self.hook_mgr.fire_pre_tool(tool_name, tool_params)
+                        if _hook_result == "deny":
+                            results.append(ToolResult(tc_id, "Blocked by hook (PreToolUse).", True))
+                            self.tui.show_tool_result(tool_name, "Blocked by hook", True)
+                            continue
                     # Plan mode: restrict Write to .eve-cli/plans/ only
                     if self._plan_mode and tool_name == "Write":
                         try:
@@ -7892,6 +8290,9 @@ class Agent:
                         self.tui.show_tool_result(tool_name, result.output, result.is_error,
                                                   duration=_pdur, params=tool_params)
                         results.append(result)
+                        # PostToolUse hook (parallel path)
+                        if self.hook_mgr and self.hook_mgr.has_hooks:
+                            self.hook_mgr.fire_post_tool(tool_name, result.output, result.is_error)
                 else:
                     # Sequential execution (preserves ordering for side-effecting tools)
                     for tc_id, tool_name, tool_params, tool in validated_calls:
@@ -7924,6 +8325,9 @@ class Agent:
                             self.tui.show_tool_result(tool_name, output, is_error=_is_err,
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
+                            # PostToolUse hook (sequential path)
+                            if self.hook_mgr and self.hook_mgr.has_hooks:
+                                self.hook_mgr.fire_post_tool(tool_name, output, _is_err)
 
                             if tracked_path and not _is_err and tool_name in ("Write", "Edit", "NotebookEdit"):
                                 if tool_name == "Write":
@@ -8061,6 +8465,10 @@ class Agent:
             _p(f"\n{C.YELLOW}The AI took {self.MAX_ITERATIONS} steps without finishing.{C.RESET}")
             _p(f"{C.DIM}Your work so far is saved. Try breaking the task into smaller steps,{C.RESET}")
             _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
+
+        # Fire Stop hook when agent loop ends
+        if self.hook_mgr and self.hook_mgr.has_hooks:
+            self.hook_mgr.fire("Stop", {"model": self.config.model, "cwd": self.config.cwd})
 
         # Stop ESC monitor (scroll region stays active — managed by main loop)
         self._last_typeahead = _esc_monitor.get_typeahead()
@@ -8507,6 +8915,9 @@ def main():
             print(f"{C.YELLOW}RAG initialization warning: {e}{C.RESET}")
             _rag_engine = None
 
+    # Code Intelligence (lightweight symbol indexing)
+    _code_intel = CodeIntelligence(config.cwd)
+
     session = Session(config, system_prompt)
     session.set_client(client)  # enable sidecar model for context compaction
     registry = ToolRegistry().register_defaults()
@@ -8540,8 +8951,13 @@ def main():
         except Exception as e:
             print(f"{C.YELLOW}Warning: MCP server '{srv_name}' failed: {e}{C.RESET}", file=sys.stderr)
 
+    # Initialize hooks system
+    hook_mgr = HookManager(config)
+    if hook_mgr.has_hooks and config.debug:
+        print(f"{C.DIM}[debug] Loaded {len(hook_mgr._hooks)} hooks{C.RESET}", file=sys.stderr)
+
     agent = Agent(config, client, registry, permissions, session, tui,
-                  rag_engine=_rag_engine)
+                  rag_engine=_rag_engine, hook_mgr=hook_mgr)
 
     # Handle Ctrl+C gracefully
     def signal_handler(sig, frame):
@@ -8611,6 +9027,14 @@ def main():
                 open(first_run_marker, "w").close()
             except OSError:
                 pass
+
+    # Fire SessionStart hook
+    if hook_mgr.has_hooks:
+        hook_mgr.fire("SessionStart", {
+            "model": config.model,
+            "cwd": config.cwd,
+            "session_id": session.session_id,
+        })
 
     # One-shot mode
     if config.prompt:
@@ -8715,6 +9139,31 @@ def main():
                     filepath = os.path.join(sessions_dir, f"{session.session_id}.jsonl")
                     print(f"{C.GREEN}Session saved: {session.session_id}{C.RESET}")
                     print(f"{C.DIM}  {filepath}{C.RESET}")
+                    continue
+                elif cmd == "/fork":
+                    fork_id = session.fork()
+                    if fork_id:
+                        # Option: rename the fork if a name was provided
+                        parts = user_input.split(None, 1)
+                        _fork_name = parts[1].strip() if len(parts) > 1 else ""
+                        if _fork_name:
+                            fork_id_named = re.sub(r'[^A-Za-z0-9_\-]', '', _fork_name)[:64]
+                            # Rename the fork
+                            src = os.path.join(config.sessions_dir, f"{fork_id}.jsonl")
+                            dst = os.path.join(config.sessions_dir, f"{fork_id_named}.jsonl")
+                            try:
+                                os.rename(src, dst)
+                                fork_id = fork_id_named
+                            except OSError:
+                                pass
+
+                        old_id = session.session_id
+                        session.session_id = fork_id
+                        print(f"{C.GREEN}Session forked: {old_id} → {fork_id}{C.RESET}")
+                        print(f"{C.DIM}Original session preserved. You're now on the fork.{C.RESET}")
+                        print(f"{C.DIM}Switch back: /resume {old_id}{C.RESET}")
+                    else:
+                        print(f"{C.RED}Failed to fork session.{C.RESET}")
                     continue
                 elif cmd == "/compact":
                     before = session.get_token_estimate()
@@ -9137,6 +9586,18 @@ def main():
                         print(f"{C.DIM}Place .md files in ~/.config/eve-cli/skills/ or .eve-cli/skills/{C.RESET}")
                     continue
 
+                elif cmd == "/hooks":
+                    _c51h = _ansi("\033[38;5;51m")
+                    _c87h = _ansi("\033[38;5;87m")
+                    print(f"\n  {_c51h}━━ Hooks ━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+                    if hook_mgr.has_hooks:
+                        print(hook_mgr.list_hooks())
+                    else:
+                        print(f"  {C.DIM}No hooks loaded.{C.RESET}")
+                        print(f"  {C.DIM}Place hooks.json in ~/.config/eve-cli/ or .eve-cli/{C.RESET}")
+                    print(f"  {_c51h}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    continue
+
                 elif cmd == "/undo":
                     if not _undo_stack:
                         print(f"{C.YELLOW}Nothing to undo.{C.RESET}")
@@ -9384,6 +9845,100 @@ def main():
                         print(f"  例: 「Google で EvE CLI を検索して結果を教えて」{C.RESET}")
                     continue
 
+                elif cmd == "/index":
+                    parts = user_input.split(None, 2)
+                    sub = parts[1].lower() if len(parts) > 1 else ""
+                    _c51b = _ansi("\033[38;5;51m")
+                    _c240b = _ansi("\033[38;5;240m")
+                    _c198b = _ansi("\033[38;5;198m")
+                    if sub == "build":
+                        print(f"\n  {_c51b}Building symbol index...{C.RESET}")
+                        _t0 = time.time()
+                        _n_syms = _code_intel.build_index()
+                        _elapsed_ms = int((time.time() - _t0) * 1000)
+                        print(f"  {C.GREEN}Indexed {_code_intel.symbol_count} symbols "
+                              f"({_n_syms} unique names) in {_elapsed_ms}ms{C.RESET}")
+                        # Also build RAG index if available
+                        if _rag_engine is not None:
+                            try:
+                                rag_path = config.rag_path or config.cwd
+                                print(f"  {_c51b}Building RAG index for {rag_path}...{C.RESET}")
+                                _rag_engine.index_directory(rag_path)
+                                _rstats = _rag_engine.get_stats()
+                                print(f"  {C.GREEN}RAG: {_rstats['files']} files, "
+                                      f"{_rstats['chunks']} chunks{C.RESET}")
+                            except Exception as _re:
+                                print(f"  {C.YELLOW}RAG index error: {_re}{C.RESET}")
+                    elif sub == "search":
+                        _query = parts[2] if len(parts) > 2 else ""
+                        if not _query:
+                            print(f"  {C.YELLOW}Usage: /index search <query>{C.RESET}")
+                        else:
+                            if _code_intel.symbol_count == 0:
+                                print(f"  {_c240b}Index empty. Building...{C.RESET}")
+                                _code_intel.build_index()
+                            _results = _code_intel.search_symbols(_query)
+                            if _results:
+                                print(f"\n  {_c51b}━━ Symbol Search: '{_query}' ({len(_results)} results) ━━{C.RESET}")
+                                for r in _results:
+                                    _kind_c = C.CYAN if r["kind"] in ("class", "struct", "interface", "trait") else C.GREEN
+                                    print(f"    {_kind_c}{r['kind']:10}{C.RESET} "
+                                          f"{_c198b}{r['name']}{C.RESET}  "
+                                          f"{_c240b}{r['file']}:{r['line']}{C.RESET}")
+                                print()
+                            else:
+                                print(f"  {C.YELLOW}No symbols matching '{_query}'{C.RESET}")
+                    elif sub == "def":
+                        _sym = parts[2] if len(parts) > 2 else ""
+                        if not _sym:
+                            print(f"  {C.YELLOW}Usage: /index def <symbol>{C.RESET}")
+                        else:
+                            if _code_intel.symbol_count == 0:
+                                print(f"  {_c240b}Index empty. Building...{C.RESET}")
+                                _code_intel.build_index()
+                            _defs = _code_intel.find_definition(_sym)
+                            if _defs:
+                                print(f"\n  {_c51b}━━ Definitions of '{_sym}' ({len(_defs)} found) ━━{C.RESET}")
+                                for d in _defs:
+                                    _kind_c = C.CYAN if d["kind"] in ("class", "struct", "interface", "trait") else C.GREEN
+                                    print(f"    {_kind_c}{d['kind']:10}{C.RESET} "
+                                          f"{_c240b}{d['file']}:{d['line']}{C.RESET}")
+                                print()
+                            else:
+                                print(f"  {C.YELLOW}No definitions found for '{_sym}'{C.RESET}")
+                    elif sub == "refs":
+                        _sym = parts[2] if len(parts) > 2 else ""
+                        if not _sym:
+                            print(f"  {C.YELLOW}Usage: /index refs <symbol>{C.RESET}")
+                        else:
+                            print(f"  {_c240b}Searching references...{C.RESET}")
+                            _refs = _code_intel.find_references(_sym)
+                            if _refs:
+                                print(f"\n  {_c51b}━━ References to '{_sym}' ({len(_refs)} found) ━━{C.RESET}")
+                                for r in _refs:
+                                    print(f"    {_c240b}{r['file']}:{r['line']}{C.RESET}  {r['text']}")
+                                print()
+                            else:
+                                print(f"  {C.YELLOW}No references found for '{_sym}'{C.RESET}")
+                    elif sub == "status":
+                        print(f"\n  {_c51b}━━ Index Status ━━━━━━━━━━━━━━━━━━━{C.RESET}")
+                        print(f"  Symbols: {_code_intel.symbol_count} "
+                              f"({len(_code_intel._index)} unique names)")
+                        print(f"  CWD: {_code_intel.cwd}")
+                        if _rag_engine is not None:
+                            _rstats = _rag_engine.get_stats()
+                            print(f"  RAG: {_rstats['files']} files, "
+                                  f"{_rstats['chunks']} chunks "
+                                  f"({_rstats['db_size'] // 1024} KB)")
+                        print(f"  {_c51b}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    else:
+                        print(f"  {C.CYAN}/index build{C.RESET}            Build symbol index")
+                        print(f"  {C.CYAN}/index search{C.RESET} <query>  Search symbols by name")
+                        print(f"  {C.CYAN}/index def{C.RESET} <symbol>    Find definitions (go-to-definition)")
+                        print(f"  {C.CYAN}/index refs{C.RESET} <symbol>   Find references")
+                        print(f"  {C.CYAN}/index status{C.RESET}          Show index statistics")
+                    continue
+
                 elif cmd == "/debug":
                     config.debug = not config.debug
                     state_str = f"{C.GREEN}ON{C.RESET}" if config.debug else f"{C.RED}OFF{C.RESET}"
@@ -9414,8 +9969,8 @@ def main():
                                      "/tokens", "/commit", "/diff", "/git", "/plan",
                                      "/approve", "/act", "/execute", "/undo", "/init",
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",
-                                     "/rollback", "/autotest", "/skills", "/image",
-                                     "/browser"]
+                                     "/rollback", "/autotest", "/skills", "/hooks",
+                                     "/image", "/browser", "/fork", "/index"]
                         _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                         if not _close:
                             _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []
