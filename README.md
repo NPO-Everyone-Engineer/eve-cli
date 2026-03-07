@@ -98,6 +98,11 @@ eve-cli --resume
 | `/compact` | 会話を要約して圧縮 |
 | `/watch` | ファイル監視モード |
 | `/autotest` | 編集後に構文チェック + テストを自動実行 |
+| `/index build` | リポジトリインデックスを構築 |
+| `/index search <query>` | シンボルを検索 |
+| `/index file <path>` | ファイルのシンボルを表示 |
+| `/index status` | インデックスの状態を確認 |
+| `/gentest <file.py>` | AI にテストファイルを生成させる |
 | `/browser setup` | ブラウザ操作のセットアップ（Playwright MCP） |
 | `/browser status` | ブラウザツールの接続状態を確認 |
 | `/config` | 現在の設定を表示 |
