@@ -719,6 +719,7 @@ class Config:
         self.temperature = self.DEFAULT_TEMPERATURE
         self.context_window = self.DEFAULT_CONTEXT_WINDOW
         self.prompt = None          # -p one-shot prompt
+        self.output_format = "text" # --output-format (text, json, stream-json)
         self.yes_mode = False       # -y auto-approve
         self.debug = False
         self.resume = False
@@ -897,6 +898,9 @@ class Config:
         parser.add_argument("--profile", help="Connection profile: auto, online, offline, or custom name")
         parser.add_argument("--dangerously-skip-permissions", action="store_true",
                             help="Alias for -y (compatibility)")
+        # Output format
+        parser.add_argument("--output-format", choices=["text", "json", "stream-json"],
+                            default="text", help="Output format for one-shot mode")
         # RAG options
         parser.add_argument("--rag", action="store_true", help="Enable RAG mode")
         parser.add_argument("--rag-mode", choices=["query"], default="query",
@@ -949,6 +953,8 @@ class Config:
             self.rag_model = args.rag_model
         if args.rag_index:
             self.rag_index = args.rag_index
+        if args.output_format:
+            self.output_format = args.output_format
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -4697,8 +4703,11 @@ def _load_mcp_servers(config):
 # ════════════════════════════════════════════════════════════════════════════════
 
 def _load_skills(config):
-    """Load SKILL.md files from standard locations."""
-    skills = {}  # name -> content
+    """Load SKILL.md files from standard locations.
+
+    Returns dict: name -> {"content": str, "skill_dir": str}
+    """
+    skills = {}  # name -> {"content": ..., "skill_dir": ...}
     skill_dirs = [
         os.path.join(config.config_dir, "skills"),
         os.path.join(config.cwd, ".eve-cli", "skills"),
@@ -4721,12 +4730,29 @@ def _load_skills(config):
                     with open(fpath, encoding="utf-8") as f:
                         content = f.read(50000)
                     name = entry[:-3]  # remove .md
-                    skills[name] = content
+                    skills[name] = {"content": content, "skill_dir": skill_dir}
                 except (OSError, UnicodeDecodeError):
                     pass
         except OSError:
             pass
     return skills
+
+
+def _expand_skill_variables(content, arguments="", skill_dir="", cwd=""):
+    """Replace skill variables ($ARGUMENTS, $0, $1, ..., $SKILL_DIR, $CWD) in content."""
+    result = content
+    result = result.replace("$ARGUMENTS", arguments)
+    result = result.replace("$SKILL_DIR", skill_dir)
+    result = result.replace("$CWD", cwd)
+    # Split arguments into positional params and replace $0, $1, ...
+    parts = arguments.split() if arguments else []
+    # Replace positional variables $0..$9 (higher indices unlikely needed)
+    for i in range(10):
+        token = "$" + str(i)
+        if token in result:
+            value = parts[i] if i < len(parts) else ""
+            result = result.replace(token, value)
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -6637,6 +6663,7 @@ class TUI:
         raw_parts = []
         in_think = False
         think_buf = ""    # buffer to detect <think> / </think> split across chunks
+        think_parts = []  # accumulate thinking content for display
         header_printed = False
         # Accumulate tool_call deltas: {index: {"id": ..., "name": ..., "arguments": ...}}
         _tc_accum = {}
@@ -6738,13 +6765,27 @@ class TUI:
                 else:
                     idx = think_buf.find("</think>")
                     if idx == -1:
-                        # Still inside think block — discard but keep buffer for partial tag
+                        # Still inside think block — accumulate and keep buffer for partial tag
                         if len(think_buf) > 8:
+                            think_parts.append(think_buf[:-8])
                             think_buf = think_buf[-8:]
                         break
                     else:
+                        think_parts.append(think_buf[:idx])
                         think_buf = think_buf[idx + 8:]  # skip past </think>
                         in_think = False
+                        # Display thinking summary with preview
+                        _clear_thinking_status()
+                        _think_text = "".join(think_parts).strip()
+                        _think_elapsed = time.time() - _stream_start
+                        _think_tok = len(_think_text) // 4 or 1
+                        _tok_s = f"{_think_tok / 1000:.1f}k" if _think_tok >= 1000 else str(_think_tok)
+                        self._scroll_print(f"\n  \U0001f4ad Thinking ({_think_elapsed:.1f}s \u00b7 {_tok_s} tokens)")
+                        _lines = [l for l in _think_text.splitlines() if l.strip()][:3]
+                        for _l in _lines:
+                            _disp = (_l[:100] + "\u2026") if len(_l) > 100 else _l
+                            self._scroll_print(f"  {C.DIM}   \u2502 {_disp}{C.RESET}")
+                        think_parts = []
 
         # Clear status line before final output
         _clear_thinking_status()
@@ -6795,6 +6836,18 @@ class TUI:
         content = message.get("content", "") or ""
         tool_calls = message.get("tool_calls", [])
 
+        # Extract and display <think>...</think> blocks before stripping
+        _think_matches = re.findall(r'<think>([\s\S]*?)</think>', content)
+        for _tm in _think_matches:
+            _think_text = _tm.strip()
+            if _think_text:
+                _think_tok = len(_think_text) // 4 or 1
+                _tok_s = f"{_think_tok / 1000:.1f}k" if _think_tok >= 1000 else str(_think_tok)
+                self._scroll_print(f"\n  \U0001f4ad Thinking ({_tok_s} tokens)")
+                _lines = [l for l in _think_text.splitlines() if l.strip()][:3]
+                for _l in _lines:
+                    _disp = (_l[:100] + "\u2026") if len(_l) > 100 else _l
+                    self._scroll_print(f"  {C.DIM}   \u2502 {_disp}{C.RESET}")
         # Strip <think>...</think> blocks (Qwen reasoning traces)
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
 
@@ -8137,6 +8190,170 @@ def _build_footer_status(config, pct):
             f"\033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m")
 
 
+def _generate_project_claude_md(cwd):
+    """Analyze codebase and generate a useful CLAUDE.md template."""
+    proj_name = os.path.basename(cwd)
+    language = None
+    framework = None
+    build_cmd = None
+    test_cmd = None
+    detections = {
+        "package.json": ("JavaScript/TypeScript", None),
+        "pyproject.toml": ("Python", None),
+        "setup.py": ("Python", None),
+        "requirements.txt": ("Python", None),
+        "Cargo.toml": ("Rust", None),
+        "go.mod": ("Go", None),
+        "Gemfile": ("Ruby", None),
+        "pom.xml": ("Java", "Maven"),
+        "build.gradle": ("Java", "Gradle"),
+    }
+    for fname, (lang, fw) in detections.items():
+        if os.path.isfile(os.path.join(cwd, fname)):
+            if language is None:
+                language = lang
+            if fw and framework is None:
+                framework = fw
+    pkg_json_path = os.path.join(cwd, "package.json")
+    if os.path.isfile(pkg_json_path):
+        try:
+            with open(pkg_json_path, encoding="utf-8", errors="replace") as f:
+                pkg = json.load(f)
+            if isinstance(pkg, dict):
+                if pkg.get("name"):
+                    proj_name = pkg["name"]
+                scripts = pkg.get("scripts", {})
+                if isinstance(scripts, dict):
+                    if "build" in scripts:
+                        build_cmd = "npm run build"
+                    if "test" in scripts:
+                        test_cmd = "npm run test"
+                deps = {}
+                deps.update(pkg.get("dependencies", {}))
+                deps.update(pkg.get("devDependencies", {}))
+                for fw_name in ["react", "vue", "angular", "next", "nuxt", "svelte", "express", "fastify", "nest"]:
+                    if any(fw_name in k for k in deps):
+                        framework = fw_name.capitalize()
+                        break
+        except Exception:
+            pass
+    if language == "Python":
+        pyproj_path = os.path.join(cwd, "pyproject.toml")
+        if os.path.isfile(pyproj_path):
+            try:
+                with open(pyproj_path, encoding="utf-8", errors="replace") as f:
+                    pyproj_text = f.read()
+                for fw_name in ["django", "flask", "fastapi", "pytest"]:
+                    if fw_name in pyproj_text.lower():
+                        if fw_name == "pytest":
+                            test_cmd = "python -m pytest"
+                        elif framework is None:
+                            framework = fw_name.capitalize()
+            except Exception:
+                pass
+        req_path = os.path.join(cwd, "requirements.txt")
+        if os.path.isfile(req_path):
+            try:
+                with open(req_path, encoding="utf-8", errors="replace") as f:
+                    req_text = f.read().lower()
+                for fw_name in ["django", "flask", "fastapi", "pytest"]:
+                    if fw_name in req_text:
+                        if fw_name == "pytest":
+                            test_cmd = test_cmd or "python -m pytest"
+                        elif framework is None:
+                            framework = fw_name.capitalize()
+            except Exception:
+                pass
+        if test_cmd is None:
+            test_cmd = "python -m pytest"
+    if language == "Rust":
+        build_cmd = "cargo build"
+        test_cmd = "cargo test"
+    if language == "Go":
+        build_cmd = "go build ./..."
+        test_cmd = "go test ./..."
+    if language == "Ruby":
+        if os.path.isfile(os.path.join(cwd, "Rakefile")):
+            test_cmd = "bundle exec rake test"
+    if os.path.isfile(os.path.join(cwd, "Makefile")):
+        if build_cmd is None:
+            build_cmd = "make"
+        try:
+            with open(os.path.join(cwd, "Makefile"), encoding="utf-8", errors="replace") as f:
+                makefile_text = f.read()
+            if "test:" in makefile_text and test_cmd is None:
+                test_cmd = "make test"
+        except Exception:
+            pass
+    has_docker = (os.path.isfile(os.path.join(cwd, "Dockerfile"))
+                  or os.path.isfile(os.path.join(cwd, "docker-compose.yml"))
+                  or os.path.isfile(os.path.join(cwd, "docker-compose.yaml")))
+    git_remote = None
+    git_branch = None
+    try:
+        r = subprocess.run(["git", "remote", "get-url", "origin"],
+                           capture_output=True, cwd=cwd, timeout=5)
+        if r.returncode == 0:
+            git_remote = r.stdout.decode("utf-8", errors="replace").strip()
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["git", "branch", "--show-current"],
+                           capture_output=True, cwd=cwd, timeout=5)
+        if r.returncode == 0:
+            git_branch = r.stdout.decode("utf-8", errors="replace").strip()
+    except Exception:
+        pass
+    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox",
+                 ".mypy_cache", ".pytest_cache", "dist", "build", ".next", ".nuxt",
+                 "target", ".idea", ".vscode"}
+    dir_entries = []
+    try:
+        for entry in sorted(os.listdir(cwd)):
+            if entry in skip_dirs:
+                continue
+            if entry.startswith(".") and entry not in (".github", ".eve-cli"):
+                continue
+            full = os.path.join(cwd, entry)
+            if os.path.isdir(full):
+                dir_entries.append(entry + "/")
+            else:
+                dir_entries.append(entry)
+            if len(dir_entries) >= 20:
+                break
+    except Exception:
+        pass
+    lines = [f"# {proj_name}", ""]
+    lines.append("## Project Overview")
+    lines.append(f"- **Language**: {language or 'Unknown'}")
+    if framework:
+        lines.append(f"- **Framework**: {framework}")
+    if has_docker:
+        lines.append("- **Docker**: Yes")
+    if git_remote:
+        lines.append(f"- **Repository**: {git_remote}")
+    if git_branch:
+        lines.append(f"- **Main branch**: {git_branch}")
+    if build_cmd:
+        lines.append(f"- **Build**: `{build_cmd}`")
+    if test_cmd:
+        lines.append(f"- **Test**: `{test_cmd}`")
+    lines.append("")
+    if dir_entries:
+        lines.append("## Directory Structure")
+        lines.append("```")
+        for e in dir_entries:
+            lines.append(e)
+        lines.append("```")
+        lines.append("")
+    lines.append("## Instructions for AI")
+    lines.append("- Follow existing code style and conventions")
+    lines.append("- Write tests for new features")
+    lines.append("- Use absolute paths for file operations")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main():
     # Parse config
     config = Config().load()
@@ -8167,6 +8384,10 @@ def main():
                 traceback.print_exc()
             sys.exit(1)
         return
+
+    # Suppress colors and banner for non-text output formats (json, stream-json)
+    if config.output_format != "text":
+        C.disable()
 
     # Show banner immediately so user sees output while connecting
     tui = TUI(config)
@@ -8257,9 +8478,13 @@ def main():
     skills = _load_skills(config)
     if skills:
         system_prompt += "\n# Loaded Skills\n"
-        for skill_name, skill_content in skills.items():
+        for skill_name, skill_info in skills.items():
+            _raw = skill_info["content"]
+            _expanded = _expand_skill_variables(_raw, arguments="",
+                                                skill_dir=skill_info["skill_dir"],
+                                                cwd=config.cwd)
             # Truncate each skill to 2000 chars to avoid bloating context
-            truncated = skill_content[:2000] + "..." if len(skill_content) > 2000 else skill_content
+            truncated = _expanded[:2000] + "..." if len(_expanded) > 2000 else _expanded
             system_prompt += f"\n## Skill: {skill_name}\n{truncated}\n"
         if config.debug:
             print(f"{C.DIM}[debug] Loaded {len(skills)} skills: {', '.join(skills.keys())}{C.RESET}", file=sys.stderr)
@@ -8391,6 +8616,20 @@ def main():
     if config.prompt:
         agent.run(config.prompt)
         session.save()
+        if config.output_format in ("json", "stream-json"):
+            # Extract last assistant message from session
+            _last_content = ""
+            for _msg in reversed(session.messages):
+                if _msg.get("role") == "assistant":
+                    _last_content = _msg.get("content", "")
+                    break
+            _output = {
+                "role": "assistant",
+                "content": _last_content,
+                "model": config.model,
+                "session_id": session.session_id,
+            }
+            print(json.dumps(_output, ensure_ascii=False))
         return
 
     # Interactive mode
@@ -8887,8 +9126,11 @@ def main():
                         _c87s = _ansi("\033[38;5;87m")
                         print(f"\n  {_c51s}━━ Loaded Skills ━━━━━━━━━━━━━━━━━━{C.RESET}")
                         for sname in sorted(loaded_skills.keys()):
-                            lines = len(loaded_skills[sname].split('\n'))
-                            print(f"  {_c87s}{sname}{C.RESET}  ({lines} lines)")
+                            _sc = loaded_skills[sname]["content"]
+                            lines = len(_sc.split('\n'))
+                            _has_args = "$ARGUMENTS" in _sc or "$0" in _sc
+                            _args_tag = f" {C.DIM}(accepts args){C.RESET}" if _has_args else ""
+                            print(f"  {_c87s}{sname}{C.RESET}  ({lines} lines){_args_tag}")
                         print(f"  {_c51s}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
                     else:
                         print(f"{C.YELLOW}No skills loaded.{C.RESET}")
@@ -8965,24 +9207,23 @@ def main():
                     continue
 
                 elif cmd == "/init":
-                    claude_md = os.path.join(os.getcwd(), "CLAUDE.md")
-                    if os.path.exists(claude_md):
-                        print(f"{C.YELLOW}CLAUDE.md already exists in this directory.{C.RESET}")
+                    _init_cwd = os.getcwd()
+                    _root_claude = os.path.join(_init_cwd, "CLAUDE.md")
+                    _eve_dir = os.path.join(_init_cwd, ".eve-cli")
+                    _eve_claude = os.path.join(_eve_dir, "CLAUDE.md")
+                    # Check both locations
+                    if os.path.exists(_root_claude):
+                        print(f"{C.YELLOW}CLAUDE.md already exists: {_root_claude}{C.RESET}")
+                    elif os.path.exists(_eve_claude):
+                        print(f"{C.YELLOW}CLAUDE.md already exists: {_eve_claude}{C.RESET}")
                     else:
-                        proj_name = os.path.basename(os.getcwd())
-                        content = (
-                            f"# {proj_name}\n\n"
-                            "## Project Overview\n\n"
-                            "<!-- Describe the project here -->\n\n"
-                            "## Instructions for AI\n\n"
-                            "- Follow existing code style\n"
-                            "- Write tests for new features\n"
-                            "- Use absolute paths\n"
-                        )
+                        content = _generate_project_claude_md(_init_cwd)
                         try:
-                            with open(claude_md, "w", encoding="utf-8") as f:
+                            os.makedirs(_eve_dir, exist_ok=True)
+                            with open(_eve_claude, "w", encoding="utf-8") as f:
                                 f.write(content)
-                            print(f"{C.GREEN}Created {claude_md}{C.RESET}")
+                            print(f"{C.GREEN}Created {_eve_claude}{C.RESET}")
+                            print(f"{C.DIM}Detected project info has been included.{C.RESET}")
                             print(f"{C.DIM}Edit this file to customize AI behavior for your project.{C.RESET}")
                         except Exception as e:
                             print(f"{C.RED}Failed to create CLAUDE.md: {e}{C.RESET}")
@@ -9071,8 +9312,51 @@ def main():
                                 print(f"  {_c240b}手動実行: npx @playwright/mcp@latest --help{C.RESET}")
                         except Exception:
                             print(f"  {C.YELLOW}確認がタイムアウトしました（初回ダウンロード中の可能性あり）。{C.RESET}")
+                        # Auto-install Playwright browsers (chromium)
+                        print(f"  {_c240b}Chromium ブラウザをインストール中...{C.RESET}")
+                        try:
+                            _install_proc = subprocess.run(
+                                ["npx", "playwright", "install", "chromium"],
+                                capture_output=True, timeout=120
+                            )
+                            if _install_proc.returncode == 0:
+                                print(f"  {C.GREEN}Chromium のインストールが完了しました。{C.RESET}")
+                            else:
+                                _stderr_out = _install_proc.stderr.decode("utf-8", errors="replace").strip()[:200]
+                                print(f"  {C.YELLOW}Chromium のインストールに失敗しました。{C.RESET}")
+                                if _stderr_out:
+                                    print(f"  {_c240b}{_stderr_out}{C.RESET}")
+                                print(f"  {_c240b}手動実行: npx playwright install chromium{C.RESET}")
+                        except Exception:
+                            print(f"  {C.YELLOW}Chromium インストールがタイムアウトしました。{C.RESET}")
+                            print(f"  {_c240b}手動実行: npx playwright install chromium{C.RESET}")
+                        # Hot-reload: start MCP server and register tools immediately
+                        _hot_reload_count = 0
+                        print(f"  {_c240b}MCP ツールをホットリロード中...{C.RESET}")
+                        try:
+                            _pw_mcp = MCPClient(
+                                name="playwright",
+                                command="npx",
+                                args=["@playwright/mcp@latest"],
+                            )
+                            _pw_mcp.start()
+                            _pw_mcp.initialize()
+                            _pw_tools_list = _pw_mcp.list_tools()
+                            for _tool_schema in _pw_tools_list:
+                                _mcp_tool = MCPTool(_pw_mcp, _tool_schema)
+                                registry.register(_mcp_tool)
+                                permissions.ASK_TOOLS.add(_mcp_tool.name)
+                                _hot_reload_count += 1
+                            _mcp_clients.append(_pw_mcp)
+                            print(f"  {C.GREEN}ホットリロード完了: {_hot_reload_count} ツールを登録しました。{C.RESET}")
+                        except Exception as _hr_e:
+                            print(f"  {C.YELLOW}ホットリロードに失敗しました: {_hr_e}{C.RESET}")
+                            print(f"  {_c240b}eve-cli を再起動するとツールが利用可能になります。{C.RESET}")
                         print(f"\n  {C.GREEN}セットアップ完了!{C.RESET}")
-                        print(f"  {_c240b}eve-cli を再起動すると、ブラウザ操作ツールが使えるようになります。{C.RESET}")
+                        if _hot_reload_count > 0:
+                            print(f"  {_c240b}ブラウザ操作ツール ({_hot_reload_count} tools) が利用可能です。{C.RESET}")
+                        else:
+                            print(f"  {_c240b}eve-cli を再起動すると、ブラウザ操作ツールが使えるようになります。{C.RESET}")
                         print(f"  {_c240b}例: 「https://example.com を開いてスクリーンショットを撮って」{C.RESET}")
                         print(f"  {_c51b}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
                     elif sub == "status":
@@ -9111,22 +9395,35 @@ def main():
                     continue
 
                 else:
-                    # "Did you mean?" for typo'd slash commands
-                    _all_cmds = ["/help", "/exit", "/quit", "/clear", "/model", "/models",
-                                 "/status", "/save", "/compact", "/yes", "/no",
-                                 "/tokens", "/commit", "/diff", "/git", "/plan",
-                                 "/approve", "/act", "/execute", "/undo", "/init",
-                                 "/config", "/debug", "/debug-scroll", "/checkpoint",
-                                 "/rollback", "/autotest", "/skills", "/image",
-                                 "/browser"]
-                    _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
-                    if not _close:
-                        _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []
-                    if _close:
-                        print(f"{C.YELLOW}Unknown command '{cmd}'. Did you mean: {', '.join(_close[:3])}?{C.RESET}")
+                    # Check if it's a skill invocation: /skill-name args
+                    _skill_name = _first_word[1:]  # remove leading /
+                    _loaded_skills = _load_skills(config)
+                    if _skill_name in _loaded_skills:
+                        _skill_args = user_input[len(_first_word):].strip()
+                        _skill_info = _loaded_skills[_skill_name]
+                        _skill_content = _expand_skill_variables(
+                            _skill_info["content"], _skill_args,
+                            skill_dir=_skill_info["skill_dir"],
+                            cwd=config.cwd)
+                        # Inject as user message and fall through to normal agent processing
+                        user_input = _skill_content
                     else:
-                        print(f"{C.YELLOW}Unknown command. Type /help for available commands.{C.RESET}")
-                    continue
+                        # "Did you mean?" for typo'd slash commands
+                        _all_cmds = ["/help", "/exit", "/quit", "/clear", "/model", "/models",
+                                     "/status", "/save", "/compact", "/yes", "/no",
+                                     "/tokens", "/commit", "/diff", "/git", "/plan",
+                                     "/approve", "/act", "/execute", "/undo", "/init",
+                                     "/config", "/debug", "/debug-scroll", "/checkpoint",
+                                     "/rollback", "/autotest", "/skills", "/image",
+                                     "/browser"]
+                        _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
+                        if not _close:
+                            _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []
+                        if _close:
+                            print(f"{C.YELLOW}Unknown command '{cmd}'. Did you mean: {', '.join(_close[:3])}?{C.RESET}")
+                        else:
+                            print(f"{C.YELLOW}Unknown command. Type /help for available commands.{C.RESET}")
+                        continue
 
             # Expand @file references: @path/to/file → inject file contents
             if "@" in user_input:
