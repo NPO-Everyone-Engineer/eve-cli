@@ -10506,6 +10506,55 @@ def main():
                     _debug_scroll_region(tui)
                     continue
 
+                elif cmd == "/team":
+                    parts = user_input.split(None, 1)
+                    team_args = parts[1].strip() if len(parts) > 1 else ""
+
+                    if not team_args:
+                        print(f"  {C.CYAN}Usage: /team <goal>{C.RESET}")
+                        print(f"  {C.DIM}Decomposes a goal into tasks and runs multiple agents in parallel.{C.RESET}")
+                        print(f"  {C.DIM}Options: /team -n 3 <goal>  (set number of agents, default 2){C.RESET}")
+                        print(f"  {C.DIM}         /team -w <goal>    (allow write operations){C.RESET}")
+                        continue
+
+                    # Parse options
+                    _team_n = 2
+                    _team_writes = False
+                    _goal_parts = team_args.split()
+                    _goal_start = 0
+                    i = 0
+                    while i < len(_goal_parts):
+                        if _goal_parts[i] == "-n" and i + 1 < len(_goal_parts):
+                            try:
+                                _team_n = int(_goal_parts[i + 1])
+                            except ValueError:
+                                pass
+                            i += 2
+                            _goal_start = i
+                        elif _goal_parts[i] == "-w":
+                            _team_writes = True
+                            i += 1
+                            _goal_start = i
+                        else:
+                            break
+
+                    _goal = " ".join(_goal_parts[_goal_start:])
+                    if not _goal:
+                        print(f"{C.YELLOW}Please provide a goal for the team.{C.RESET}")
+                        continue
+
+                    team = AgentTeam(config, client, registry, permissions)
+                    team_result = team.run(_goal, num_teammates=_team_n, allow_writes=_team_writes)
+
+                    session.add_user_message(f"/team {team_args}")
+                    session.add_assistant_message(team_result)
+
+                    # Display result
+                    _scroll_aware_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="")
+                    tui._render_markdown(team_result)
+                    _scroll_aware_print()
+                    continue
+
                 else:
                     # Check if it's a skill invocation: /skill-name args
                     _skill_name = _first_word[1:]  # remove leading /
@@ -10528,7 +10577,7 @@ def main():
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",
                                      "/rollback", "/autotest", "/skills", "/hooks",
                                      "/image", "/browser", "/fork", "/index",
-                                     "/pr", "/gh"]
+                                     "/pr", "/gh", "/team"]
                         _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                         if not _close:
                             _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []
