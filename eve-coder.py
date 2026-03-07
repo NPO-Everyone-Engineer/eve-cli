@@ -5911,12 +5911,55 @@ class TUI:
                 def _completer(text, state):
                     if text.startswith("/"):
                         options = [c for c in _slash_commands if c.startswith(text)]
+                    elif text.startswith("@"):
+                        # @file completion
+                        prefix = text[1:]
+                        try:
+                            if os.path.sep in prefix or prefix == "":
+                                dirn = os.path.dirname(prefix) or "."
+                                base = os.path.basename(prefix)
+                                entries = os.listdir(dirn)
+                                options = []
+                                for e in entries:
+                                    if e.startswith(base) and not e.startswith("."):
+                                        full = os.path.join(dirn, e) if dirn != "." else e
+                                        if os.path.isdir(os.path.join(dirn, e)):
+                                            options.append("@" + full + "/")
+                                        else:
+                                            options.append("@" + full)
+                            else:
+                                entries = os.listdir(".")
+                                options = ["@" + e + ("/" if os.path.isdir(e) else "")
+                                           for e in entries
+                                           if e.startswith(prefix) and not e.startswith(".")]
+                        except OSError:
+                            options = []
+                    elif text.startswith("~") or text.startswith("/") or os.path.sep in text:
+                        # File path completion
+                        expanded = os.path.expanduser(text)
+                        dirn = os.path.dirname(expanded) or "."
+                        base = os.path.basename(expanded)
+                        try:
+                            entries = os.listdir(dirn)
+                            options = []
+                            for e in sorted(entries):
+                                if e.startswith(base) and not e.startswith("."):
+                                    full = os.path.join(dirn, e)
+                                    if os.path.isdir(full):
+                                        options.append(full + "/")
+                                    else:
+                                        options.append(full)
+                        except OSError:
+                            options = []
                     else:
                         options = []
                     return options[state] if state < len(options) else None
                 readline.set_completer(_completer)
                 readline.set_completer_delims(" \t\n")
-                readline.parse_and_bind("tab: complete")
+                if _is_libedit:
+                    readline.parse_and_bind("bind ^I rl_complete")
+                else:
+                    readline.parse_and_bind("tab: complete")
             except Exception:
                 pass
 
@@ -6363,25 +6406,119 @@ class TUI:
 
         return content, tool_calls
 
+    # Keyword sets for syntax highlighting (no external deps)
+    _SYNTAX_KEYWORDS = {
+        "python": {"def", "class", "import", "from", "return", "if", "elif", "else",
+                    "for", "while", "try", "except", "finally", "with", "as", "yield",
+                    "raise", "pass", "break", "continue", "and", "or", "not", "in",
+                    "is", "lambda", "async", "await", "None", "True", "False", "self"},
+        "javascript": {"function", "const", "let", "var", "return", "if", "else",
+                        "for", "while", "class", "import", "export", "from", "async",
+                        "await", "try", "catch", "finally", "throw", "new", "this",
+                        "typeof", "instanceof", "null", "undefined", "true", "false",
+                        "switch", "case", "default", "break", "continue", "of", "in"},
+        "bash": {"if", "then", "else", "elif", "fi", "for", "do", "done", "while",
+                 "case", "esac", "function", "return", "local", "export", "source",
+                 "in", "until", "select", "declare", "readonly", "unset", "shift",
+                 "exit", "eval", "exec", "set", "true", "false"},
+        "go": {"func", "package", "import", "return", "if", "else", "for", "range",
+               "switch", "case", "default", "struct", "interface", "type", "var",
+               "const", "defer", "go", "chan", "select", "map", "nil", "true", "false",
+               "break", "continue", "fallthrough"},
+        "rust": {"fn", "let", "mut", "if", "else", "for", "while", "loop", "match",
+                 "impl", "struct", "enum", "trait", "use", "mod", "pub", "return",
+                 "self", "super", "crate", "where", "async", "await", "move",
+                 "true", "false", "Some", "None", "Ok", "Err"},
+    }
+    # Aliases
+    _SYNTAX_KEYWORDS["py"] = _SYNTAX_KEYWORDS["python"]
+    _SYNTAX_KEYWORDS["js"] = _SYNTAX_KEYWORDS["javascript"]
+    _SYNTAX_KEYWORDS["ts"] = _SYNTAX_KEYWORDS["javascript"]
+    _SYNTAX_KEYWORDS["tsx"] = _SYNTAX_KEYWORDS["javascript"]
+    _SYNTAX_KEYWORDS["jsx"] = _SYNTAX_KEYWORDS["javascript"]
+    _SYNTAX_KEYWORDS["typescript"] = _SYNTAX_KEYWORDS["javascript"]
+    _SYNTAX_KEYWORDS["sh"] = _SYNTAX_KEYWORDS["bash"]
+    _SYNTAX_KEYWORDS["zsh"] = _SYNTAX_KEYWORDS["bash"]
+    _SYNTAX_KEYWORDS["shell"] = _SYNTAX_KEYWORDS["bash"]
+
+    def _highlight_code_line(self, line, lang):
+        """Apply simple syntax highlighting to a code line."""
+        if not C._enabled:
+            return line
+        keywords = self._SYNTAX_KEYWORDS.get(lang)
+        if not keywords:
+            return f"{C.GREEN}{line}{C.RESET}"
+
+        _kw = _ansi("\033[38;5;198m")   # keywords: pink
+        _str = _ansi("\033[38;5;186m")  # strings: yellow
+        _cmt = _ansi("\033[38;5;240m")  # comments: dim gray
+        _num = _ansi("\033[38;5;141m")  # numbers: purple
+        _base = _ansi("\033[38;5;252m") # base text: light gray
+
+        # Comments (simple check)
+        stripped = line.lstrip()
+        if stripped.startswith("#") or stripped.startswith("//"):
+            return f"{_cmt}{line}{C.RESET}"
+
+        result = []
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            # Strings
+            if ch in ('"', "'"):
+                quote = ch
+                j = i + 1
+                while j < len(line) and line[j] != quote:
+                    if line[j] == '\\':
+                        j += 1
+                    j += 1
+                j = min(j + 1, len(line))
+                result.append(f"{_str}{line[i:j]}{_base}")
+                i = j
+            # Numbers
+            elif ch.isdigit() and (i == 0 or not line[i-1].isalnum()):
+                j = i
+                while j < len(line) and (line[j].isdigit() or line[j] == '.'):
+                    j += 1
+                result.append(f"{_num}{line[i:j]}{_base}")
+                i = j
+            # Words (keywords)
+            elif ch.isalpha() or ch == '_':
+                j = i
+                while j < len(line) and (line[j].isalnum() or line[j] == '_'):
+                    j += 1
+                word = line[i:j]
+                if word in keywords:
+                    result.append(f"{_kw}{word}{_base}")
+                else:
+                    result.append(f"{_base}{word}")
+                i = j
+            else:
+                result.append(f"{_base}{ch}")
+                i += 1
+        return f"{_base}{''.join(result)}{C.RESET}"
+
     def _render_markdown(self, text):
         """Simple markdown-ish rendering for terminal."""
         _p = self._scroll_print
         in_code_block = False
+        code_lang = ""
         lines = text.split("\n")
         for i, line in enumerate(lines):
             if line.startswith("```"):
                 in_code_block = not in_code_block
                 if in_code_block:
-                    lang = line[3:].strip()
+                    code_lang = line[3:].strip().lower()
                     sep_w = min(40, _get_terminal_width() - 6)
-                    _p(f"\n{C.DIM}{'─' * sep_w} {lang}{C.RESET}")
+                    _p(f"\n{C.DIM}{'─' * sep_w} {code_lang}{C.RESET}")
                 else:
                     sep_w = min(40, _get_terminal_width() - 6)
                     _p(f"{C.DIM}{'─' * sep_w}{C.RESET}")
+                    code_lang = ""
                 continue
 
             if in_code_block:
-                _p(f"{C.GREEN}{line}{C.RESET}")
+                _p(self._highlight_code_line(line, code_lang))
                 continue
 
             # Headers
@@ -6572,10 +6709,32 @@ class TUI:
            f"{_red}{err_suffix}{C.RESET}" if is_error else
            f"  {icon_color}{icon_char}{C.RESET} {name}{_dim}{key_arg}{C.RESET}{_dim}{paren}{C.RESET}")
 
-        # Show first 3 lines of detail with ┃ prefix (collapsed by default)
+        # Show detail lines with ┃ prefix
+        # Edit tool: show colorized diff (more lines); others: 3 lines collapsed
         detail_marker = _dim + "  \u2503"
-        max_detail = 3
-        if line_count > 0 and not is_error:
+        if name == "Edit" and not is_error and line_count > 0:
+            # Show full colorized diff for Edit results
+            _diff_red = _ansi("\033[38;5;196m")
+            _diff_green = _ansi("\033[38;5;46m")
+            _diff_sep = _ansi("\033[38;5;240m")
+            max_diff = 30
+            shown = 0
+            for line in lines[:max_diff]:
+                display = _truncate_to_display_width(line, 200)
+                if display.startswith("-"):
+                    _p(f"{detail_marker} {_diff_red}{display}{C.RESET}")
+                elif display.startswith("+"):
+                    _p(f"{detail_marker} {_diff_green}{display}{C.RESET}")
+                elif display == "---":
+                    _p(f"{detail_marker} {_diff_sep}---{C.RESET}")
+                else:
+                    _p(f"{detail_marker} {_dim}{display}{C.RESET}")
+                shown += 1
+            if line_count > max_diff:
+                remaining = line_count - max_diff
+                _p(f"{detail_marker} {_ansi(chr(27)+'[38;5;245m')}  \u2195 {remaining} more lines{C.RESET}")
+        elif line_count > 0 and not is_error:
+            max_detail = 3
             shown = min(max_detail, line_count)
             for line in lines[:shown]:
                 display = _truncate_to_display_width(line, 200)
@@ -6593,11 +6752,36 @@ class TUI:
 
         # Show full command/detail (no truncation for security review)
         detail = ""
+        detail_extra = []  # additional preview lines
         if tool_name == "Bash":
             cmd = params.get("command", "")
             detail = cmd
-        elif tool_name in ("Write", "Edit"):
+        elif tool_name == "Edit":
             detail = params.get("file_path", "")
+            old_s = params.get("old_string", "")
+            new_s = params.get("new_string", "")
+            _dr = _ansi("\033[38;5;196m")
+            _dg = _ansi("\033[38;5;46m")
+            if old_s:
+                for ln in old_s.split("\n")[:5]:
+                    detail_extra.append(f"{_dr}- {ln}{C.RESET}")
+                if old_s.count("\n") > 5:
+                    detail_extra.append(f"{_dr}  ... ({old_s.count(chr(10))+1} lines){C.RESET}")
+            if new_s:
+                for ln in new_s.split("\n")[:5]:
+                    detail_extra.append(f"{_dg}+ {ln}{C.RESET}")
+                if new_s.count("\n") > 5:
+                    detail_extra.append(f"{_dg}  ... ({new_s.count(chr(10))+1} lines){C.RESET}")
+        elif tool_name == "Write":
+            detail = params.get("file_path", "")
+            content = params.get("content", "")
+            n_lines = content.count("\n") + (1 if content else 0)
+            _dg = _ansi("\033[38;5;46m")
+            detail_extra.append(f"{_dg}  ({n_lines} lines to write){C.RESET}")
+            for ln in content.split("\n")[:3]:
+                detail_extra.append(f"{_dg}  {ln[:80]}{C.RESET}")
+            if n_lines > 3:
+                detail_extra.append(f"{_dg}  ...{C.RESET}")
         elif tool_name == "NotebookEdit":
             detail = params.get("notebook_path", "")
         elif tool_name in ("WebFetch", "WebSearch"):
@@ -6618,6 +6802,8 @@ class TUI:
                 for i in range(0, len(detail), max_w):
                     chunk = detail[i:i+max_w]
                     print(f"  {_y}│{C.RESET} {_w}{chunk}{C.RESET}")
+        for extra_line in detail_extra:
+            print(f"  {_y}│{C.RESET} {extra_line}")
         print(f"  {_y}│{C.RESET}")
         print(f"  {_y}│{C.RESET}  [y] Allow once   [a] Allow all {tool_name} this session")
         print(f"  {_y}│{C.RESET}  [n] Deny (Enter)  [d] Deny all   [Y] Approve everything")
@@ -6766,6 +6952,7 @@ class TUI:
   {_c198}/no{C.RESET}                Auto-approve OFF
   {_c198}/image{C.RESET}             Attach image from clipboard
   {_c198}/image{C.RESET} <path>      Attach image file
+  {_c198}@file{C.RESET}              Attach file contents (e.g. @src/main.py)
   {_c198}/debug{C.RESET}             Toggle debug mode
   {_c198}/debug-scroll{C.RESET}      Test scroll region (DECSTBM)
   {_c198}/resume{C.RESET}            Switch to a different session
@@ -7221,14 +7408,11 @@ class Agent:
                             if tool_name in ("Write", "Edit") and self.git_checkpoint._is_git_repo:
                                 self.git_checkpoint.create(f"before-{tool_name.lower()}")
 
-                            is_long_op = tool_name in ("Bash", "WebFetch", "WebSearch")
-                            if is_long_op:
-                                self.tui.start_tool_status(tool_name)
+                            self.tui.start_tool_status(tool_name)
                             _tool_t0 = time.time()
                             output = tool.execute(tool_params)
                             _tool_dur = time.time() - _tool_t0
-                            if is_long_op:
-                                self.tui.stop_spinner()
+                            self.tui.stop_spinner()
                             _is_err = isinstance(output, str) and (
                                 output.startswith("Error:") or output.startswith("Error -")
                             )
@@ -8369,6 +8553,34 @@ def main():
                     else:
                         print(f"{C.YELLOW}Unknown command. Type /help for available commands.{C.RESET}")
                     continue
+
+            # Expand @file references: @path/to/file → inject file contents
+            if "@" in user_input:
+                _at_pattern = re.compile(r'(?<!\w)@((?:[^\s@]|\\ )+)')
+                _at_files_found = []
+                def _at_replace(m):
+                    fpath = m.group(1).replace("\\ ", " ")
+                    expanded = os.path.expanduser(fpath)
+                    if not os.path.isabs(expanded):
+                        expanded = os.path.join(os.getcwd(), expanded)
+                    if os.path.isfile(expanded):
+                        try:
+                            with open(expanded, "rb") as _bf:
+                                sample = _bf.read(8192)
+                            if b"\x00" in sample:
+                                return m.group(0)  # skip binary files
+                            with open(expanded, "r", encoding="utf-8", errors="replace") as _rf:
+                                content = _rf.read(100_000)  # 100KB cap
+                            _at_files_found.append(os.path.basename(expanded))
+                            truncated = " (truncated)" if len(content) >= 100_000 else ""
+                            return f"\n<file path=\"{expanded}\">\n{content}\n</file>{truncated}\n"
+                        except Exception:
+                            return m.group(0)
+                    return m.group(0)  # not a file, keep as-is
+                user_input = _at_pattern.sub(_at_replace, user_input)
+                if _at_files_found:
+                    _names = ", ".join(_at_files_found)
+                    print(f"  {C.DIM}📎 Attached: {_names}{C.RESET}")
 
             # Detect dragged-and-dropped image paths in user input
             cleaned_input, dropped_images = _extract_image_paths(user_input)
