@@ -121,28 +121,48 @@ COMPACT_PRESERVE_COUNT  = 30    # recent messages to keep during compaction
 FILE_WATCHER_MAX_EVENTS = 20    # max file change events shown at once
 
 
-def _tmux_notify(title: str, body: str = "") -> None:
-    """Send a tmux display-message notification when running inside a tmux session.
+def _notify(title: str, body: str = "") -> None:
+    """Send a terminal notification when the AI finishes or errors.
 
-    Fires only when TMUX env var is set (i.e. inside tmux).
-    This is useful when you switch to another window while the AI is running —
-    you'll see a status-bar flash when the task finishes or an error occurs.
+    Useful when you switch to another pane/window while waiting for the AI.
+    Supports two backends (both may fire simultaneously):
+
+    1. OSC 777 escape sequence — works in cmux, iTerm2, rxvt-unicode, and
+       other terminals that support desktop/sidebar notifications.
+       Format: \\e]777;notify;<title>;<body>\\a
+
+    2. tmux display-message — shows a flash in the tmux status bar.
+       Only fires when the TMUX environment variable is set.
+
     All errors are silently swallowed; notifications are strictly best-effort.
     """
-    if not os.environ.get("TMUX"):
-        return
+    label = f"[eve] {title}"
+    body_short = body[:100] if body else ""
+
+    # Backend 1: OSC 777 (cmux, iTerm2, rxvt-unicode, etc.)
+    # Emitted whenever stdout is a TTY — harmless in unsupported terminals.
     try:
-        msg = f"[eve] {title}"
-        if body:
-            msg += f": {body}"
-        msg = msg[:200]  # truncate to avoid tmux display issues
-        subprocess.run(
-            ["tmux", "display-message", "-d", "4000", msg],
-            timeout=2,
-            capture_output=True,
-        )
+        if sys.stdout.isatty():
+            sys.stdout.write(f"\x1b]777;notify;{label};{body_short}\x07")
+            sys.stdout.flush()
     except Exception:
-        pass  # notification is strictly best-effort
+        pass  # best-effort
+
+    # Backend 2: tmux display-message (only inside tmux sessions)
+    if os.environ.get("TMUX"):
+        try:
+            msg = f"{label}: {body_short}" if body_short else label
+            subprocess.run(
+                ["tmux", "display-message", "-d", "4000", msg[:200]],
+                timeout=2,
+                capture_output=True,
+            )
+        except Exception:
+            pass  # best-effort
+
+
+# Keep old name as alias for compatibility with any external hooks
+_tmux_notify = _notify
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -7806,7 +7826,7 @@ class Agent:
                         "iterations": iteration,
                         "msgs": len(self.session.messages),
                     })
-                    _tmux_notify("Done", f"{iteration + 1} step(s)")
+                    _notify("Done", f"{iteration + 1} step(s)")
                     break
 
                 # 5. Detect infinite tool call loops
@@ -8081,7 +8101,7 @@ class Agent:
                     _p(f"{C.DIM}Download it:  ollama pull {self.config.model}{C.RESET}")
                 elif e.code == 400:
                     _p(f"{C.DIM}The request was rejected — the model name or context may be invalid.{C.RESET}")
-                _tmux_notify("Error", f"HTTP {e.code}")
+                _notify("Error", f"HTTP {e.code}")
                 break
             except urllib.error.URLError as e:
                 self.tui.stop_spinner()
@@ -8092,7 +8112,7 @@ class Agent:
                 _p(f"\n{C.RED}Lost connection to Ollama (the local AI engine).{C.RESET}")
                 _p(f"{C.DIM}It may have crashed or been closed. Restart it:  ollama serve{C.RESET}")
                 _p(f"{C.DIM}Your conversation is still here — just try again after restarting.{C.RESET}")
-                _tmux_notify("Error", "Ollama connection lost")
+                _notify("Error", "Ollama connection lost")
                 break
             except Exception as e:
                 self.tui.stop_spinner()
@@ -8106,13 +8126,13 @@ class Agent:
                     traceback.print_exc()
                 else:
                     _p(f"{C.DIM}(Run with --debug for full details){C.RESET}")
-                _tmux_notify("Error", str(e)[:60])
+                _notify("Error", str(e)[:60])
                 break
         else:
             _p(f"\n{C.YELLOW}The AI took {self.MAX_ITERATIONS} steps without finishing.{C.RESET}")
             _p(f"{C.DIM}Your work so far is saved. Try breaking the task into smaller steps,{C.RESET}")
             _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
-            _tmux_notify("Stopped", f"reached {self.MAX_ITERATIONS} step limit")
+            _notify("Stopped", f"reached {self.MAX_ITERATIONS} step limit")
 
         # Stop ESC monitor (scroll region stays active — managed by main loop)
         self._last_typeahead = _esc_monitor.get_typeahead()
