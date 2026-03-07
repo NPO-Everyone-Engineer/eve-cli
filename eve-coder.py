@@ -31,6 +31,7 @@ import unicodedata
 import urllib.request
 import urllib.error
 import urllib.parse
+import copy
 import hashlib
 import traceback
 import base64
@@ -740,6 +741,9 @@ class Config:
         self.rag_model = "nomic-embed-text"
         self.rag_index = None  # path to index then exit
 
+        # Markdown rendering
+        self.markdown_renderer = "glow"  # "glow" or "simple"
+
         # Paths (primary: eve-cli, with backward compat for old eve-coder dirs)
         if os.name == "nt":
             appdata = os.environ.get("LOCALAPPDATA",
@@ -842,6 +846,9 @@ class Config:
                             self.context_window = int(val)
                         except ValueError:
                             pass
+                    elif key == "MARKDOWN_RENDERER" and val:
+                        if val.lower() in ("glow", "simple"):
+                            self.markdown_renderer = val.lower()
         except (OSError, IOError):
             pass  # Config file unreadable — skip silently
 
@@ -861,6 +868,10 @@ class Config:
             self.profile = os.environ["EVE_CLI_PROFILE"]
         if os.environ.get("EVE_CODER_DEBUG") == "1" or os.environ.get("EVE_CLI_DEBUG") == "1":
             self.debug = True
+        if os.environ.get("EVE_CLI_MARKDOWN_RENDERER"):
+            renderer = os.environ["EVE_CLI_MARKDOWN_RENDERER"].lower()
+            if renderer in ("glow", "simple"):
+                self.markdown_renderer = renderer
 
     def _load_cli_args(self, argv=None):
         # Strip full-width spaces from args (common with Japanese IME input)
@@ -901,6 +912,9 @@ class Config:
         # Output format
         parser.add_argument("--output-format", choices=["text", "json", "stream-json"],
                             default="text", help="Output format for one-shot mode")
+        # Markdown rendering
+        parser.add_argument("--markdown-renderer", choices=["glow", "simple"],
+                            help="Markdown renderer: glow (beautiful tables) or simple")
         # RAG options
         parser.add_argument("--rag", action="store_true", help="Enable RAG mode")
         parser.add_argument("--rag-mode", choices=["query"], default="query",
@@ -955,6 +969,8 @@ class Config:
             self.rag_index = args.rag_index
         if args.output_format:
             self.output_format = args.output_format
+        if args.markdown_renderer:
+            self.markdown_renderer = args.markdown_renderer
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -4497,6 +4513,11 @@ class SubAgentTool(Tool):
                     "type": "boolean",
                     "description": "Allow write tools: Bash, Write, Edit (default false)",
                 },
+                "isolation": {
+                    "type": "string",
+                    "enum": ["none", "worktree"],
+                    "description": "Isolation mode: 'worktree' runs in a temporary git worktree (default: none)",
+                },
             },
             "required": ["prompt"],
         }
@@ -4526,6 +4547,29 @@ class SubAgentTool(Tool):
 
         allow_writes = params.get("allow_writes", False)
 
+        # Worktree isolation setup
+        isolation = params.get("isolation", "none")
+        worktree_path = None
+        worktree_branch = None
+        wt_manager = None
+
+        if isolation == "worktree" and allow_writes:
+            wt_manager = GitWorktree(self._config.cwd)
+            worktree_path, worktree_branch = wt_manager.create()
+            if worktree_path:
+                sub_config = copy.copy(self._config)
+                sub_config.cwd = worktree_path
+                with _print_lock:
+                    _scroll_aware_print(
+                        f"  {C.DIM}  \u21b3 Worktree: {worktree_path} (branch: {worktree_branch}){C.RESET}")
+            else:
+                sub_config = self._config
+                with _print_lock:
+                    _scroll_aware_print(
+                        f"  {C.DIM}  \u21b3 Worktree creation failed, running in main directory{C.RESET}")
+        else:
+            sub_config = self._config
+
         # Determine allowed tool set
         allowed_tools = set(self.READ_ONLY_TOOLS)
         if allow_writes:
@@ -4548,7 +4592,7 @@ class SubAgentTool(Tool):
 
         # Build sub-agent conversation
         messages = [
-            {"role": "system", "content": self._build_sub_system_prompt(self._config)},
+            {"role": "system", "content": self._build_sub_system_prompt(sub_config)},
             {"role": "user", "content": prompt},
         ]
 
@@ -4684,6 +4728,33 @@ class SubAgentTool(Tool):
                 f"Sub-agent reached max turns ({max_turns}). "
                 f"Last response: {last_text[:2000]}"
             )
+
+        # Worktree cleanup
+        if worktree_path and wt_manager:
+            try:
+                has_changes = wt_manager.has_changes(worktree_path)
+                if has_changes:
+                    diff_preview = wt_manager.get_diff(worktree_path)
+                    result_text += f"\n\n[Worktree changes on branch: {worktree_branch}]\n"
+                    if diff_preview:
+                        result_text += f"```diff\n{diff_preview[:3000]}\n```\n"
+                    result_text += f"To apply: git merge {worktree_branch}"
+                    # Don't remove worktree if it has changes
+                    with _print_lock:
+                        _scroll_aware_print(
+                            f"  {C.DIM}  \u21b3 Worktree preserved (has changes): {worktree_path}{C.RESET}")
+                else:
+                    # Clean up: no changes
+                    wt_manager.remove(worktree_path, worktree_branch)
+                    with _print_lock:
+                        _scroll_aware_print(
+                            f"  {C.DIM}  \u21b3 Worktree cleaned up (no changes){C.RESET}")
+            except Exception:
+                # Best-effort cleanup on error
+                try:
+                    wt_manager.remove(worktree_path, worktree_branch)
+                except Exception:
+                    pass
 
         _sub_elapsed = time.time() - _sub_start
         with _print_lock:
@@ -5227,6 +5298,91 @@ class GitCheckpoint:
                 "summary": summary or "working tree snapshot",
             })
         return items
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Git Worktree — Isolated sub-agent execution
+# ════════════════════════════════════════════════════════════════════════════════
+
+class GitWorktree:
+    """Manages temporary git worktrees for isolated sub-agent execution."""
+
+    def __init__(self, cwd):
+        self.cwd = cwd
+        self._is_git_repo = os.path.isdir(os.path.join(cwd, ".git"))
+
+    def create(self, branch_prefix="eve-worktree"):
+        """Create a temporary worktree. Returns (worktree_path, branch_name) or (None, None)."""
+        if not self._is_git_repo:
+            return None, None
+        branch_name = f"{branch_prefix}-{uuid.uuid4().hex[:8]}"
+        worktree_path = os.path.join(tempfile.gettempdir(), f"eve-wt-{uuid.uuid4().hex[:8]}")
+        try:
+            # Create worktree with new branch from current HEAD
+            proc = subprocess.run(
+                ["git", "worktree", "add", "-b", branch_name, worktree_path],
+                capture_output=True, text=True, timeout=30, cwd=self.cwd,
+            )
+            if proc.returncode != 0:
+                return None, None
+            return worktree_path, branch_name
+        except (subprocess.TimeoutExpired, OSError):
+            return None, None
+
+    def remove(self, worktree_path, branch_name=None):
+        """Remove a worktree and optionally its branch."""
+        if not worktree_path or not os.path.isdir(worktree_path):
+            return
+        try:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", worktree_path],
+                capture_output=True, text=True, timeout=15, cwd=self.cwd,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            # Fallback: try to remove directory
+            try:
+                shutil.rmtree(worktree_path, ignore_errors=True)
+                subprocess.run(
+                    ["git", "worktree", "prune"],
+                    capture_output=True, text=True, timeout=10, cwd=self.cwd,
+                )
+            except Exception:
+                pass
+        # Clean up branch
+        if branch_name:
+            try:
+                subprocess.run(
+                    ["git", "branch", "-D", branch_name],
+                    capture_output=True, text=True, timeout=10, cwd=self.cwd,
+                )
+            except Exception:
+                pass
+
+    def has_changes(self, worktree_path):
+        """Check if worktree has uncommitted changes."""
+        if not worktree_path or not os.path.isdir(worktree_path):
+            return False
+        try:
+            proc = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, timeout=10, cwd=worktree_path,
+            )
+            return bool(proc.stdout.strip())
+        except Exception:
+            return False
+
+    def get_diff(self, worktree_path):
+        """Get diff of changes in worktree."""
+        if not worktree_path:
+            return ""
+        try:
+            proc = subprocess.run(
+                ["git", "diff"],
+                capture_output=True, text=True, timeout=15, cwd=worktree_path,
+            )
+            return proc.stdout[:10000]
+        except Exception:
+            return ""
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -6692,7 +6848,7 @@ class TUI:
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/watch", "/skills",
-                    "/browser", "/fork", "/index",
+                    "/browser", "/fork", "/index", "/pr", "/gh",
                 ]
                 def _completer(text, state):
                     try:
@@ -7329,23 +7485,24 @@ class TUI:
         """Render markdown using glow for beautiful tables and formatting."""
         _p = self._scroll_print
         
-        # Try to use glow for beautiful markdown rendering (tables, etc.)
-        glow_path = shutil.which("glow")
-        if glow_path:
-            try:
-                # Use glow to render markdown with proper table support
-                proc = subprocess.run(
-                    [glow_path, "--style", "dark", "--width", str(min(120, _get_terminal_width()))],
-                    input=text,
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if proc.returncode == 0:
-                    _p(proc.stdout)
-                    return
-            except Exception:
-                pass  # Fall back to simple rendering
+        # Use glow if configured and available
+        if self.config.markdown_renderer == "glow":
+            glow_path = shutil.which("glow")
+            if glow_path:
+                try:
+                    # Use glow to render markdown with proper table support
+                    proc = subprocess.run(
+                        [glow_path, "--style", "dark", "--width", str(min(120, _get_terminal_width()))],
+                        input=text,
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    if proc.returncode == 0:
+                        _p(proc.stdout)
+                        return
+                except Exception:
+                    pass  # Fall back to simple rendering
         
         # Fallback: simple markdown-ish rendering for terminal
         in_code_block = False
@@ -7810,6 +7967,9 @@ class TUI:
   {_c198}/commit{C.RESET}            Generate AI commit message
   {_c198}/diff{C.RESET}              Show git diff
   {_c198}/git{C.RESET} <args>        Run git commands
+  {_c51}━━ GitHub {sep[9:]}{C.RESET}
+  {_c198}/pr{C.RESET} [subcommand]   PR management (list, create, view, checks, diff, merge)
+  {_c198}/gh{C.RESET} <command>      Run any gh CLI command (e.g., /gh issue list)
   {_c51}━━ Plan/Act Mode {sep[16:]}{C.RESET}
   {_c198}/plan{C.RESET}              Enter plan mode (explore + write plan)
   {_c198}/plan list{C.RESET}         List recent plan files
@@ -8762,6 +8922,23 @@ def _generate_project_claude_md(cwd):
     return "\n".join(lines)
 
 
+def _run_gh_command(args, cwd=None, timeout=30):
+    """Run a gh CLI command and return (success, stdout, stderr)."""
+    if not shutil.which("gh"):
+        return False, "", "gh CLI not found. Install: https://cli.github.com/"
+    try:
+        proc = subprocess.run(
+            ["gh"] + args,
+            capture_output=True, text=True, timeout=timeout,
+            cwd=cwd or os.getcwd(),
+        )
+        return proc.returncode == 0, proc.stdout.strip(), proc.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return False, "", "Command timed out"
+    except Exception as e:
+        return False, "", str(e)
+
+
 def main():
     # Parse config
     config = Config().load()
@@ -9459,6 +9636,167 @@ def main():
                         print(f"{C.RED}Error: {e}{C.RESET}")
                     continue
 
+                # ── GitHub commands ───────────────────────────────────
+                elif cmd == "/pr":
+                    parts = user_input.split(maxsplit=1)
+                    sub = parts[1].strip().lower() if len(parts) > 1 else "list"
+
+                    if sub == "list":
+                        ok, out, err = _run_gh_command(["pr", "list"], cwd=config.cwd)
+                        print(out if ok else f"{C.RED}{err}{C.RESET}")
+
+                    elif sub == "create":
+                        try:
+                            # Get branch info
+                            branch_result = subprocess.run(
+                                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True, cwd=config.cwd, timeout=10)
+                            branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "unknown"
+
+                            # Get commit log
+                            log_result = subprocess.run(
+                                ["git", "log", "--oneline", "origin/main..HEAD"],
+                                capture_output=True, text=True, cwd=config.cwd, timeout=10)
+                            log_output = log_result.stdout.strip() if log_result.returncode == 0 else ""
+
+                            # Get diff stat
+                            diff_result = subprocess.run(
+                                ["git", "diff", "--stat", "origin/main..HEAD"],
+                                capture_output=True, text=True, cwd=config.cwd, timeout=10)
+                            diff_stat = diff_result.stdout.strip() if diff_result.returncode == 0 else ""
+
+                            if not log_output:
+                                print(f"{C.YELLOW}No commits ahead of origin/main.{C.RESET}")
+                                continue
+
+                            # Use agent to generate PR title and body
+                            pr_prompt = (
+                                f"Based on these commits, generate a PR title and description.\n\n"
+                                f"Branch: {branch}\n"
+                                f"Commits:\n{log_output}\n\n"
+                                f"Diff stat:\n{diff_stat}\n\n"
+                                f"Format your response EXACTLY as:\n"
+                                f"TITLE: <one line title>\n"
+                                f"BODY:\n<markdown body with ## Summary and ## Changes sections>"
+                            )
+                            session.add_user_message(pr_prompt)
+                            agent.run(pr_prompt)
+
+                            # After agent responds, ask user to confirm and create
+                            confirm = input(f"\n{C.CYAN}Create this PR? [Y/n]: {C.RESET}").strip().lower()
+                            if confirm in ("", "y", "yes"):
+                                # Extract title and body from last assistant message
+                                last_msg = ""
+                                for m in reversed(session.messages):
+                                    if m.get("role") == "assistant" and m.get("content"):
+                                        last_msg = m["content"]
+                                        break
+                                title = branch  # fallback
+                                body = last_msg
+                                # Try to extract TITLE: line
+                                for line in last_msg.split("\n"):
+                                    if line.strip().startswith("TITLE:"):
+                                        title = line.split("TITLE:", 1)[1].strip()
+                                        break
+                                # Extract BODY: section
+                                if "BODY:" in last_msg:
+                                    body = last_msg.split("BODY:", 1)[1].strip()
+
+                                # Push first
+                                print(f"{C.DIM}Pushing to origin/{branch}...{C.RESET}")
+                                push_result = subprocess.run(
+                                    ["git", "push", "-u", "origin", branch],
+                                    capture_output=True, text=True, cwd=config.cwd, timeout=60)
+                                if push_result.returncode != 0:
+                                    print(f"{C.YELLOW}Push warning: {push_result.stderr}{C.RESET}")
+
+                                ok, out, err = _run_gh_command(
+                                    ["pr", "create", "--title", title, "--body", body],
+                                    cwd=config.cwd, timeout=30)
+                                if ok:
+                                    print(f"{C.GREEN}PR created: {out}{C.RESET}")
+                                else:
+                                    print(f"{C.RED}Failed to create PR: {err}{C.RESET}")
+                            else:
+                                print(f"{C.DIM}PR creation cancelled.{C.RESET}")
+                        except (EOFError, KeyboardInterrupt):
+                            print(f"\n{C.DIM}Cancelled.{C.RESET}")
+                        except Exception as e:
+                            print(f"{C.RED}Error: {e}{C.RESET}")
+
+                    elif sub.startswith("view"):
+                        pr_num = sub.split(None, 1)[1] if len(sub.split()) > 1 else ""
+                        args = ["pr", "view"]
+                        if pr_num:
+                            args.append(pr_num)
+                        ok, out, err = _run_gh_command(args, cwd=config.cwd)
+                        print(out if ok else f"{C.RED}{err}{C.RESET}")
+
+                    elif sub.startswith("checks"):
+                        pr_num = sub.split(None, 1)[1] if len(sub.split()) > 1 else ""
+                        args = ["pr", "checks"]
+                        if pr_num:
+                            args.append(pr_num)
+                        ok, out, err = _run_gh_command(args, cwd=config.cwd)
+                        print(out if ok else f"{C.RED}{err}{C.RESET}")
+
+                    elif sub.startswith("diff"):
+                        pr_num = sub.split(None, 1)[1] if len(sub.split()) > 1 else ""
+                        args = ["pr", "diff"]
+                        if pr_num:
+                            args.append(pr_num)
+                        ok, out, err = _run_gh_command(args, cwd=config.cwd)
+                        print(out if ok else f"{C.RED}{err}{C.RESET}")
+
+                    elif sub.startswith("merge"):
+                        pr_num = sub.split(None, 1)[1] if len(sub.split()) > 1 else ""
+                        args = ["pr", "merge"]
+                        if pr_num:
+                            args.append(pr_num)
+                        try:
+                            confirm = input(f"{C.CYAN}Merge this PR? [y/N]: {C.RESET}").strip().lower()
+                            if confirm in ("y", "yes"):
+                                ok, out, err = _run_gh_command(args, cwd=config.cwd, timeout=30)
+                                if ok:
+                                    print(f"{C.GREEN}{out}{C.RESET}")
+                                else:
+                                    print(f"{C.RED}{err}{C.RESET}")
+                            else:
+                                print(f"{C.DIM}Merge cancelled.{C.RESET}")
+                        except (EOFError, KeyboardInterrupt):
+                            print(f"\n{C.DIM}Cancelled.{C.RESET}")
+
+                    else:
+                        print(f"{C.YELLOW}Usage: /pr [list|create|view|checks|diff|merge] [number]{C.RESET}")
+                    continue
+
+                elif cmd == "/gh":
+                    parts = user_input.split(None, 1)
+                    gh_args = parts[1] if len(parts) > 1 else ""
+                    if not gh_args:
+                        print(f"  {C.CYAN}/gh <command>{C.RESET} — Run any gh CLI command")
+                        print(f"  {C.DIM}Examples: /gh issue list, /gh repo view, /gh run list{C.RESET}")
+                        continue
+                    # Security: block dangerous commands
+                    _blocked = {"auth", "ssh-key", "gpg-key", "secret"}
+                    import shlex as _shlex_gh
+                    try:
+                        _gh_parsed = _shlex_gh.split(gh_args)
+                    except ValueError:
+                        _gh_parsed = gh_args.split()
+                    first_arg = _gh_parsed[0] if _gh_parsed else ""
+                    if first_arg in _blocked:
+                        print(f"{C.RED}Blocked: /gh {first_arg} is not allowed for security.{C.RESET}")
+                        continue
+                    ok, out, err = _run_gh_command(_gh_parsed, cwd=config.cwd, timeout=30)
+                    if ok:
+                        print(out)
+                    else:
+                        print(f"{C.RED}{err}{C.RESET}")
+                        if "not logged in" in err.lower() or "auth" in err.lower():
+                            print(f"{C.DIM}Run: gh auth login{C.RESET}")
+                    continue
+
                 # ── Plan mode commands ────────────────────────────────
                 elif cmd == "/plan":
                     parts = user_input.split(maxsplit=1)
@@ -9970,7 +10308,8 @@ def main():
                                      "/approve", "/act", "/execute", "/undo", "/init",
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",
                                      "/rollback", "/autotest", "/skills", "/hooks",
-                                     "/image", "/browser", "/fork", "/index"]
+                                     "/image", "/browser", "/fork", "/index",
+                                     "/pr", "/gh"]
                         _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                         if not _close:
                             _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []
