@@ -454,7 +454,7 @@ class ScrollRegion:
         buf += f"\033[{status_row};1H\033[2K {status}{_rst}"
 
         hint = self._hint_text or ""
-        hint_prefix = f" {_dim}ESC: stop"
+        hint_prefix = f" {_dim}ESC: stop, Ctrl+M: mode"
         if hint:
             buf += f"\033[{hint_row};1H\033[2K{hint_prefix} | type-ahead: \"{hint}\"{_rst}"
         else:
@@ -515,7 +515,7 @@ def _debug_scroll_region(tui):
     print(f"\n  {_c51}Test 1: Footer before DECSTBM (setup pattern){_rst}")
     footer = f"\033[{sep_row};1H\033[2K{_sep_c}{'═' * cols}{_r}"
     footer += f"\033[{status_row};1H\033[2K {_c87}[fixed] Status row{_r}"
-    footer += f"\033[{hint_row};1H\033[2K {_dim}[fixed] ESC: stop{_r}"
+    footer += f"\033[{hint_row};1H\033[2K {_dim}[fixed] ESC: stop, Ctrl+M: mode{_r}"
     buf = footer
     buf += f"\033[1;{scroll_end}r"
     buf += f"\033[{scroll_end};1H"
@@ -567,9 +567,11 @@ class InputMonitor:
     Type-ahead: any non-ESC characters typed during agent execution are
     buffered and can be injected into readline's next input() call via
     get_typeahead() + readline.set_startup_hook.
+    
+    Mode switching: Ctrl+M toggles between local/cloud models (auto mode).
     """
 
-    def __init__(self, on_typeahead=None):
+    def __init__(self, on_typeahead=None, on_mode_switch=None):
         self._pressed = threading.Event()
 
         self._stop_event = threading.Event()
@@ -578,12 +580,22 @@ class InputMonitor:
         self._typeahead = []      # buffered keystrokes (bytes)
         self._typeahead_lock = threading.Lock()
         self._on_typeahead = on_typeahead  # callback(text) for live type-ahead display
+        self._on_mode_switch = on_mode_switch  # callback() for mode switch (Ctrl+M)
+        self._mode_switched = threading.Event()  # True if Ctrl+M was pressed
 
     @property
     def pressed(self):
         """True if ESC was pressed since start()."""
         return self._pressed.is_set()
 
+    @property
+    def mode_switched(self):
+        """True if Ctrl+M was pressed since start()."""
+        return self._mode_switched.is_set()
+
+    def reset_mode_switch(self):
+        """Reset the mode switch flag."""
+        self._mode_switched.clear()
 
     def get_typeahead(self):
         """Return and clear any buffered type-ahead text (decoded as utf-8)."""
@@ -652,6 +664,15 @@ class InputMonitor:
                 elif ch == b'\x03':  # Ctrl+C
                     self._pressed.set()
                     break
+                elif ch == b'\x0d':  # Ctrl+M (ASCII 13 = carriage return)
+                    # Mode switch shortcut
+                    self._mode_switched.set()
+                    if self._on_mode_switch:
+                        try:
+                            self._on_mode_switch()
+                        except Exception:
+                            pass
+                    # Don't break — allow continued monitoring
                 elif ch == b'\n' or ch == b'\r':
                     # Enter during execution — ignore (don't buffer newlines)
                     pass
@@ -1107,6 +1128,12 @@ class Config:
             except ValueError:
                 pass
 
+    def _get_effective_ram(self):
+        """Get effective RAM in GB (system RAM or VRAM, whichever is larger)."""
+        ram_gb = _get_ram_gb()
+        vram_gb = _get_vram_gb()
+        return max(ram_gb, vram_gb) if vram_gb > 0 else ram_gb
+
     def _auto_detect_model(self):
         if self.model:
             # Set appropriate context window for known models
@@ -1385,6 +1412,64 @@ def _get_vram_gb():
 # System Prompt
 # ════════════════════════════════════════════════════════════════════════════════
 
+def _collect_project_context(cwd):
+    """Collect git info, directory structure, and project type for system prompt."""
+    sections = []
+    MAX_BYTES = 2000
+
+    try:
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=cwd, capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        if branch:
+            sections.append(f"Branch: {branch}")
+    except Exception:
+        pass
+    try:
+        log = subprocess.run(
+            ["git", "log", "--oneline", "-5"],
+            cwd=cwd, capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        if log:
+            sections.append(f"Recent commits:\n{log}")
+    except Exception:
+        pass
+
+    _SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox",
+             ".mypy_cache", ".pytest_cache", ".eggs", "dist", "build"}
+    try:
+        entries = sorted(os.listdir(cwd))
+        entries = [e for e in entries if e not in _SKIP][:20]
+        if entries:
+            sections.append("Root files:\n" + "\n".join(entries))
+    except OSError:
+        pass
+
+    _MARKERS = [
+        ("package.json", "Node.js"),
+        ("requirements.txt", "Python"), ("pyproject.toml", "Python"), ("setup.py", "Python"),
+        ("go.mod", "Go"),
+        ("Cargo.toml", "Rust"),
+        ("Makefile", "C/C++"), ("CMakeLists.txt", "C/C++"),
+        ("Gemfile", "Ruby"),
+    ]
+    detected = []
+    for fname, lang in _MARKERS:
+        if os.path.isfile(os.path.join(cwd, fname)):
+            if lang not in detected:
+                detected.append(lang)
+    if detected:
+        sections.append("Project type: " + ", ".join(detected))
+
+    if not sections:
+        return ""
+    ctx = "\n".join(sections)
+    if len(ctx.encode("utf-8", errors="replace")) > MAX_BYTES:
+        ctx = ctx.encode("utf-8", errors="replace")[:MAX_BYTES].decode("utf-8", errors="ignore")
+    return f"\n# Project Context\n{ctx}\n"
+
+
 def _build_system_prompt(config):
     """Build system prompt with environment info and OS-specific hints."""
     cwd = config.cwd
@@ -1531,34 +1616,49 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
         except Exception:
             pass
 
-    # 2. Parent directory hierarchy → cwd (walk up from cwd to find CLAUDE.md in parent dirs)
+    # 2. Parent directory hierarchy → cwd (Claude Code compatible)
+    # Each level: .eve-cli/CLAUDE.md, CLAUDE.md, .eve-coder.json, CLAUDE.local.md
+    # All matching files at each level are loaded (merged), total capped at 8000 bytes.
+    _INST_PATTERNS = [
+        (os.path.join(".eve-cli", "CLAUDE.md"), ".eve-cli/CLAUDE.md"),
+        ("CLAUDE.md", "CLAUDE.md"),
+        (".eve-coder.json", ".eve-coder.json"),
+        ("CLAUDE.local.md", "CLAUDE.local.md"),
+    ]
     instruction_files = []
     search_dir = cwd
     for _ in range(10):  # max 10 levels up
-        for fname in [".eve-coder.json", "CLAUDE.md"]:
-            fpath = os.path.join(search_dir, fname)
+        for rel_path, display_name in _INST_PATTERNS:
+            fpath = os.path.join(search_dir, rel_path)
             if os.path.isfile(fpath) and not os.path.islink(fpath):
-                instruction_files.append((search_dir, fname, fpath))
-                break  # prefer .eve-coder.json over CLAUDE.md at same level
+                instruction_files.append((search_dir, display_name, fpath))
         parent = os.path.dirname(search_dir)
         if parent == search_dir:
             break  # reached filesystem root
         search_dir = parent
 
     # Load in order: most distant ancestor first, cwd last (so cwd overrides)
+    total_loaded = 0
+    max_total = 8000
     for search_dir, fname, fpath in reversed(instruction_files):
+        if total_loaded >= max_total:
+            break
+        remaining = max_total - total_loaded
         try:
-            content, truncated = _load_instructions(fpath)
+            content, truncated = _load_instructions(fpath, max_bytes=remaining)
             safe_content = _sanitize_instructions(content)
-            trunc_note = "\n[Note: file truncated, only first 4000 bytes loaded]" if truncated else ""
+            trunc_note = "\n[Note: file truncated due to size limit]" if truncated else ""
             rel = os.path.relpath(search_dir, cwd) if search_dir != cwd else "."
             prompt += f"\n# Project Instructions (from {rel}/{fname})\n{safe_content}{trunc_note}\n"
+            total_loaded += len(content)
         except PermissionError:
             print(f"{C.YELLOW}Warning: {fname} found but not readable (permission denied).{C.RESET}",
                   file=sys.stderr)
         except Exception as e:
             print(f"{C.YELLOW}Warning: Could not read {fname}: {e}{C.RESET}",
                   file=sys.stderr)
+
+    prompt += _collect_project_context(cwd)
 
     return prompt
 
@@ -6069,12 +6169,15 @@ class PermissionMgr:
     ASK_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit"}
     NETWORK_TOOLS = {"WebFetch", "WebSearch"}
 
+    _NO_PERSIST_ALLOW = {"Bash", "Write", "Edit", "NotebookEdit"}
+
     def __init__(self, config):
         self.yes_mode = config.yes_mode
-        self.rules = {}  # tool_name -> "allow" | "deny" | pattern list
+        self.rules = {}  # tool_name -> "allow" | "deny"
         self._session_allows = set()  # remembered "allow" decisions this session
         self._session_denies = set()  # remembered "deny" decisions this session
-        self._load_rules(config.permissions_file)
+        self._permissions_path = config.permissions_file
+        self._load_rules(self._permissions_path)
 
     # Dangerous commands that require confirmation even in -y mode
     _ALWAYS_CONFIRM_PATTERNS = [
@@ -6126,6 +6229,8 @@ class PermissionMgr:
                             return True
                         if result == "deny_all":
                             self._session_denies.add(tool_name)
+                            self.rules[tool_name] = "deny"
+                            self._save_rules()
                             return False
                         return result
                     return False
@@ -6161,13 +6266,26 @@ class PermissionMgr:
                 return True
             if result == "deny_all":
                 self._session_denies.add(tool_name)
+                self.rules[tool_name] = "deny"
+                self._save_rules()
                 return False
             return result
         return False  # Default deny when no TUI (safety)
 
+    def _save_rules(self):
+        try:
+            os.makedirs(os.path.dirname(self._permissions_path), exist_ok=True)
+            with open(self._permissions_path, "w", encoding="utf-8") as f:
+                json.dump(self.rules, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
     def session_allow(self, tool_name):
-        """Allow a tool for the rest of this session."""
+        """Allow a tool for the rest of this session, and persist if safe."""
         self._session_allows.add(tool_name)
+        if tool_name not in self._NO_PERSIST_ALLOW:
+            self.rules[tool_name] = "allow"
+            self._save_rules()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -8406,14 +8524,44 @@ class Agent:
         # Check if scroll region is already active (managed by main loop)
         _scroll_mode = self.tui.scroll_region._active
 
+        # Mode switch callback: toggle between local and cloud model
+        def _on_mode_switch():
+            """Toggle between local and cloud model when Ctrl+M is pressed."""
+            current = self.config.model or ""
+            if _is_cloud_model(current):
+                # Switch to local: pick best local model from tiers
+                installed = self.client._query_installed_models()
+                if installed:
+                    new_model = self.config._pick_best_model(installed, self.config._get_effective_ram())
+                    if new_model:
+                        self.config.model = new_model
+                        _p(f"\n{C.CYAN}Mode switched to LOCAL: {new_model}{C.RESET}")
+                        return
+                # Fallback
+                self.config.model = "qwen3:8b"
+                _p(f"\n{C.CYAN}Mode switched to LOCAL: qwen3:8b (fallback){C.RESET}")
+            else:
+                # Switch to cloud: use qwen3.5:397b-cloud
+                self.config.model = "qwen3.5:397b-cloud"
+                _p(f"\n{C.CYAN}Mode switched to CLOUD: qwen3.5:397b-cloud{C.RESET}")
+        
         # ESC key monitor for real-time interrupt (with type-ahead → scroll region hint)
         def _on_typeahead(text):
             if self.tui.scroll_region._active:
                 self.tui.scroll_region.update_hint(text)
-        _esc_monitor = InputMonitor(on_typeahead=_on_typeahead if _scroll_mode else None)
+        _esc_monitor = InputMonitor(
+            on_typeahead=_on_typeahead if _scroll_mode else None,
+            on_mode_switch=_on_mode_switch
+        )
         _esc_monitor.start()
 
         for iteration in range(self.MAX_ITERATIONS):
+            # Check for mode switch (Ctrl+M)
+            if _esc_monitor.mode_switched:
+                _esc_monitor.reset_mode_switch()
+                # Update spinner hint to show current mode
+                _esc_hint = " — ESC: stop, Ctrl+M: toggle mode" if HAS_TERMIOS else ""
+            
             if self._interrupted.is_set() or _esc_monitor.pressed:
                 if _esc_monitor.pressed:
                     _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
@@ -8436,7 +8584,7 @@ class Agent:
                 if self._plan_mode:
                     tools = [t for t in tools
                              if t.get("function", {}).get("name") in self.PLAN_MODE_TOOLS]
-                _esc_hint = " — ESC: stop" if HAS_TERMIOS else ""
+                _esc_hint = " — ESC: stop, Ctrl+M: toggle mode" if HAS_TERMIOS else ""
                 if iteration == 0:
                     self.tui.start_spinner(("Planning" if self._plan_mode else "Thinking") + _esc_hint)
                 else:
