@@ -42,6 +42,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 import collections
 import concurrent.futures
+import shlex
 
 # readline is not available on Windows
 try:
@@ -5136,10 +5137,99 @@ class MCPTool(Tool):
             return f"MCP tool error: {e}"
 
 
+_MCP_COMMAND_ALLOWLIST = frozenset({
+    "npx", "node", "python3", "python", "uvx", "bunx", "deno",
+})
+
+
+def _is_allowed_mcp_command(command):
+    """Check if MCP server command is in the allowlist."""
+    base = os.path.basename(command.split()[0]) if command else ""
+    return base in _MCP_COMMAND_ALLOWLIST
+
+
+def _get_trusted_repos_path(config):
+    return os.path.join(config.config_dir, "trusted_repos.json")
+
+
+def _load_trusted_repos(config):
+    path = _get_trusted_repos_path(config)
+    if not os.path.isfile(path) or os.path.islink(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_trusted_repos(config, data):
+    path = _get_trusted_repos_path(config)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _compute_file_hash(fpath):
+    try:
+        with open(fpath, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _is_mcp_trusted(config, proj_mcp_path):
+    """Check if the project MCP config is trusted. Prompt user if not."""
+    cwd = os.path.realpath(config.cwd)
+    trusted = _load_trusted_repos(config)
+    current_hash = _compute_file_hash(proj_mcp_path)
+
+    entry = trusted.get(cwd)
+    if entry and isinstance(entry, dict):
+        if entry.get("trusted") and entry.get("mcp_hash") == current_hash:
+            return True
+        if entry.get("trusted") and entry.get("mcp_hash") != current_hash:
+            print(f"{C.YELLOW}Warning: .eve-cli/mcp.json has changed since it was trusted.{C.RESET}")
+            print(f"{C.YELLOW}Re-approval required.{C.RESET}")
+
+    try:
+        with open(proj_mcp_path, encoding="utf-8") as f:
+            content = f.read(4000)
+        print(f"\n{C.YELLOW}\u256d\u2500 MCP Trust Required \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{C.RESET}")
+        print(f"{C.YELLOW}\u2502{C.RESET} Project MCP config found: .eve-cli/mcp.json")
+        print(f"{C.YELLOW}\u2502{C.RESET}")
+        for line in content.split("\n")[:15]:
+            print(f"{C.YELLOW}\u2502{C.RESET} {C.DIM}{line}{C.RESET}")
+        print(f"{C.YELLOW}\u2502{C.RESET}")
+        print(f"{C.YELLOW}\u2502{C.RESET} {C.WHITE}Trust this repo's MCP servers?{C.RESET}")
+        print(f"{C.YELLOW}\u2502{C.RESET}  [y] Trust  [n] Skip (default)")
+        print(f"{C.YELLOW}\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{C.RESET}")
+        try:
+            ans = input(f"  {C.YELLOW}? {C.RESET}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans in ("y", "yes"):
+            trusted[cwd] = {
+                "trusted": True,
+                "trusted_at": datetime.now().isoformat(),
+                "mcp_hash": current_hash,
+            }
+            _save_trusted_repos(config, trusted)
+            print(f"{C.GREEN}MCP servers trusted for this repo.{C.RESET}")
+            return True
+        return False
+    except OSError:
+        return False
+
+
 def _load_mcp_servers(config):
-    """Load MCP server configurations from config directory and CLAUDE.md."""
+    """Load MCP server configurations from config directory and project."""
     servers = {}
-    # Check for mcp.json in config dir
+    # Global MCP config is always trusted
     mcp_config = os.path.join(config.config_dir, "mcp.json")
     if os.path.isfile(mcp_config) and not os.path.islink(mcp_config):
         try:
@@ -5151,18 +5241,28 @@ def _load_mcp_servers(config):
                         servers[name] = srv
         except (OSError, json.JSONDecodeError) as e:
             print(f"{C.YELLOW}Warning: Could not load mcp.json: {e}{C.RESET}", file=sys.stderr)
-    # Also check project-level .eve-cli/mcp.json
+    # Project-level MCP requires explicit trust
     proj_mcp = os.path.join(config.cwd, ".eve-cli", "mcp.json")
     if os.path.isfile(proj_mcp) and not os.path.islink(proj_mcp):
-        try:
-            with open(proj_mcp, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and "mcpServers" in data:
-                for name, srv in data["mcpServers"].items():
-                    if isinstance(srv, dict) and "command" in srv:
-                        servers[name] = srv
-        except (OSError, json.JSONDecodeError):
-            pass
+        if _is_mcp_trusted(config, proj_mcp):
+            try:
+                with open(proj_mcp, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and "mcpServers" in data:
+                    for name, srv in data["mcpServers"].items():
+                        if isinstance(srv, dict) and "command" in srv:
+                            cmd = srv["command"]
+                            if _is_allowed_mcp_command(cmd):
+                                servers[name] = srv
+                            else:
+                                print(f"{C.YELLOW}Warning: MCP server '{name}' blocked \u2014 "
+                                      f"command '{cmd}' is not in allowlist{C.RESET}",
+                                      file=sys.stderr)
+            except (OSError, json.JSONDecodeError):
+                pass
+        else:
+            print(f"{C.YELLOW}Project MCP config found but not trusted. "
+                  f"Use /browser setup or manually trust.{C.RESET}", file=sys.stderr)
     return servers
 
 
@@ -6446,40 +6546,137 @@ class HookManager:
         self._hooks = []  # list of hook dicts
         self._load_hooks()
 
+    # Allowlisted hook commands (base names only)
+    _HOOK_COMMAND_ALLOWLIST = frozenset({
+        "echo", "sh", "bash", "zsh", "python3", "python", "node",
+        "cat", "grep", "test", "true", "false",
+    })
+
     def _load_hooks(self):
-        """Load hooks from config files (project-level is additive to global)."""
-        paths = [
-            os.path.join(self.config.config_dir, "hooks.json"),
-            os.path.join(self.config.cwd, ".eve-cli", "hooks.json"),
-        ]
-        for path in paths:
-            # Security: skip symlinks to prevent symlink attacks
-            if not os.path.isfile(path) or os.path.islink(path):
-                continue
-            try:
-                # Size cap: reject oversized config files
-                if os.path.getsize(path) > 65536:
+        """Load hooks from config files."""
+        # Global hooks are always trusted
+        global_path = os.path.join(self.config.config_dir, "hooks.json")
+        if os.path.isfile(global_path) and not os.path.islink(global_path):
+            self._load_hooks_file(global_path, is_project=False)
+        # Project-level hooks require trust
+        proj_path = os.path.join(self.config.cwd, ".eve-cli", "hooks.json")
+        if os.path.isfile(proj_path) and not os.path.islink(proj_path):
+            if self._is_hooks_trusted(proj_path):
+                self._load_hooks_file(proj_path, is_project=True)
+            else:
+                self._ask_hooks_trust(proj_path)
+
+    def _load_hooks_file(self, path, is_project=False):
+        """Load hooks from a single file with validation."""
+        try:
+            if os.path.getsize(path) > 65536:
+                return
+            with open(path, encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            hooks = data.get("hooks", [])
+            if not isinstance(hooks, list):
+                return
+            for h in hooks[:self.MAX_HOOKS]:
+                if not isinstance(h, dict):
                     continue
-                with open(path, encoding="utf-8", errors="replace") as f:
-                    data = json.load(f)
-                hooks = data.get("hooks", [])
-                if not isinstance(hooks, list):
+                event = h.get("event", "")
+                command = h.get("command", "")
+                if event not in self.VALID_EVENTS or not command:
                     continue
-                for h in hooks[:self.MAX_HOOKS]:
-                    if not isinstance(h, dict):
+                if is_project and event in ("SessionStart",):
+                    if not h.get("allow_session_start", False):
                         continue
-                    event = h.get("event", "")
-                    command = h.get("command", "")
-                    if event in self.VALID_EVENTS and command:
-                        self._hooks.append({
-                            "event": event,
-                            "command": command,
-                            "matcher": h.get("matcher", {}),
-                            "timeout": h.get("timeout", self.DEFAULT_TIMEOUT),
-                            "source": path,
-                        })
-            except (json.JSONDecodeError, OSError):
-                pass
+                if is_project:
+                    base_cmd = ""
+                    if isinstance(command, list) and command:
+                        base_cmd = os.path.basename(command[0])
+                    elif isinstance(command, str):
+                        base_cmd = os.path.basename(command.split()[0]) if command.strip() else ""
+                    if base_cmd not in self._HOOK_COMMAND_ALLOWLIST:
+                        print(f"{C.YELLOW}Warning: Hook command '{base_cmd}' blocked "
+                              f"(not in allowlist){C.RESET}", file=sys.stderr)
+                        continue
+                timeout = min(
+                    h.get("timeout", self.DEFAULT_TIMEOUT),
+                    self.MAX_TIMEOUT
+                )
+                self._hooks.append({
+                    "event": event,
+                    "command": command,
+                    "matcher": h.get("matcher", {}),
+                    "timeout": timeout,
+                    "source": path,
+                    "is_project": is_project,
+                })
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    def _get_trusted_hooks_path(self):
+        return os.path.join(self.config.config_dir, "trusted_hooks.json")
+
+    def _load_trusted_hooks(self):
+        path = self._get_trusted_hooks_path()
+        if not os.path.isfile(path) or os.path.islink(path):
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_trusted_hooks(self, data):
+        path = self._get_trusted_hooks_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def _is_hooks_trusted(self, hooks_path):
+        cwd = os.path.realpath(self.config.cwd)
+        trusted = self._load_trusted_hooks()
+        try:
+            with open(hooks_path, "rb") as f:
+                current_hash = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return False
+        entry = trusted.get(cwd)
+        if entry and isinstance(entry, dict):
+            if entry.get("trusted") and entry.get("hooks_hash") == current_hash:
+                return True
+        return False
+
+    def _ask_hooks_trust(self, hooks_path):
+        """Ask user to trust project hooks."""
+        try:
+            with open(hooks_path, encoding="utf-8") as f:
+                content = f.read(2000)
+            print(f"\n{C.YELLOW}╭─ Project Hooks Found ───────────────────{C.RESET}")
+            print(f"{C.YELLOW}│{C.RESET} {C.WHITE}.eve-cli/hooks.json{C.RESET}")
+            print(f"{C.YELLOW}│{C.RESET}")
+            for line in content.split("\n")[:10]:
+                print(f"{C.YELLOW}│{C.RESET} {C.DIM}{line}{C.RESET}")
+            print(f"{C.YELLOW}│{C.RESET}")
+            print(f"{C.YELLOW}│{C.RESET} {_ansi(chr(27)+'[38;5;196m')}Warning: repo hooks can run arbitrary commands{C.RESET}")
+            print(f"{C.YELLOW}│{C.RESET}  [y] Trust  [n] Skip (default)")
+            print(f"{C.YELLOW}╰──────────────────────────────────────────{C.RESET}")
+            ans = input(f"  {C.YELLOW}? {C.RESET}").strip().lower()
+            if ans in ("y", "yes"):
+                cwd = os.path.realpath(self.config.cwd)
+                with open(hooks_path, "rb") as f:
+                    hooks_hash = hashlib.sha256(f.read()).hexdigest()
+                trusted = self._load_trusted_hooks()
+                trusted[cwd] = {
+                    "trusted": True,
+                    "hooks_hash": hooks_hash,
+                    "trusted_at": datetime.now().isoformat(),
+                }
+                self._save_trusted_hooks(trusted)
+                self._load_hooks_file(hooks_path, is_project=True)
+                print(f"{C.GREEN}Project hooks trusted.{C.RESET}")
+        except (OSError, EOFError, KeyboardInterrupt):
+            pass
 
     def fire(self, event, context=None):
         """Fire hooks for the given event. Returns list of result dicts.
@@ -6513,10 +6710,26 @@ class HookManager:
                     env_key = "EVE_HOOK_" + k.upper()
                     env[env_key] = str(v)[:4096]  # cap value size
             timeout = min(hook.get("timeout", self.DEFAULT_TIMEOUT), self.MAX_TIMEOUT)
+            # Parse command into list for safe execution (no shell=True)
+            cmd = hook["command"]
+            if isinstance(cmd, list):
+                cmd_list = cmd
+            else:
+                try:
+                    cmd_list = shlex.split(cmd)
+                except ValueError:
+                    results.append({
+                        "event": event,
+                        "command": str(cmd),
+                        "exit_code": -1,
+                        "stdout": "",
+                        "stderr": "Invalid command syntax",
+                    })
+                    continue
             try:
                 proc = subprocess.run(
-                    hook["command"],
-                    shell=True,
+                    cmd_list,
+                    shell=False,
                     capture_output=True,
                     text=True,
                     timeout=timeout,
@@ -6592,8 +6805,9 @@ class HookManager:
             return "No hooks loaded."
         lines = []
         for i, h in enumerate(self._hooks, 1):
-            cmd_preview = h["command"][:60]
-            if len(h["command"]) > 60:
+            cmd_str = " ".join(h["command"]) if isinstance(h["command"], list) else h["command"]
+            cmd_preview = cmd_str[:60]
+            if len(cmd_str) > 60:
                 cmd_preview += "..."
             matcher_str = ""
             if h.get("matcher"):

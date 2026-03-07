@@ -634,9 +634,21 @@ if [ "$IS_LINUX" -eq 1 ] && (uname -r 2>/dev/null | grep -qi 'microsoft\|WSL'); 
     vapor_info "Ollama should be installed in WSL, not Windows host"
 fi
 
+# Mask credentials from proxy URL for safe display
+mask_proxy_url() {
+    local url="$1"
+    if echo "$url" | grep -qE '://[^@]+@'; then
+        echo "$url" | sed -E 's|://([^:]+):([^@]+)@|://***:***@|' | sed -E 's|://([^@]+)@|://***@|'
+    else
+        echo "$url" | sed -E 's|https?://||' | sed -E 's|/.*||'
+    fi
+}
+
 # Proxy environment detection
 if [ -n "${HTTP_PROXY:-}" ] || [ -n "${HTTPS_PROXY:-}" ] || [ -n "${http_proxy:-}" ] || [ -n "${https_proxy:-}" ]; then
-    vapor_info "Proxy detected: ${HTTP_PROXY:-${http_proxy:-${HTTPS_PROXY:-${https_proxy:-}}}}"
+    _proxy_raw="${HTTP_PROXY:-${http_proxy:-${HTTPS_PROXY:-${https_proxy:-}}}}"
+    _proxy_safe="$(mask_proxy_url "$_proxy_raw")"
+    vapor_info "Proxy detected: ${_proxy_safe}"
     vapor_info "Model downloads will use your proxy settings"
 fi
 

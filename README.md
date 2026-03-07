@@ -694,19 +694,33 @@ CONTEXT_WINDOW=8192
 
 ### 設定ファイル
 
-- `~/.config/eve-cli/hooks.json` （グローバル）
-- `.eve-cli/hooks.json` （プロジェクト単位）
+- `~/.config/eve-cli/hooks.json` （グローバル — 常に信頼）
+- `.eve-cli/hooks.json` （プロジェクト単位 — **初回に信頼確認が必要**）
+
+> **セキュリティ警告**: プロジェクトレベルの `.eve-cli/hooks.json` はリポジトリに含まれるファイルです。
+> 悪意あるリポジトリがフックを通じて任意のコマンドを実行する可能性があるため、
+> 初回読み込み時に内容を表示して明示的な許可を求めます。
+> 信頼状態は `~/.config/eve-cli/trusted_hooks.json` にリポジトリごとに保存されます。
+> **ファイルが変更されると信頼は無効化され、再確認が必要になります。**
+
+### セキュリティ制限
+
+| 制限 | 内容 |
+|------|------|
+| **コマンドallowlist** | プロジェクトフックは `echo`, `bash`, `python3`, `node`, `grep` 等の安全なコマンドのみ実行可能 |
+| **SessionStart制限** | プロジェクトフックからの `SessionStart` イベントはデフォルトでブロック |
+| **shell=False実行** | シェルインジェクション防止のため、コマンドは配列として安全に実行 |
+| **タイムアウト** | フックごとに設定可能（最大30秒） |
 
 ### 設定例
 
 ```json
 {
-  "hooks": {
-    "SessionStart": ["echo 'Session started'"],
-    "PreToolUse": ["./scripts/check-tool.sh"],
-    "PostToolUse": ["./scripts/log-tool.sh"],
-    "Stop": ["echo 'Session ended'"]
-  }
+  "hooks": [
+    {"event": "PreToolUse", "command": "echo 'tool check'", "timeout": 5},
+    {"event": "PostToolUse", "command": "python3 scripts/log.py"},
+    {"event": "Stop", "command": "echo 'done'"}
+  ]
 }
 ```
 
@@ -785,9 +799,9 @@ eve-cli
 > フォームに名前を入力して送信ボタンを押して
 ```
 
-### 手動設定
+### MCP設定
 
-`~/.config/eve-cli/mcp.json` を直接編集することもできます:
+グローバル設定（`~/.config/eve-cli/mcp.json`）は常に信頼されます:
 
 ```json
 {
@@ -799,6 +813,21 @@ eve-cli
   }
 }
 ```
+
+### プロジェクトレベルMCPのセキュリティ
+
+プロジェクト内の `.eve-cli/mcp.json` は**初回に信頼確認が必要**です。
+
+> **なぜ確認が必要？**
+> リポジトリに含まれる `mcp.json` は、MCPサーバーとして任意のコマンドを起動できます。
+> 悪意あるリポジトリがこれを悪用する可能性があるため、明示的な信頼が必要です。
+
+| セキュリティ制限 | 内容 |
+|----------------|------|
+| **初回確認** | 内容を表示し、ユーザーの明示的な許可を求める |
+| **ハッシュ検証** | ファイル変更時は信頼が無効化され再確認が必要 |
+| **コマンドallowlist** | `npx`, `node`, `python3`, `deno` 等の安全なコマンドのみ許可 |
+| **リポジトリ単位** | 信頼状態は `~/.config/eve-cli/trusted_repos.json` にリポジトリごとに保存 |
 
 ---
 
