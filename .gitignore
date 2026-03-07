@@ -49,3 +49,7 @@ tests/
 
 # Dev notes
 make.md
+
+# Markdown docs
+*.md
+!README.md
