@@ -5909,57 +5909,62 @@ class TUI:
                     "/checkpoint", "/rollback", "/autotest", "/watch", "/skills",
                 ]
                 def _completer(text, state):
-                    if text.startswith("/"):
-                        options = [c for c in _slash_commands if c.startswith(text)]
-                    elif text.startswith("@"):
-                        # @file completion
-                        prefix = text[1:]
-                        try:
-                            if os.path.sep in prefix or prefix == "":
-                                dirn = os.path.dirname(prefix) or "."
-                                base = os.path.basename(prefix)
+                    try:
+                        options = []
+                        if text.startswith("/"):
+                            options = [c for c in _slash_commands if c.startswith(text)]
+                        elif text.startswith("@"):
+                            # @file completion
+                            prefix = text[1:]
+                            try:
+                                if os.path.sep in prefix:
+                                    dirn = os.path.dirname(prefix) or "."
+                                    base = os.path.basename(prefix)
+                                else:
+                                    dirn = "."
+                                    base = prefix
                                 entries = os.listdir(dirn)
-                                options = []
-                                for e in entries:
+                                for e in sorted(entries):
                                     if e.startswith(base) and not e.startswith("."):
                                         full = os.path.join(dirn, e) if dirn != "." else e
                                         if os.path.isdir(os.path.join(dirn, e)):
-                                            options.append("@" + full + "/")
+                                            options.append("@" + full + os.path.sep)
                                         else:
                                             options.append("@" + full)
-                            else:
-                                entries = os.listdir(".")
-                                options = ["@" + e + ("/" if os.path.isdir(e) else "")
-                                           for e in entries
-                                           if e.startswith(prefix) and not e.startswith(".")]
-                        except OSError:
-                            options = []
-                    elif text.startswith("~") or text.startswith("/") or os.path.sep in text:
-                        # File path completion
-                        expanded = os.path.expanduser(text)
-                        dirn = os.path.dirname(expanded) or "."
-                        base = os.path.basename(expanded)
-                        try:
-                            entries = os.listdir(dirn)
-                            options = []
-                            for e in sorted(entries):
-                                if e.startswith(base) and not e.startswith("."):
-                                    full = os.path.join(dirn, e)
-                                    if os.path.isdir(full):
-                                        options.append(full + "/")
-                                    else:
-                                        options.append(full)
-                        except OSError:
-                            options = []
-                    else:
-                        options = []
-                    return options[state] if state < len(options) else None
+                            except OSError:
+                                pass
+                        else:
+                            # General file/directory completion for any text
+                            try:
+                                if os.path.sep in text or text.startswith("~"):
+                                    expanded = os.path.expanduser(text)
+                                    dirn = os.path.dirname(expanded) or "."
+                                    base = os.path.basename(expanded)
+                                    prefix_dir = os.path.dirname(text)
+                                else:
+                                    dirn = "."
+                                    base = text
+                                    prefix_dir = ""
+                                entries = os.listdir(dirn)
+                                for e in sorted(entries):
+                                    if e.startswith(base) and not e.startswith("."):
+                                        full_path = os.path.join(dirn, e)
+                                        display = os.path.join(prefix_dir, e) if prefix_dir else e
+                                        if os.path.isdir(full_path):
+                                            options.append(display + os.path.sep)
+                                        else:
+                                            options.append(display)
+                            except OSError:
+                                pass
+                        return options[state] if state < len(options) else None
+                    except Exception:
+                        return None
                 readline.set_completer(_completer)
                 readline.set_completer_delims(" \t\n")
+                # Enable tab completion — try both syntaxes for compatibility
                 if _is_libedit:
                     readline.parse_and_bind("bind ^I rl_complete")
-                else:
-                    readline.parse_and_bind("tab: complete")
+                readline.parse_and_bind("tab: complete")
             except Exception:
                 pass
 
