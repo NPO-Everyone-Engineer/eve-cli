@@ -37,3 +37,6 @@ node_modules/
 
 # vibe-local RAG index (local, user-specific — not for version control)
 .vibe/rag/
+
+# Dev notes
+make.md
