@@ -6,7 +6,7 @@
 
 ## 特徴
 
-- **ローカル + クラウド**: Ollamaのローカルモデルとクラウドモデル（`minimax-m2.5:cloud` 等）を自由に切り替え
+- **ローカル + クラウド**: Ollamaのローカルモデルとクラウドモデル（`qwen3.5:397b-cloud` 等）を自由に切り替え
 - **ゼロ依存**: Python標準ライブラリのみ、pip install不要
 - **16個の内蔵ツール**: Bash実行、ファイル操作、Web取得、サブエージェント、タスク管理など
 - **MCP統合**: JSON-RPC 2.0によるツール連携
@@ -61,7 +61,7 @@ eve-cli -p "Hello Worldを作って"
 eve-cli --model qwen3:8b
 
 # クラウドモデル指定（Ollama有料版）
-eve-cli --model minimax-m2.5:cloud
+eve-cli --model qwen3.5:397b-cloud
 
 # 自動許可モード
 eve-cli -y
@@ -141,7 +141,7 @@ eve-cli --resume
 export EVE_CLI_MODEL="qwen3:8b"
 
 # クラウドモデルを使う場合
-export EVE_CLI_MODEL="minimax-m2.5:cloud"
+export EVE_CLI_MODEL="qwen3.5:397b-cloud"
 
 # サイドカーモデル（サブエージェント用の軽量モデル）
 export EVE_CLI_SIDECAR_MODEL="qwen3:4b"
@@ -212,7 +212,7 @@ eve-cli
 | Apple Silicon Mac | 96GB+ | gpt-oss:120b |
 | Apple Silicon Mac | 16GB | qwen3:8b |
 | Intel/Windows/Linux | 16GB+ | qwen3:8b |
-| クラウドモデル利用時 | 制限なし | minimax-m2.5:cloud |
+| クラウドモデル利用時 | 制限なし | qwen3.5:397b-cloud |
 
 画像認識を使う場合は、ビジョン対応モデル（`llava`, `llama3.2-vision`, `gemma3` 等）が必要です。
 
