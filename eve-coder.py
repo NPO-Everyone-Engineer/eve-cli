@@ -4270,7 +4270,9 @@ class AskUserQuestionTool(Tool):
     name = "AskUserQuestion"
     description = (
         "Ask the user a question during execution. Present options for them to choose from. "
-        "Use when you need clarification to proceed. Returns the user's answer."
+        "Use when you need clarification to proceed. Returns the user's answer(s). "
+        "Set multiSelect=true to allow multiple selections. "
+        "Add 'preview' to each option for visual comparisons (code snippets, mockups)."
     )
     parameters = {
         "type": "object",
@@ -4281,8 +4283,25 @@ class AskUserQuestionTool(Tool):
             },
             "options": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Options for the user to choose from (2-5 options). User can also type a custom answer.",
+                "description": "Options for the user to choose from (2-5 options).",
+                "items": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Display text for the option"},
+                                "description": {"type": "string", "description": "Explanation of the option"},
+                                "preview": {"type": "string", "description": "Code/mockup shown alongside option"},
+                            },
+                            "required": ["label"],
+                        },
+                    ]
+                },
+            },
+            "multiSelect": {
+                "type": "boolean",
+                "description": "If true, allow the user to select multiple options (comma-separated numbers)",
             },
         },
         "required": ["question"],
@@ -4290,34 +4309,148 @@ class AskUserQuestionTool(Tool):
 
     def execute(self, params):
         question = params.get("question", "")
-        options = params.get("options", [])
+        raw_options = params.get("options", [])
+        multi = params.get("multiSelect", False)
         if not question:
             return "Error: question is required"
 
+        # Normalize options to dicts
+        options = []
+        for o in raw_options:
+            if isinstance(o, str):
+                options.append({"label": o, "description": "", "preview": ""})
+            elif isinstance(o, dict):
+                options.append({
+                    "label": o.get("label", str(o)),
+                    "description": o.get("description", ""),
+                    "preview": o.get("preview", ""),
+                })
+
         with _print_lock:
-            print(f"\n{_ansi(C.CYAN)}{_ansi(C.BOLD)}Question:{_ansi(C.RESET)} {question}")
+            _cyan = _ansi(C.CYAN)
+            _bold = _ansi(C.BOLD)
+            _dim = _ansi(C.DIM)
+            _rst = _ansi(C.RESET)
+            print(f"\n{_cyan}{_bold}Question:{_rst} {question}")
+            if multi:
+                print(f"  {_dim}(multi-select: enter numbers separated by commas){_rst}")
             if options:
                 for i, opt in enumerate(options, 1):
-                    print(f"  {_ansi(C.CYAN)}{i}.{_ansi(C.RESET)} {opt}")
-                print(f"  {_ansi(C.DIM)}Enter number or type your own answer:{_ansi(C.RESET)}")
+                    label = opt["label"]
+                    desc = opt["description"]
+                    preview = opt["preview"]
+                    desc_str = f"  {_dim}{desc}{_rst}" if desc else ""
+                    print(f"  {_cyan}{i}.{_rst} {label}{desc_str}")
+                    if preview:
+                        # Indent preview block
+                        for pline in preview.split("\n")[:8]:
+                            print(f"     {_dim}│ {pline}{_rst}")
+                if multi:
+                    print(f"  {_dim}Enter numbers (e.g. 1,3) or type your own:{_rst}")
+                else:
+                    print(f"  {_dim}Enter number or type your own answer:{_rst}")
             else:
-                print(f"  {_ansi(C.DIM)}Type your answer:{_ansi(C.RESET)}")
+                print(f"  {_dim}Type your answer:{_rst}")
 
         try:
-            answer = input(f"  {_ansi(C.CYAN)}>{_ansi(C.RESET)} ").strip()
+            answer = input(f"  {_cyan}>{_rst} ").strip()
         except (EOFError, KeyboardInterrupt):
             return "User cancelled the question."
 
         if not answer:
             return "User provided no answer."
 
-        # If user entered a number, map to option
-        if options and answer.isdigit():
-            idx = int(answer) - 1
-            if 0 <= idx < len(options):
-                return f"User chose: {options[idx]}"
+        if options:
+            if multi:
+                # Parse comma-separated numbers
+                selected = []
+                for part in re.split(r'[,\s]+', answer):
+                    part = part.strip()
+                    if part.isdigit():
+                        idx = int(part) - 1
+                        if 0 <= idx < len(options):
+                            selected.append(options[idx]["label"])
+                if selected:
+                    return f"User selected: {', '.join(selected)}"
+            elif answer.isdigit():
+                idx = int(answer) - 1
+                if 0 <= idx < len(options):
+                    return f"User chose: {options[idx]['label']}"
 
         return f"User answered: {answer}"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ExitPlanMode — Request user approval of a written plan (Claude CLI compatible)
+# ════════════════════════════════════════════════════════════════════════════════
+
+# Global flag: set by ExitPlanMode tool, read by the agent loop
+_plan_approval_requested = threading.Event()
+_plan_approval_content = {"text": "", "file": ""}
+
+class ExitPlanModeTool(Tool):
+    """Signal that the plan is complete and request user approval before acting.
+
+    Use this ONLY in plan mode, after you have written the implementation plan.
+    The tool displays the plan to the user and waits for approval.
+    The agent will pause until the user types /approve (or /act) to proceed.
+
+    Workflow:
+    1. Enter plan mode with /plan
+    2. Explore the codebase and write a plan
+    3. Call ExitPlanMode with the plan summary
+    4. User reviews and types /approve to begin implementation
+    """
+    name = "ExitPlanMode"
+    description = (
+        "Signal that planning is complete and request user approval. "
+        "Call this after writing the implementation plan in plan mode. "
+        "Provide a clear summary of what will be implemented. "
+        "The agent will pause and wait for user approval (/approve) before proceeding."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "plan": {
+                "type": "string",
+                "description": "Clear summary of the implementation plan to show the user for approval",
+            },
+            "plan_file": {
+                "type": "string",
+                "description": "Optional path to the written plan file (e.g. .eve-cli/plans/plan.md)",
+            },
+        },
+        "required": ["plan"],
+    }
+
+    def execute(self, params):
+        plan = params.get("plan", "").strip()
+        plan_file = params.get("plan_file", "").strip()
+        if not plan:
+            return "Error: plan is required"
+
+        _plan_approval_content["text"] = plan
+        _plan_approval_content["file"] = plan_file
+        _plan_approval_requested.set()
+
+        _cyan = _ansi(C.CYAN)
+        _bold = _ansi(C.BOLD)
+        _dim = _ansi(C.DIM)
+        _rst = _ansi(C.RESET)
+        _c51 = _ansi("\033[38;5;51m")
+        _c226 = _ansi("\033[38;5;226m")
+
+        with _print_lock:
+            print(f"\n  {_c51}━━ Plan Ready for Approval ━━━━━━━━━━{_rst}")
+            for line in plan.split("\n"):
+                print(f"  {line}")
+            if plan_file:
+                print(f"\n  {_dim}Full plan: {plan_file}{_rst}")
+            print(f"\n  {_c226}Type /approve or /act to begin implementation{_rst}")
+            print(f"  {_dim}Or continue asking questions in plan mode{_rst}")
+            print(f"  {_c51}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{_rst}\n")
+
+        return "Plan presented to user. Waiting for /approve to proceed with implementation."
 
 
 # Sub-Agent — Spawns a mini agent loop in a separate thread
@@ -5268,7 +5401,7 @@ class ToolRegistry:
         for cls in [BashTool, ReadTool, WriteTool, EditTool, GlobTool,
                     GrepTool, WebFetchTool, WebSearchTool, NotebookEditTool,
                     TaskCreateTool, TaskListTool, TaskGetTool, TaskUpdateTool,
-                    TodoWriteTool, AskUserQuestionTool]:
+                    TodoWriteTool, AskUserQuestionTool, ExitPlanModeTool]:
             self.register(cls())
         return self
 
@@ -5281,7 +5414,8 @@ class PermissionMgr:
     """Manages tool execution permissions."""
 
     SAFE_TOOLS = {"Read", "Glob", "Grep", "SubAgent", "AskUserQuestion",
-                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TodoWrite"}
+                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TodoWrite",
+                   "ExitPlanMode"}
     ASK_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit"}
     NETWORK_TOOLS = {"WebFetch", "WebSearch"}
 
@@ -7244,6 +7378,9 @@ class TUI:
   {_c198}/tokens{C.RESET}, {_c198}/cost{C.RESET}     Show token usage & session cost
   {_c198}/context{C.RESET}           Show context usage as colored grid
   {_c198}/memory{C.RESET}            View/manage auto memory (per-project notes)
+  {_c198}/stats{C.RESET}             Daily usage statistics & streak
+  {_c198}/doctor{C.RESET}            Diagnose installation and settings
+  {_c198}/permissions{C.RESET}       View/manage tool permissions
   {_c198}/init{C.RESET}              Create CLAUDE.md template
   {_c198}/yes{C.RESET}               Auto-approve ON
   {_c198}/no{C.RESET}                Auto-approve OFF
@@ -7254,6 +7391,8 @@ class TUI:
   {_c198}/debug{C.RESET}             Toggle debug mode
   {_c198}/debug-scroll{C.RESET}      Test scroll region (DECSTBM)
   {_c198}/resume{C.RESET}            Switch to a different session
+  {_c198}/rename{C.RESET} <name>     Rename current session
+  {_c198}/fork{C.RESET}              Fork conversation into new session
   {_c198}\"\"\"{C.RESET}                Multi-line input
   {_c51}━━ Git {sep[6:]}{C.RESET}
   {_c198}/commit{C.RESET}            Generate AI commit message
@@ -7402,6 +7541,7 @@ class Agent:
         "Write",              # restricted to .eve-cli/plans/ only (runtime guard)
         "AskUserQuestion",    # clarify requirements during planning
         "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TodoWrite",
+        "ExitPlanMode",       # signal plan is ready for approval
         "SubAgent",
     }
 
@@ -9127,15 +9267,277 @@ def main():
                     _debug_scroll_region(tui)
                     continue
 
+                # ── Stats ─────────────────────────────────────────────
+                elif cmd == "/stats":
+                    _c51s = _ansi("\033[38;5;51m")
+                    _c87s = _ansi("\033[38;5;87m")
+                    _c240s = _ansi("\033[38;5;240m")
+                    _c226s = _ansi("\033[38;5;226m")
+                    # Session stats
+                    _elapsed = int(time.time() - _session_start_time)
+                    _mins, _secs = divmod(_elapsed, 60)
+                    _hrs, _mins = divmod(_mins, 60)
+                    _dur_str = (f"{_hrs}h {_mins}m {_secs}s" if _hrs
+                                else f"{_mins}m {_secs}s" if _mins else f"{_secs}s")
+                    _new_msgs = len(session.messages) - _session_start_msgs
+                    _tokens = session.get_token_estimate()
+                    _pct = min(int((_tokens / config.context_window) * 100), 100)
+                    # Count tool calls this session (rough: tool result messages)
+                    _tool_calls = sum(1 for m in session.messages if m.get("role") == "tool")
+                    # Persistent daily stats stored in state dir
+                    _stats_file = os.path.join(config.state_dir, "stats.json")
+                    _stats = {}
+                    if os.path.isfile(_stats_file):
+                        try:
+                            with open(_stats_file, encoding="utf-8") as _sf:
+                                _stats = json.load(_sf)
+                        except Exception:
+                            pass
+                    _today = datetime.now().strftime("%Y-%m-%d")
+                    _today_data = _stats.get(_today, {"sessions": 0, "msgs": 0, "tool_calls": 0})
+                    _total_sessions = sum(v.get("sessions", 0) for v in _stats.values())
+                    _total_msgs = sum(v.get("msgs", 0) for v in _stats.values())
+                    # Update today's stats
+                    _today_data["sessions"] = _today_data.get("sessions", 0) + 1
+                    _today_data["msgs"] = _today_data.get("msgs", 0) + _new_msgs
+                    _today_data["tool_calls"] = _today_data.get("tool_calls", 0) + _tool_calls
+                    _stats[_today] = _today_data
+                    # Streak calculation
+                    _streak = 0
+                    _check_date = datetime.now()
+                    while True:
+                        _d = _check_date.strftime("%Y-%m-%d")
+                        if _d in _stats and _stats[_d].get("sessions", 0) > 0:
+                            _streak += 1
+                            _check_date = _check_date.replace(
+                                day=_check_date.day - 1
+                            ) if _check_date.day > 1 else _check_date
+                            # Simple streak — stop after 365 checks
+                            if _streak > 365:
+                                break
+                            _check_date = datetime.fromtimestamp(
+                                _check_date.timestamp() - 86400
+                            )
+                        else:
+                            break
+                    try:
+                        os.makedirs(os.path.dirname(_stats_file), exist_ok=True)
+                        with open(_stats_file, "w", encoding="utf-8") as _sf:
+                            json.dump(_stats, _sf, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+                    print(f"\n  {_c51s}━━ Session Stats ━━━━━━━━━━━━━━━━━━{C.RESET}")
+                    print(f"  {_c87s}This session:{C.RESET}")
+                    print(f"    Duration:    {_c226s}{_dur_str}{C.RESET}")
+                    print(f"    Messages:    {_c226s}{_new_msgs}{C.RESET}")
+                    print(f"    Tool calls:  {_c226s}{_tool_calls}{C.RESET}")
+                    print(f"    Context:     {_c226s}{_pct}%{C.RESET} ({_tokens:,} tokens)")
+                    print(f"  {_c87s}Today ({_today}):{C.RESET}")
+                    print(f"    Sessions:    {_c226s}{_today_data['sessions']}{C.RESET}")
+                    print(f"    Messages:    {_c226s}{_today_data['msgs']}{C.RESET}")
+                    print(f"  {_c87s}All time:{C.RESET}")
+                    print(f"    Total days:  {_c226s}{len(_stats)}{C.RESET}")
+                    print(f"    Sessions:    {_c226s}{_total_sessions}{C.RESET}")
+                    print(f"    Messages:    {_c226s}{_total_msgs}{C.RESET}")
+                    print(f"    Streak:      {_c226s}{_streak} day{'s' if _streak != 1 else ''}{C.RESET} 🔥")
+                    print(f"  {_c51s}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    continue
+
+                # ── Doctor ────────────────────────────────────────────
+                elif cmd == "/doctor":
+                    _c51d = _ansi("\033[38;5;51m")
+                    _c87d = _ansi("\033[38;5;87m")
+                    _c46d = _ansi("\033[38;5;46m")    # green
+                    _c196d = _ansi("\033[38;5;196m")  # red
+                    _c226d = _ansi("\033[38;5;226m")  # yellow
+                    _c240d = _ansi("\033[38;5;240m")
+                    def _ok(msg): return f"  {_c46d}✓{C.RESET} {msg}"
+                    def _warn(msg): return f"  {_c226d}⚠{C.RESET} {msg}"
+                    def _err(msg): return f"  {_c196d}✗{C.RESET} {msg}"
+                    print(f"\n  {_c51d}━━ Diagnostics (/doctor) ━━━━━━━━━━{C.RESET}")
+                    # Python version
+                    _pyv = sys.version.split()[0]
+                    _py_ok = tuple(int(x) for x in _pyv.split(".")[:2]) >= (3, 8)
+                    print(_ok(f"Python {_pyv}") if _py_ok else _err(f"Python {_pyv} (need 3.8+)"))
+                    # Ollama connection
+                    try:
+                        _ol_resp = urllib.request.urlopen(
+                            f"{config.ollama_host}/api/tags", timeout=3
+                        )
+                        _ol_resp.read()
+                        print(_ok(f"Ollama reachable at {config.ollama_host}"))
+                    except Exception:
+                        print(_err(f"Ollama not reachable at {config.ollama_host}"))
+                    # Model loaded
+                    if config.model:
+                        print(_ok(f"Model: {config.model}"))
+                    else:
+                        print(_warn("No model configured (will auto-detect)"))
+                    # Config dir
+                    if os.path.isdir(config.config_dir):
+                        print(_ok(f"Config dir: {config.config_dir}"))
+                    else:
+                        print(_warn(f"Config dir missing: {config.config_dir}"))
+                    # Sessions dir
+                    if os.path.isdir(config.sessions_dir):
+                        _n_sessions = len([f for f in os.listdir(config.sessions_dir)
+                                           if f.endswith(".json") and f != "project-index.json"])
+                        print(_ok(f"Sessions dir: {_n_sessions} saved sessions"))
+                    else:
+                        print(_warn("No sessions dir yet"))
+                    # CLAUDE.md
+                    _cwd_md = os.path.join(config.cwd, "CLAUDE.md")
+                    _dot_claude_md = os.path.join(config.cwd, ".claude", "CLAUDE.md")
+                    if os.path.isfile(_cwd_md):
+                        print(_ok(f"CLAUDE.md found: {_cwd_md}"))
+                    elif os.path.isfile(_dot_claude_md):
+                        print(_ok(f"CLAUDE.md found: {_dot_claude_md}"))
+                    else:
+                        print(_warn("No CLAUDE.md in project (run /init to create)"))
+                    # settings.json
+                    if config.project_settings_file and os.path.isfile(config.project_settings_file):
+                        print(_ok(f"Project settings: {config.project_settings_file}"))
+                    else:
+                        print(_warn("No .claude/settings.json (optional)"))
+                    # git
+                    _git_ok = subprocess.run(
+                        ["git", "rev-parse", "--git-dir"],
+                        capture_output=True, cwd=config.cwd
+                    ).returncode == 0
+                    print(_ok("Git repository detected") if _git_ok else _warn("Not a git repository"))
+                    # Auto memory
+                    if os.path.isfile(auto_memory.path):
+                        print(_ok(f"Auto memory: {auto_memory.path}"))
+                    else:
+                        print(_warn("No auto memory yet (AI will create it)"))
+                    # Hooks
+                    if config.hooks:
+                        _hn = sum(len(v) for v in config.hooks.values() if isinstance(v, list))
+                        print(_ok(f"Hooks configured: {_hn} hook(s)"))
+                    else:
+                        print(_c240d + "  ○ No hooks configured (optional)" + C.RESET)
+                    # MCP servers
+                    if _mcp_clients:
+                        print(_ok(f"MCP servers: {len(_mcp_clients)} connected"))
+                    else:
+                        print(_c240d + "  ○ No MCP servers (optional)" + C.RESET)
+                    print(f"  {_c51d}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    continue
+
+                # ── Permissions ───────────────────────────────────────
+                elif cmd == "/permissions":
+                    _c51p = _ansi("\033[38;5;51m")
+                    _c87p = _ansi("\033[38;5;87p")
+                    _c46p = _ansi("\033[38;5;46m")
+                    _c196p = _ansi("\033[38;5;196m")
+                    _c240p = _ansi("\033[38;5;240m")
+                    _c87p = _ansi("\033[38;5;87m")
+                    parts = user_input.split(None, 2)
+                    sub = parts[1].lower() if len(parts) > 1 else ""
+                    if sub == "allow" and len(parts) >= 3:
+                        # /permissions allow Bash
+                        _rule = parts[2].strip()
+                        permissions.rules[_rule] = "allow"
+                        print(f"  {_c46p}✓ Allowed:{C.RESET} {_rule}")
+                    elif sub == "deny" and len(parts) >= 3:
+                        _rule = parts[2].strip()
+                        permissions.rules[_rule] = "deny"
+                        print(f"  {_c196p}✗ Denied:{C.RESET} {_rule}")
+                    elif sub == "reset" and len(parts) >= 3:
+                        _rule = parts[2].strip()
+                        permissions.rules.pop(_rule, None)
+                        permissions._session_allows.discard(_rule)
+                        permissions._session_denies.discard(_rule)
+                        print(f"  Reset permission for: {_rule}")
+                    else:
+                        # Show current permissions
+                        print(f"\n  {_c51p}━━ Permissions ━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+                        print(f"  {_c87p}Auto-approve (yes mode):{C.RESET} {'ON' if config.yes_mode else 'OFF'}")
+                        print(f"\n  {_c87p}Always allowed (safe tools):{C.RESET}")
+                        for t in sorted(permissions.SAFE_TOOLS):
+                            print(f"    {_c46p}✓{C.RESET} {t}")
+                        print(f"\n  {_c87p}Ask before running:{C.RESET}")
+                        for t in sorted(permissions.ASK_TOOLS):
+                            print(f"    {_c240p}?{C.RESET} {t}")
+                        if permissions.rules:
+                            print(f"\n  {_c87p}Custom rules:{C.RESET}")
+                            for rule, action in sorted(permissions.rules.items()):
+                                icon = _c46p + "✓" if action == "allow" else _c196p + "✗"
+                                print(f"    {icon}{C.RESET} {rule} → {action}")
+                        if permissions._session_allows:
+                            print(f"\n  {_c87p}Session-approved:{C.RESET}")
+                            for t in sorted(permissions._session_allows):
+                                print(f"    {_c46p}✓{C.RESET} {t} (this session)")
+                        print(f"\n  {_c240p}Usage: /permissions allow <tool>  /permissions deny <tool>{C.RESET}")
+                        print(f"  {_c51p}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    continue
+
+                # ── Rename session ────────────────────────────────────
+                elif cmd == "/rename":
+                    parts = user_input.split(None, 1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        print(f"{C.YELLOW}Usage: /rename <new-name>{C.RESET}")
+                        print(f"  {C.DIM}Current session: {session.session_id}{C.RESET}")
+                        continue
+                    _new_name = re.sub(r'[^A-Za-z0-9_\-]', '_', parts[1].strip())[:48]
+                    if not _new_name:
+                        print(f"{C.RED}Invalid name. Use letters, numbers, - and _ only.{C.RESET}")
+                        continue
+                    _new_sid = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + _new_name
+                    # Save under new name
+                    session.save()
+                    _old_path = os.path.join(config.sessions_dir, f"{session.session_id}.json")
+                    _new_path = os.path.join(config.sessions_dir, f"{_new_sid}.json")
+                    try:
+                        if os.path.isfile(_old_path):
+                            import shutil as _shutil
+                            _shutil.copy2(_old_path, _new_path)
+                            os.unlink(_old_path)
+                        session.session_id = _new_sid
+                        print(f"  {C.GREEN}Session renamed to: {_new_sid}{C.RESET}")
+                    except Exception as e:
+                        print(f"  {C.RED}Rename failed: {e}{C.RESET}")
+                    continue
+
+                # ── Fork session ──────────────────────────────────────
+                elif cmd == "/fork":
+                    # Save current session, then create a new session with same history
+                    session.save()
+                    _fork_sid = datetime.now().strftime("%Y%m%d_%H%M%S") + "_fork_" + uuid.uuid4().hex[:4]
+                    _src_path = os.path.join(config.sessions_dir, f"{session.session_id}.json")
+                    _dst_path = os.path.join(config.sessions_dir, f"{_fork_sid}.json")
+                    try:
+                        import shutil as _shutil
+                        if os.path.isfile(_src_path):
+                            _shutil.copy2(_src_path, _dst_path)
+                        session.session_id = _fork_sid
+                        print(f"  {C.GREEN}Forked to new session: {_fork_sid}{C.RESET}")
+                        print(f"  {C.DIM}Both sessions share the same history up to this point.{C.RESET}")
+                        print(f"  {C.DIM}Original session preserved as a separate branch.{C.RESET}")
+                    except Exception as e:
+                        print(f"  {C.RED}Fork failed: {e}{C.RESET}")
+                    continue
+
+                elif cmd == "/debug":
+                    config.debug = not config.debug
+                    state_str = f"{C.GREEN}ON{C.RESET}" if config.debug else f"{C.RED}OFF{C.RESET}"
+                    print(f"  Debug mode: {state_str}")
+                    continue
+
+                elif cmd == "/debug-scroll":
+                    _debug_scroll_region(tui)
+                    continue
+
                 else:
                     # "Did you mean?" for typo'd slash commands
                     _all_cmds = ["/help", "/exit", "/quit", "/clear", "/model", "/models",
                                  "/status", "/save", "/compact", "/yes", "/no",
-                                 "/tokens", "/commit", "/diff", "/git", "/plan",
-                                 "/approve", "/act", "/execute", "/undo", "/init",
+                                 "/tokens", "/cost", "/context", "/memory", "/stats",
+                                 "/doctor", "/permissions", "/commit", "/diff", "/git",
+                                 "/plan", "/approve", "/act", "/execute", "/undo", "/init",
                                  "/config", "/debug", "/debug-scroll", "/checkpoint",
                                  "/rollback", "/autotest", "/skills", "/image",
-                                 "/browser"]
+                                 "/browser", "/rename", "/fork", "/resume"]
                     _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                     if not _close:
                         _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []
@@ -9223,6 +9625,17 @@ def main():
                 tui._scroll_print(f"  {_ansi(chr(27)+'[38;5;240m')}(type-ahead: \"{_typeahead_text}\"){C.RESET}")
             # Auto-save after each interaction (user's work is never lost)
             session.save()
+            # Auto-compact: if context > 70%, silently compact to free space
+            _pre_compact_tokens = session.get_token_estimate()
+            _auto_compact_threshold = config.context_window * 0.70
+            if _pre_compact_tokens > _auto_compact_threshold and not session._just_compacted:
+                session.compact_if_needed()
+                _post_compact_tokens = session.get_token_estimate()
+                if _post_compact_tokens < _pre_compact_tokens:
+                    _saved = _pre_compact_tokens - _post_compact_tokens
+                    tui._scroll_print(
+                        f"  {_ansi(chr(27)+'[38;5;240m')}[auto-compact: freed ~{_saved:,} tokens]{C.RESET}"
+                    )
             # Update scroll region status back to "Ready"
             if _scroll_mode and tui.scroll_region._active:
                 pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
