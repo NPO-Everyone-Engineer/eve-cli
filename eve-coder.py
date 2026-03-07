@@ -83,6 +83,10 @@ MAX_BG_TASKS = 50  # Prevent unbounded memory growth
 # Active scroll region reference (set during agent execution)
 _active_scroll_region = None
 
+# Custom commands cache: command_name -> {"description": str, "path": str, "frontmatter": dict}
+_custom_commands = {}
+_custom_commands_lock = threading.Lock()
+
 def _scroll_aware_print(*args, **kwargs):
     """Print within scroll region or normal print.
     When scroll region is active, acquires its lock to prevent text from
@@ -746,6 +750,9 @@ class Config:
         # Markdown rendering
         self.markdown_renderer = "glow"  # "glow" or "simple"
 
+        # System prompt customization
+        self.system_prompt_file = None  # --system-prompt-file
+
         # Paths (primary: eve-cli, with backward compat for old eve-coder dirs)
         if os.name == "nt":
             appdata = os.environ.get("LOCALAPPDATA",
@@ -764,6 +771,9 @@ class Config:
         self.permissions_file = os.path.join(self.config_dir, "permissions.json")
         self.sessions_dir = os.path.join(self.state_dir, "sessions")
         self.history_file = os.path.join(self.state_dir, "history")
+        # Custom commands directory
+        self.commands_dir = os.path.join(self.config_dir, "commands")
+        self.project_commands_dir = os.path.join(os.getcwd(), ".eve-cli", "commands")
 
     def load(self, argv=None):
         """Load config from file, then env, then CLI args (later overrides earlier)."""
@@ -775,6 +785,7 @@ class Config:
         self._auto_detect_model()
         self._validate_ollama_host()
         self._ensure_dirs()
+        self.load_custom_commands()
         return self
 
     def _load_config_file(self):
@@ -917,6 +928,9 @@ class Config:
         # Markdown rendering
         parser.add_argument("--markdown-renderer", choices=["glow", "simple"],
                             help="Markdown renderer: glow (beautiful tables) or simple")
+        # System prompt customization
+        parser.add_argument("--system-prompt-file", metavar="PATH",
+                            help="Append system prompt from file")
         # RAG options
         parser.add_argument("--rag", action="store_true", help="Enable RAG mode")
         parser.add_argument("--rag-mode", choices=["query"], default="query",
@@ -973,6 +987,8 @@ class Config:
             self.output_format = args.output_format
         if args.markdown_renderer:
             self.markdown_renderer = args.markdown_renderer
+        if args.system_prompt_file:
+            self.system_prompt_file = args.system_prompt_file
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -1254,7 +1270,7 @@ class Config:
                 setattr(self, attr, "" if attr == "sidecar_model" else self.DEFAULT_MODEL)
 
     def _ensure_dirs(self):
-        for d in [self.config_dir, self.state_dir, self.sessions_dir]:
+        for d in [self.config_dir, self.state_dir, self.sessions_dir, self.commands_dir]:
             try:
                 os.makedirs(d, mode=0o700, exist_ok=True)
             except PermissionError:
@@ -1287,6 +1303,58 @@ class Config:
                 shutil.copy2(old_history, self.history_file)
             except (OSError, shutil.Error):
                 pass
+
+    def load_custom_commands(self):
+        """Load custom commands from .eve-cli/commands/ and ~/.eve-cli/commands/."""
+        global _custom_commands
+        with _custom_commands_lock:
+            _custom_commands.clear()
+            # Load from project directory first, then global (global can override)
+            for cmd_dir in [self.project_commands_dir, self.commands_dir]:
+                if not os.path.isdir(cmd_dir):
+                    continue
+                for fname in os.listdir(cmd_dir):
+                    if not fname.endswith(".md"):
+                        continue
+                    fpath = os.path.join(cmd_dir, fname)
+                    # Security: skip symlinks
+                    if os.path.islink(fpath):
+                        continue
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        # Parse YAML frontmatter
+                        frontmatter = {}
+                        body = content
+                        if content.startswith("---"):
+                            parts = content.split("---", 2)
+                            if len(parts) >= 3:
+                                yaml_text = parts[1].strip()
+                                body = parts[2].strip()
+                                # Simple YAML parser (no external dependency)
+                                for line in yaml_text.split("\n"):
+                                    line = line.strip()
+                                    if not line or line.startswith("#"):
+                                        continue
+                                    if ":" in line:
+                                        key, val = line.split(":", 1)
+                                        key = key.strip()
+                                        val = val.strip().strip("\"'")
+                                        # Parse allowed-tools as list
+                                        if key == "allowed-tools" and val.startswith("[") and val.endswith("]"):
+                                            val = [t.strip() for t in val[1:-1].split(",") if t.strip()]
+                                        frontmatter[key] = val
+                        # Command name is filename without .md
+                        cmd_name = fname[:-3].lower()
+                        _custom_commands[cmd_name] = {
+                            "name": cmd_name,
+                            "description": frontmatter.get("description", ""),
+                            "path": fpath,
+                            "frontmatter": frontmatter,
+                            "body": body,
+                        }
+                    except (OSError, UnicodeDecodeError):
+                        pass
 
 
 def _check_internet(timeout=3):
@@ -7630,7 +7698,7 @@ class TUI:
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/gentest", "/watch", "/skills",
                     "/browser", "/fork", "/index", "/pr", "/gh",
-                    "/team", "/memory",
+                    "/team", "/memory", "/custom", "/cmd",
                 ]
                 def _completer(text, state):
                     try:
@@ -9011,6 +9079,9 @@ class TUI:
   {_c198}/memory rm{C.RESET} <index>  Remove a memory by index
   {_c198}/memory search{C.RESET} <q>  Search memories by keyword
   {_c198}/memory clear{C.RESET}       Clear all memories
+  {_c51}━━ Custom Commands {sep[18:]}{C.RESET}
+  {_c198}/custom{C.RESET} <name> [args]  Run custom command from .eve-cli/commands/
+  {_c198}/cmd{C.RESET} <name> [args]     Alias for /custom
   {_c51}━━ Keyboard {sep[11:]}{C.RESET}
   {_c198}Ctrl+C{C.RESET}             Stop current task
   {_c198}Ctrl+C x2{C.RESET}          Exit (within 1.5s)
@@ -11539,6 +11610,92 @@ def main():
                         print(f"{C.GREEN}All memories cleared.{C.RESET}")
                     continue
 
+                # ── Custom Commands ───────────────────────────────────
+                elif cmd in ("/custom", "/cmd"):
+                    parts = user_input.split(None, 1)
+                    if len(parts) < 2:
+                        print(f"{C.YELLOW}Usage: /custom <name> [args]{C.RESET}")
+                        print(f"{C.DIM}  Lists available custom commands if no name given.{C.RESET}")
+                        continue
+                    cmd_name = parts[1].split()[0].lower() if parts[1] else ""
+                    cmd_args = parts[1][len(cmd_name):].strip() if cmd_name else ""
+                    
+                    # List available commands if no name given or if name is "list"
+                    if not cmd_name or cmd_name == "list":
+                        _c51c = _ansi("\033[38;5;51m")
+                        _c87c = _ansi("\033[38;5;87m")
+                        with _custom_commands_lock:
+                            if _custom_commands:
+                                print(f"\n  {_c51c}━━ Custom Commands ━━━━━━━━━━━━━━━━━━{C.RESET}")
+                                for cname in sorted(_custom_commands.keys()):
+                                    cinfo = _custom_commands[cname]
+                                    desc = cinfo.get("description", "")
+                                    desc_str = f" {C.DIM}- {desc}{C.RESET}" if desc else ""
+                                    print(f"  {_c87c}/{cname}{C.RESET}{desc_str}")
+                                print(f"  {_c51c}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                            else:
+                                print(f"{C.YELLOW}No custom commands found.{C.RESET}")
+                                print(f"{C.DIM}Create .md files in .eve-cli/commands/ or ~/.eve-cli/commands/{C.RESET}")
+                                print(f"{C.DIM}Example: .eve-cli/commands/review.md{C.RESET}")
+                                print(f"""{C.DIM}---
+description: Code review checklist
+---
+Review this code for:
+1. Security issues
+2. Performance problems
+3. Code style{C.RESET}""")
+                        continue
+                    
+                    # Execute the custom command
+                    with _custom_commands_lock:
+                        if cmd_name not in _custom_commands:
+                            print(f"{C.RED}Unknown custom command: {cmd_name}{C.RESET}")
+                            print(f"{C.DIM}Use /custom list to see available commands.{C.RESET}")
+                            continue
+                        cmd_info = _custom_commands[cmd_name]
+                    
+                    # Build the prompt from command body with argument substitution
+                    cmd_body = cmd_info.get("body", "")
+                    # Substitute $ARGUMENTS, $0, $1, etc.
+                    cmd_body = cmd_body.replace("$ARGUMENTS", cmd_args)
+                    cmd_body = cmd_body.replace("$0", cmd_name)
+                    # Simple $1, $2 substitution
+                    _arg_list = cmd_args.split()
+                    for i, arg_val in enumerate(_arg_list, start=1):
+                        cmd_body = cmd_body.replace(f"${i}", arg_val)
+                    
+                    # Get allowed tools from frontmatter if specified
+                    _allowed_tools = None
+                    _frontmatter = cmd_info.get("frontmatter", {})
+                    if "allowed-tools" in _frontmatter:
+                        _tools_spec = _frontmatter["allowed-tools"]
+                        if isinstance(_tools_spec, list):
+                            _allowed_tools = []
+                            for t in _tools_spec:
+                                t_lower = t.lower()
+                                if t_lower in ("bash", "read", "write", "edit", "glob", "grep",
+                                               "webfetch", "websearch", "notebookedit",
+                                               "taskcreate", "tasklist", "taskget", "taskupdate",
+                                               "subagent", "parallelagents", "askuserquestion"):
+                                    _allowed_tools.append(tool_registry.get(t_lower))
+                            if not _allowed_tools:
+                                _allowed_tools = None  # Fall back to default
+                    
+                    # Inject the custom command prompt
+                    user_input = cmd_body
+                    print(f"{C.DIM}Running custom command: {cmd_name}{C.RESET}")
+                    if cmd_args:
+                        print(f"{C.DIM}Arguments: {cmd_args}{C.RESET}")
+                    # Fall through to normal agent processing with the injected prompt
+                    # But restrict tools if allowed-tools was specified
+                    if _allowed_tools is not None:
+                        # Temporarily override available tools
+                        _orig_tools = agent.available_tools
+                        agent.available_tools = _allowed_tools
+                        # Will restore after agent.run
+                        # Store in session for restoration
+                        session._custom_command_tools_override = _orig_tools
+
                 elif cmd == "/team":
                     parts = user_input.split(None, 1)
                     team_args = parts[1].strip() if len(parts) > 1 else ""
@@ -11692,6 +11849,10 @@ def main():
             else:
                 # Run agent normally
                 agent.run(user_input)
+            # Restore tools if custom command had tool restrictions
+            if hasattr(session, '_custom_command_tools_override'):
+                agent.available_tools = session._custom_command_tools_override
+                del session._custom_command_tools_override
             # Capture type-ahead for next prompt (text typed during execution)
             _typeahead_text = agent.get_typeahead()
             if _typeahead_text:

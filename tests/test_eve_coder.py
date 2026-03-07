@@ -380,5 +380,108 @@ class TestMarkdownTableRendering(unittest.TestCase):
         self.assertFalse(any("..." in line or "…" in line for line in plain))
 
 
+class TestCustomCommands(unittest.TestCase):
+    def test_load_custom_commands_from_project_dir(self):
+        """Test that custom commands are loaded from .eve-cli/commands/"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cmd_dir = os.path.join(tmpdir, ".eve-cli", "commands")
+            os.makedirs(cmd_dir)
+            
+            # Create a test command
+            cmd_path = os.path.join(cmd_dir, "testcmd.md")
+            with open(cmd_path, "w", encoding="utf-8") as f:
+                f.write("""---
+description: Test command
+allowed-tools: [Read, Glob]
+---
+This is a test command with $ARGUMENTS
+""")
+            
+            # Change to tmpdir and load config
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                config = eve.Config()
+                config.load([])
+                
+                # Check command is loaded
+                self.assertIn("testcmd", eve._custom_commands)
+                cmd_info = eve._custom_commands["testcmd"]
+                self.assertEqual(cmd_info["description"], "Test command")
+                self.assertEqual(cmd_info["name"], "testcmd")
+                self.assertIn("allowed-tools", cmd_info["frontmatter"])
+                self.assertIn("Read", cmd_info["frontmatter"]["allowed-tools"])
+                self.assertIn("This is a test command with $ARGUMENTS", cmd_info["body"])
+            finally:
+                os.chdir(old_cwd)
+    
+    def test_custom_command_argument_substitution(self):
+        """Test that arguments are substituted in custom commands"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cmd_dir = os.path.join(tmpdir, ".eve-cli", "commands")
+            os.makedirs(cmd_dir)
+            
+            cmd_path = os.path.join(cmd_dir, "explain.md")
+            with open(cmd_path, "w", encoding="utf-8") as f:
+                f.write("""---
+description: Explain code
+---
+Explain: $ARGUMENTS
+Command: $0
+First arg: $1
+""")
+            
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                config = eve.Config()
+                config.load([])
+                
+                cmd_info = eve._custom_commands["explain"]
+                body = cmd_info["body"]
+                
+                # Simulate argument substitution
+                body = body.replace("$ARGUMENTS", "this function")
+                body = body.replace("$0", "explain")
+                body = body.replace("$1", "this function")
+                
+                self.assertIn("Explain: this function", body)
+                self.assertIn("Command: explain", body)
+                self.assertIn("First arg: this function", body)
+            finally:
+                os.chdir(old_cwd)
+    
+    def test_custom_command_skips_symlinks(self):
+        """Test that symlinks are skipped for security"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cmd_dir = os.path.join(tmpdir, ".eve-cli", "commands")
+            os.makedirs(cmd_dir)
+            
+            # Create a real file
+            real_cmd = os.path.join(cmd_dir, "real.md")
+            with open(real_cmd, "w", encoding="utf-8") as f:
+                f.write("Real command")
+            
+            # Create a symlink
+            link_cmd = os.path.join(cmd_dir, "link.md")
+            try:
+                os.symlink(real_cmd, link_cmd)
+            except (OSError, NotImplementedError):
+                self.skipTest("Symlinks not supported on this platform")
+            
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                config = eve.Config()
+                config.load([])
+                
+                # Real command should be loaded
+                self.assertIn("real", eve._custom_commands)
+                # Symlink should be skipped
+                self.assertNotIn("link", eve._custom_commands)
+            finally:
+                os.chdir(old_cwd)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

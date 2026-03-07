@@ -41,6 +41,9 @@ node_modules/
 # vibe-local RAG index (local, user-specific — not for version control)
 .vibe/rag/
 
+# EvE CLI local config (project-specific commands, skills, hooks — user-defined)
+.eve-cli/
+
 # Local test artifacts
 tests/
 
