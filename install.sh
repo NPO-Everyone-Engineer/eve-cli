@@ -682,14 +682,14 @@ elif [ "$RAM_GB" -ge 32 ]; then
     echo -e "  ${NEON_GREEN}┃${NC}    ${BOLD}${WHITE}$MODEL${NC} ${DIM}(19GB, MoE 3.3B active, $(msg model_best))${NC}"
     echo -e "  ${NEON_GREEN}┃${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (5GB, fast helper)${NC}"
 elif [ "$RAM_GB" -ge 16 ]; then
-    MODEL="qwen3:8b"
-    SIDECAR_MODEL="qwen3:1.7b"
+    MODEL="qwen3.5:397b-cloud"
+    SIDECAR_MODEL="qwen3.5:32b"
     echo -e "  ${MINT}┃${NC} ⭐ ${BOLD}${CYAN}★★ ＧＲＥＡＴ  ＭＯＤＥＬ ★★${NC}"
-    echo -e "  ${MINT}┃${NC}    ${BOLD}${WHITE}$MODEL${NC} ${DIM}(5GB, $(msg model_great))${NC}"
-    echo -e "  ${MINT}┃${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (1.1GB, fast helper)${NC}"
+    echo -e "  ${MINT}┃${NC}    ${BOLD}${WHITE}$MODEL${NC} ${DIM}(Cloud, $(msg model_great))${NC}"
+    echo -e "  ${MINT}┃${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (fast helper)${NC}"
 elif [ "$RAM_GB" -ge 8 ]; then
-    MODEL="qwen3:1.7b"
-    vapor_warn "$MODEL (1.1GB, $(msg model_min))"
+    MODEL="qwen3.5:32b"
+    vapor_warn "$MODEL ($(msg model_min))"
     vapor_warn "$(msg model_recommend)"
 else
     vapor_error "$(msg mem_lack): ${RAM_GB}GB ($(msg mem_lack_min))"
