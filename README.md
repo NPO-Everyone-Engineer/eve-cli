@@ -1,215 +1,385 @@
-# EvE CLI — Everyone.Engineer Coding Agent
+# EvE CLI — AIコーディングエージェント
 
-**EvE CLI** は、[NPO法人 Everyone.Engineer](https://www.everyone.engineer) が提供するオープンソースのAIコーディングエージェントです。
+**EvE CLI** は、ターミナルで動くAIプログラミングアシスタントです。
+[NPO法人 Everyone.Engineer](https://www.everyone.engineer) が提供するオープンソースソフトウェアです。
 
-[ochyai/vibe-local](https://github.com/ochyai/vibe-local) をベースに、ローカルLLMに加えてOllamaクラウドモデルにも対応しています。
+「コードを書いて」「バグを直して」「このファイルを説明して」と日本語で話しかけるだけで、AIが実際にファイルを作成・編集・実行します。
 
-## 特徴
+---
 
-- **ローカル + クラウド**: Ollamaのローカルモデルとクラウドモデル（`minimax-m2.5:cloud` 等）を自由に切り替え
-- **ゼロ依存**: Python標準ライブラリのみ、pip install不要
-- **16個の内蔵ツール**: Bash実行、ファイル操作、Web取得、サブエージェント、タスク管理など
-- **MCP統合**: JSON-RPC 2.0によるツール連携
-- **Plan/Actモード**: 読み取り専用 → 実行の段階的遷移
-- **Gitチェックポイント**: stashベースのロールバック機能
-- **シンタックスハイライト**: コードブロックのキーワード/文字列/コメント色分け（Python, JS/TS, Bash, Go, Rust）
-- **カラーdiff表示**: ファイル編集時に変更箇所を赤/緑で表示
-- **@file記法**: `@src/main.py` でファイル内容をメッセージに自動添付
-- **Tab補完**: スラッシュコマンド、ファイルパス、@fileのTab補完
-- **画像添付**: ドラッグ&ドロップ、クリップボード貼り付け、`/image` コマンド（ビジョン対応モデル必要）
-- **日本語対応**: 日本語・英語・中国語に対応
+## はじめに — EvE CLI でできること
+
+```
+あなた: src/main.py のバグを直して
+  AI  : ファイルを確認しています...
+        問題を発見しました。修正します。
+        ✓ src/main.py を編集しました
+```
+
+- **コードの作成・編集**: 「Reactのボタンコンポーネントを作って」
+- **バグ修正**: 「エラーメッセージを貼るので原因を調べて直して」
+- **コードの説明**: 「このコードが何をしているか教えて」
+- **ファイル操作**: 「このディレクトリ構造を整理して」
+- **コマンド実行**: 「テストを実行して失敗したら直して」
+- **Web検索**: 「最新のReactのインストール方法を調べて」
+
+---
 
 ## インストール
 
-### ワンライナー（推奨）
+### ステップ 1 — Ollama をインストールする
+
+Ollama は、AIモデルをパソコン上で動かすソフトウェアです。
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+**Windows:**
+[https://ollama.com/download](https://ollama.com/download) からインストーラーをダウンロード
+
+### ステップ 2 — AIモデルをダウンロードする
+
+```bash
+# 推奨モデル（メモリ 8GB 以上のパソコン向け）
+ollama pull qwen3:8b
+
+# メモリが少ない場合（4GB 程度でも動作）
+ollama pull qwen3:4b
+```
+
+> ダウンロードには数分かかります（モデルのサイズ: 約 5〜8GB）
+
+### ステップ 3 — EvE CLI をインストールする
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main/install.sh | bash
 ```
 
-これだけで Python・Ollama の確認、モデルのダウンロード、`eve-cli` コマンドのセットアップが自動で行われます。
+インストールが完了したら、ターミナルを再起動してください。
 
-### 手動インストール
+### 動作確認
 
 ```bash
-# リポジトリをクローン
-git clone https://github.com/NPO-Everyone-Engineer/eve-cli.git
-cd eve-cli
-
-# 実行権限を付与
-chmod +x eve-coder.py eve-cli.sh
-
-# パスに追加
-ln -s $(pwd)/eve-cli.sh /usr/local/bin/eve-cli
+eve-cli --version
 ```
 
-### 前提条件
+バージョン番号が表示されれば成功です。
 
-- Python 3.8+
-- [Ollama](https://ollama.com/) がインストール・起動済み
+---
 
-## 使い方
+## はじめての使い方
+
+### 起動する
 
 ```bash
-# 対話モード
 eve-cli
-
-# ワンショット
-eve-cli -p "Hello Worldを作って"
-
-# ローカルモデル指定
-eve-cli --model qwen3:8b
-
-# クラウドモデル指定（Ollama有料版）
-eve-cli --model minimax-m2.5:cloud
-
-# 自動許可モード
-eve-cli -y
-
-# セッション再開
-eve-cli --resume
 ```
 
-### 入力方法
+こんな画面が表示されます：
 
-- **Enter**: 改行（入力を続ける）
-- **空のEnter**: メッセージ送信
-- **`"""`**: 明示的なマルチラインモード（`"""`で開始・終了）
-- **Tab**: ファイルパス・コマンド補完
-- **@ファイル名**: ファイル内容を自動添付（例: `@src/main.py を修正して`）
+```
+✦ EvE CLI v1.x.x  model: qwen3:8b
+>
+```
 
-### インタラクティブコマンド
+### 話しかけてみる
+
+```
+> こんにちは。何ができますか？
+```
+
+Enterキーを2回押すと送信されます（1回目は改行、2回目で送信）。
+
+### ファイルを作ってもらう
+
+```
+> hello.py というファイルを作って。「Hello, World!」を表示するプログラムにして
+```
+
+AIがファイルを作ろうとすると確認が求められます：
+
+```
+┌─ Write ────────────────────────────────
+│  hello.py
+│
+│  [y] 今回だけ許可   [a] 常に許可
+│  [n] 拒否 (Enter)   [Y] すべて許可
+╰────────────────────────────────────────
+?
+```
+
+`y` を押すと実行されます。
+
+### 終了する
+
+```
+> /exit
+```
+
+または `Ctrl+D` を押します。
+
+---
+
+## コマンド一覧
+
+`/` で始まるコマンドを入力することで、様々な機能を使えます。
+
+### よく使うコマンド
 
 | コマンド | 説明 |
 |---------|------|
-| `/help` | ヘルプ表示 |
-| `/model` | モデル切り替え |
-| `/plan` | Planモードに切り替え |
-| `/approve` | 計画を承認して実行 |
-| `/image` | クリップボードの画像を添付 |
-| `/image <path>` | 画像ファイルを添付 |
-| `/commit` | Git コミット作成 |
-| `/diff` | 変更差分を表示 |
+| `/help` | コマンド一覧を表示 |
+| `/clear` | 会話をクリアして最初からやり直す |
 | `/undo` | 直前のファイル変更を元に戻す |
-| `/checkpoint` | Gitチェックポイント作成 |
-| `/rollback` | チェックポイントに戻す |
-| `/compact` | 会話を要約して圧縮 |
-| `/watch` | ファイル監視モード |
-| `/autotest` | 自動テストループ |
-| `/browser setup` | ブラウザ操作のセットアップ（Playwright MCP） |
-| `/browser status` | ブラウザツールの接続状態を確認 |
-| `/config` | 現在の設定を表示 |
-| `/clear` | 会話クリア |
 | `/exit` | 終了 |
 
-### パーミッション
+### ファイル・コード操作
 
-ツール実行時に確認プロンプトが表示されます（`-y` で自動許可）。
+| コマンド | 説明 |
+|---------|------|
+| `@ファイル名` | ファイルの内容を会話に添付（例: `@src/main.py を直して`） |
+| `/image` | クリップボードの画像を添付（スクリーンショットのエラーを読み取るなど） |
+| `/image <パス>` | 画像ファイルを指定して添付 |
 
-| 選択肢 | 説明 |
-|--------|------|
+### 状態確認
+
+| コマンド | 説明 |
+|---------|------|
+| `/status` | セッション情報を表示 |
+| `/tokens` または `/cost` | AIが使ったトークン数とセッション時間 |
+| `/context` | コンテキスト使用率をグラフで表示 |
+| `/stats` | 利用統計（今日の使用回数、連続利用日数など） |
+| `/doctor` | 設定の診断（うまく動かない時に） |
+| `/config` | 現在の設定を表示 |
+| `/memory` | AIが記憶したメモを表示 |
+
+### Git 連携
+
+| コマンド | 説明 |
+|---------|------|
+| `/commit` | AIが変更内容を読んでコミットメッセージを自動生成 |
+| `/diff` | 変更差分を表示 |
+| `/checkpoint` | 現在の状態を保存（何かあれば戻れる） |
+| `/rollback` | チェックポイントに戻す |
+
+### セッション管理
+
+| コマンド | 説明 |
+|---------|------|
+| `/save` | 会話を保存 |
+| `/resume` | 以前の会話を再開 |
+| `/rename <名前>` | セッションに名前をつける |
+| `/fork` | 現在の会話を分岐させて別方向を試す |
+| `/compact` | 会話を要約して容量を節約 |
+
+### Plan/Act モード（慎重に作業したいとき）
+
+| コマンド | 説明 |
+|---------|------|
+| `/plan` | Planモードに切り替え（AIがファイルを変更できない読み取り専用） |
+| `/approve` | Planを承認して実行に移る |
+
+### パーミッション（権限）管理
+
+| コマンド | 説明 |
+|---------|------|
+| `/permissions` | 現在の権限設定を表示 |
+| `/permissions allow Bash` | Bashコマンドを常に許可 |
+| `/permissions deny Write` | ファイル書き込みを常に拒否 |
+| `/yes` | 全ての操作を自動許可（注意して使ってください） |
+| `/no` | 自動許可を解除して確認モードに戻る |
+
+### モデル管理
+
+| コマンド | 説明 |
+|---------|------|
+| `/model` | 使用するAIモデルを切り替え |
+| `/models` | インストール済みモデル一覧 |
+
+---
+
+## 入力方法
+
+| 操作 | 説明 |
+|------|------|
+| **Enter** | 改行（入力を続ける） |
+| **空行でEnter** | メッセージを送信 |
+| **Tab** | コマンド・ファイルパスの補完 |
+| **↑ / ↓** | 過去のコマンド履歴 |
+| **Ctrl+C** | AIの処理を中断 |
+| **Ctrl+C × 2回** | eve-cli を終了 |
+
+---
+
+## ツール許可について
+
+AIが何か操作を行う前に、毎回確認が表示されます。
+
+```
+┌─ Bash ──────────────────────────────────
+│  npm install
+╰─────────────────────────────────────────
+?
+```
+
+| キー | 動作 |
+|------|------|
 | `y` | 今回だけ許可 |
-| `a` | このツールを今後すべて許可 |
+| `a` | このツールを今後すべて許可（セッション中） |
 | `n` / Enter | 拒否 |
 | `d` | このツールを今後すべて拒否 |
 | `Y` | すべてのツールを自動許可 |
 
-## 環境変数
+---
 
-| 変数 | 説明 |
-|------|------|
-| `EVE_CLI_MODEL` | デフォルトモデル名 |
-| `EVE_CLI_SIDECAR_MODEL` | サイドカーモデル名 |
-| `EVE_CLI_DEBUG` | デバッグモード (`1` で有効) |
-| `OLLAMA_HOST` | Ollamaホスト URL |
-
-### 設定方法
-
-シェルの設定ファイル（`~/.zshrc` または `~/.bashrc`）に追記してください。
+## 起動オプション
 
 ```bash
-# デフォルトモデルを設定
-export EVE_CLI_MODEL="qwen3:8b"
+# 対話モード（通常の起動）
+eve-cli
 
-# クラウドモデルを使う場合
-export EVE_CLI_MODEL="minimax-m2.5:cloud"
+# 一度だけ実行して終了
+eve-cli -p "package.json の依存関係を確認して"
 
-# サイドカーモデル（サブエージェント用の軽量モデル）
-export EVE_CLI_SIDECAR_MODEL="qwen3:4b"
+# モデルを指定して起動
+eve-cli --model qwen3:8b
 
-# デバッグモードを有効化
-export EVE_CLI_DEBUG=1
+# 全操作を自動許可（確認なし）
+eve-cli -y
 
-# Ollamaのホストを変更（デフォルト: http://localhost:11434）
-export OLLAMA_HOST="http://localhost:11434"
+# 前回の会話を再開
+eve-cli --resume
+
+# デバッグ情報を表示
+eve-cli --debug
 ```
 
-設定後、ターミナルを再起動するか `source ~/.zshrc` を実行してください。
+---
 
-設定ファイル（`~/.config/eve-cli/config`）でも同様に設定できます。
+## 設定ファイル
+
+### モデルを固定する
+
+`~/.config/eve-cli/config` を作成して設定します：
 
 ```
 MODEL=qwen3:8b
-SIDECAR_MODEL=qwen3:4b
-OLLAMA_HOST=http://localhost:11434
-EVE_CLI_DEBUG=0
 ```
 
-## ブラウザ操作（Playwright MCP）
+### プロジェクトごとにAIへの指示を書く（CLAUDE.md）
 
-eve-cli からブラウザを操作できます。Webページの表示、スクリーンショット、フォーム入力、クリックなどが可能です。
-
-### セットアップ
+プロジェクトのフォルダに `CLAUDE.md` というファイルを作ると、AIが毎回それを読み込みます。
 
 ```bash
-# Node.js が必要（未インストールの場合）
-brew install node
-
-# eve-cli 内でセットアップ
+# 自動でテンプレートを作成
 eve-cli
-> /browser setup
+> /init
 ```
 
-セットアップ後、eve-cli を再起動するとブラウザ操作ツールが自動で読み込まれます。
+例：
+```markdown
+# プロジェクト名
 
-### 使用例
+## このプロジェクトについて
+Reactを使ったTodoアプリです。
 
+## コーディングルール
+- TypeScriptを使う
+- コメントは日本語で書く
+- テストを必ず書く
 ```
-> https://example.com を開いてページの内容を教えて
-> Google で "EvE CLI" を検索して最初の結果を教えて
-> https://example.com のスクリーンショットを撮って
-> フォームに名前を入力して送信ボタンを押して
-```
 
-### 手動設定
+### settings.json で詳細設定
 
-`~/.config/eve-cli/mcp.json` を直接編集することもできます:
+`.claude/settings.json` でより細かい設定ができます：
 
 ```json
 {
-  "mcpServers": {
-    "playwright": {
-      "command": "npx",
-      "args": ["@playwright/mcp@latest"]
-    }
+  "model": "qwen3:8b",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "command": "echo ファイルが更新されました"
+      }
+    ]
   }
 }
 ```
 
-## 推奨環境
+---
+
+## AIの記憶機能
+
+EvE CLI は、プロジェクトごとにAIが学習した内容を記憶します。
+
+- ビルドコマンド、よく使うパターン、好みの書き方などを自動で覚えます
+- セッションをまたいで引き継がれます
+- `/memory` コマンドで確認・編集できます
+
+---
+
+## ブラウザ操作（上級者向け）
+
+Webページを開いたり、フォームを操作したりできます。
+
+```bash
+# セットアップ（Node.js が必要）
+eve-cli
+> /browser setup
+```
+
+セットアップ後：
+```
+> https://example.com を開いてスクリーンショットを撮って
+> Google で "Python チュートリアル" を検索して最初の結果を教えて
+```
+
+---
+
+## うまく動かない時
+
+### Ollama が起動していない
+
+```bash
+# macOS: メニューバーのラマアイコンをクリック、または:
+ollama serve
+
+# Linux:
+ollama serve
+```
+
+### `/doctor` で診断する
+
+```bash
+eve-cli
+> /doctor
+```
+
+設定や接続の問題を自動でチェックします。
+
+### モデルのダウンロードが遅い
+
+Wi-Fi が安定している環境で実行してください。モデルのサイズは 5〜8GB あります。
+
+---
+
+## 推奨スペック
 
 | 環境 | メモリ | 推奨モデル |
-|------|-------|----------|
-| Apple Silicon Mac | 96GB+ | gpt-oss:120b |
-| Apple Silicon Mac | 16GB | qwen3:8b |
-| Intel/Windows/Linux | 16GB+ | qwen3:8b |
-| クラウドモデル利用時 | 制限なし | minimax-m2.5:cloud |
+|------|--------|-----------|
+| Mac (Apple Silicon) | 16GB | qwen3:8b |
+| Mac (Apple Silicon) | 8GB 以下 | qwen3:4b |
+| Windows / Linux | 16GB+ | qwen3:8b |
+| Windows / Linux | 8GB | qwen3:4b |
 
-画像認識を使う場合は、ビジョン対応モデル（`llava`, `llama3.2-vision`, `gemma3` 等）が必要です。
+---
 
 ## ライセンス
 
-MIT License — [ochyai/vibe-local](https://github.com/ochyai/vibe-local) をベースにしています。
+MIT License
 
 ## クレジット
 
