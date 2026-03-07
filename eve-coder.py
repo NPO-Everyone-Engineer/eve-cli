@@ -5907,6 +5907,7 @@ class TUI:
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/watch", "/skills",
+                    "/browser",
                 ]
                 def _completer(text, state):
                     try:
@@ -6958,6 +6959,7 @@ class TUI:
   {_c198}/image{C.RESET}             Attach image from clipboard
   {_c198}/image{C.RESET} <path>      Attach image file
   {_c198}@file{C.RESET}              Attach file contents (e.g. @src/main.py)
+  {_c198}/browser{C.RESET}           Browser automation (Playwright MCP)
   {_c198}/debug{C.RESET}             Toggle debug mode
   {_c198}/debug-scroll{C.RESET}      Test scroll region (DECSTBM)
   {_c198}/resume{C.RESET}            Switch to a different session
@@ -8532,6 +8534,100 @@ def main():
                     print(f"  {_c51x}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
                     continue
 
+                elif cmd == "/browser":
+                    parts = user_input.split(None, 1)
+                    sub = parts[1].strip().lower() if len(parts) > 1 else ""
+                    if sub == "setup":
+                        # Setup Playwright MCP
+                        _c51b = _ansi("\033[38;5;51m")
+                        _c240b = _ansi("\033[38;5;240m")
+                        print(f"\n  {_c51b}━━ Browser Setup (Playwright MCP) ━━{C.RESET}")
+                        # Check Node.js
+                        _has_node = subprocess.run(
+                            ["node", "--version"], capture_output=True, timeout=5
+                        ).returncode == 0 if subprocess.run(["which", "node"], capture_output=True).returncode == 0 else False
+                        if not _has_node:
+                            print(f"  {C.RED}Node.js が見つかりません。{C.RESET}")
+                            print(f"  {_c240b}インストール: brew install node  または  https://nodejs.org/{C.RESET}")
+                            print(f"  {_c51b}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                            continue
+                        # Check npx
+                        _has_npx = subprocess.run(["which", "npx"], capture_output=True).returncode == 0
+                        if not _has_npx:
+                            print(f"  {C.RED}npx が見つかりません。Node.js を再インストールしてください。{C.RESET}")
+                            continue
+                        # Write MCP config
+                        _mcp_dir = os.path.join(config.config_dir)
+                        os.makedirs(_mcp_dir, exist_ok=True)
+                        _mcp_path = os.path.join(_mcp_dir, "mcp.json")
+                        _mcp_data = {
+                            "mcpServers": {
+                                "playwright": {
+                                    "command": "npx",
+                                    "args": ["@playwright/mcp@latest"]
+                                }
+                            }
+                        }
+                        # Merge with existing config if present
+                        if os.path.isfile(_mcp_path) and not os.path.islink(_mcp_path):
+                            try:
+                                with open(_mcp_path, encoding="utf-8") as _mf:
+                                    _existing = json.load(_mf)
+                                if isinstance(_existing, dict) and "mcpServers" in _existing:
+                                    _existing["mcpServers"]["playwright"] = _mcp_data["mcpServers"]["playwright"]
+                                    _mcp_data = _existing
+                            except Exception:
+                                pass
+                        try:
+                            with open(_mcp_path, "w", encoding="utf-8") as _mf:
+                                json.dump(_mcp_data, _mf, indent=2, ensure_ascii=False)
+                            print(f"  {C.GREEN}MCP設定を書き込みました: {_mcp_path}{C.RESET}")
+                        except Exception as e:
+                            print(f"  {C.RED}設定の書き込みに失敗: {e}{C.RESET}")
+                            continue
+                        # Test Playwright MCP launch
+                        print(f"  {_c240b}Playwright MCP の動作確認中...{C.RESET}")
+                        try:
+                            _test_proc = subprocess.run(
+                                ["npx", "@playwright/mcp@latest", "--help"],
+                                capture_output=True, timeout=30
+                            )
+                            if _test_proc.returncode == 0:
+                                print(f"  {C.GREEN}Playwright MCP は利用可能です。{C.RESET}")
+                            else:
+                                print(f"  {C.YELLOW}Playwright MCP のインストール中にエラーが発生しました。{C.RESET}")
+                                print(f"  {_c240b}手動実行: npx @playwright/mcp@latest --help{C.RESET}")
+                        except Exception:
+                            print(f"  {C.YELLOW}確認がタイムアウトしました（初回ダウンロード中の可能性あり）。{C.RESET}")
+                        print(f"\n  {C.GREEN}セットアップ完了!{C.RESET}")
+                        print(f"  {_c240b}eve-cli を再起動すると、ブラウザ操作ツールが使えるようになります。{C.RESET}")
+                        print(f"  {_c240b}例: 「https://example.com を開いてスクリーンショットを撮って」{C.RESET}")
+                        print(f"  {_c51b}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    elif sub == "status":
+                        _c51b = _ansi("\033[38;5;51m")
+                        _c240b = _ansi("\033[38;5;240m")
+                        print(f"\n  {_c51b}━━ Browser Status ━━━━━━━━━━━━━━━━━{C.RESET}")
+                        # Check if playwright MCP tools are registered
+                        _pw_tools = [t for t in registry.list_tools() if "browser" in t.lower() or "playwright" in t.lower() or "navigate" in t.lower() or "screenshot" in t.lower() or "click" in t.lower()]
+                        if _pw_tools:
+                            print(f"  {C.GREEN}Playwright MCP: 接続済み ({len(_pw_tools)} tools){C.RESET}")
+                            for _t in _pw_tools[:10]:
+                                print(f"    {_c240b}- {_t}{C.RESET}")
+                            if len(_pw_tools) > 10:
+                                print(f"    {_c240b}  ... +{len(_pw_tools)-10} more{C.RESET}")
+                        else:
+                            print(f"  {C.YELLOW}Playwright MCP: 未接続{C.RESET}")
+                            print(f"  {_c240b}/browser setup でセットアップしてください{C.RESET}")
+                        print(f"  {_c51b}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    else:
+                        print(f"  {C.CYAN}/browser setup{C.RESET}   — Playwright MCP をセットアップ")
+                        print(f"  {C.CYAN}/browser status{C.RESET}  — ブラウザツールの接続状態を確認")
+                        print(f"  {C.DIM}")
+                        print(f"  セットアップ後、eve-cli を再起動するとブラウザ操作が可能になります。")
+                        print(f"  例: 「https://example.com を開いてページの内容を教えて」")
+                        print(f"  例: 「Google で EvE CLI を検索して結果を教えて」{C.RESET}")
+                    continue
+
                 elif cmd == "/debug":
                     config.debug = not config.debug
                     state_str = f"{C.GREEN}ON{C.RESET}" if config.debug else f"{C.RED}OFF{C.RESET}"
@@ -8549,7 +8645,8 @@ def main():
                                  "/tokens", "/commit", "/diff", "/git", "/plan",
                                  "/approve", "/act", "/execute", "/undo", "/init",
                                  "/config", "/debug", "/debug-scroll", "/checkpoint",
-                                 "/rollback", "/autotest", "/skills", "/image"]
+                                 "/rollback", "/autotest", "/skills", "/image",
+                                 "/browser"]
                     _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                     if not _close:
                         _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []

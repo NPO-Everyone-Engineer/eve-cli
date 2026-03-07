@@ -96,6 +96,8 @@ eve-cli --resume
 | `/compact` | 会話を要約して圧縮 |
 | `/watch` | ファイル監視モード |
 | `/autotest` | 自動テストループ |
+| `/browser setup` | ブラウザ操作のセットアップ（Playwright MCP） |
+| `/browser status` | ブラウザツールの接続状態を確認 |
 | `/config` | 現在の設定を表示 |
 | `/clear` | 会話クリア |
 | `/exit` | 終了 |
@@ -151,6 +153,47 @@ MODEL=qwen3:8b
 SIDECAR_MODEL=qwen3:4b
 OLLAMA_HOST=http://localhost:11434
 EVE_CLI_DEBUG=0
+```
+
+## ブラウザ操作（Playwright MCP）
+
+eve-cli からブラウザを操作できます。Webページの表示、スクリーンショット、フォーム入力、クリックなどが可能です。
+
+### セットアップ
+
+```bash
+# Node.js が必要（未インストールの場合）
+brew install node
+
+# eve-cli 内でセットアップ
+eve-cli
+> /browser setup
+```
+
+セットアップ後、eve-cli を再起動するとブラウザ操作ツールが自動で読み込まれます。
+
+### 使用例
+
+```
+> https://example.com を開いてページの内容を教えて
+> Google で "EvE CLI" を検索して最初の結果を教えて
+> https://example.com のスクリーンショットを撮って
+> フォームに名前を入力して送信ボタンを押して
+```
+
+### 手動設定
+
+`~/.config/eve-cli/mcp.json` を直接編集することもできます:
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"]
+    }
+  }
+}
 ```
 
 ## 推奨環境
