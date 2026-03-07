@@ -1,6 +1,6 @@
 # EvE CLI — Everyone.Engineer Coding Agent
 
-**EvE CLI** は、[NPO法人 Everyone.Engineer](https://everyone.engineer) が提供するオープンソースのAIコーディングエージェントです。
+**EvE CLI** は、[NPO法人 Everyone.Engineer](https://www.everyone.engineer) が提供するオープンソースのAIコーディングエージェントです。
 
 [ochyai/vibe-local](https://github.com/ochyai/vibe-local) をベースに、ローカルLLMに加えてOllamaクラウドモデルにも対応しています。
 
@@ -12,6 +12,11 @@
 - **MCP統合**: JSON-RPC 2.0によるツール連携
 - **Plan/Actモード**: 読み取り専用 → 実行の段階的遷移
 - **Gitチェックポイント**: stashベースのロールバック機能
+- **シンタックスハイライト**: コードブロックのキーワード/文字列/コメント色分け（Python, JS/TS, Bash, Go, Rust）
+- **カラーdiff表示**: ファイル編集時に変更箇所を赤/緑で表示
+- **@file記法**: `@src/main.py` でファイル内容をメッセージに自動添付
+- **Tab補完**: スラッシュコマンド、ファイルパス、@fileのTab補完
+- **画像添付**: ドラッグ&ドロップ、クリップボード貼り付け、`/image` コマンド（ビジョン対応モデル必要）
 - **日本語対応**: 日本語・英語・中国語に対応
 
 ## インストール
@@ -65,6 +70,14 @@ eve-cli -y
 eve-cli --resume
 ```
 
+### 入力方法
+
+- **Enter**: 改行（入力を続ける）
+- **空のEnter**: メッセージ送信
+- **`"""`**: 明示的なマルチラインモード（`"""`で開始・終了）
+- **Tab**: ファイルパス・コマンド補完
+- **@ファイル名**: ファイル内容を自動添付（例: `@src/main.py を修正して`）
+
 ### インタラクティブコマンド
 
 | コマンド | 説明 |
@@ -73,12 +86,31 @@ eve-cli --resume
 | `/model` | モデル切り替え |
 | `/plan` | Planモードに切り替え |
 | `/approve` | 計画を承認して実行 |
+| `/image` | クリップボードの画像を添付 |
+| `/image <path>` | 画像ファイルを添付 |
+| `/commit` | Git コミット作成 |
+| `/diff` | 変更差分を表示 |
+| `/undo` | 直前のファイル変更を元に戻す |
 | `/checkpoint` | Gitチェックポイント作成 |
 | `/rollback` | チェックポイントに戻す |
+| `/compact` | 会話を要約して圧縮 |
 | `/watch` | ファイル監視モード |
 | `/autotest` | 自動テストループ |
+| `/config` | 現在の設定を表示 |
 | `/clear` | 会話クリア |
 | `/exit` | 終了 |
+
+### パーミッション
+
+ツール実行時に確認プロンプトが表示されます（`-y` で自動許可）。
+
+| 選択肢 | 説明 |
+|--------|------|
+| `y` | 今回だけ許可 |
+| `a` | このツールを今後すべて許可 |
+| `n` / Enter | 拒否 |
+| `d` | このツールを今後すべて拒否 |
+| `Y` | すべてのツールを自動許可 |
 
 ## 環境変数
 
@@ -130,6 +162,8 @@ EVE_CLI_DEBUG=0
 | Intel/Windows/Linux | 16GB+ | qwen3:8b |
 | クラウドモデル利用時 | 制限なし | minimax-m2.5:cloud |
 
+画像認識を使う場合は、ビジョン対応モデル（`llava`, `llama3.2-vision`, `gemma3` 等）が必要です。
+
 ## ライセンス
 
 MIT License — [ochyai/vibe-local](https://github.com/ochyai/vibe-local) をベースにしています。
@@ -137,4 +171,4 @@ MIT License — [ochyai/vibe-local](https://github.com/ochyai/vibe-local) をベ
 ## クレジット
 
 - 原作: [ochyai/vibe-local](https://github.com/ochyai/vibe-local) by Yoichi Ochiai
-- フォーク・拡張: [NPO法人 Everyone.Engineer](https://everyone.engineer)
+- フォーク・拡張: [NPO法人 Everyone.Engineer](https://www.everyone.engineer)
