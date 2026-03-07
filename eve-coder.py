@@ -109,7 +109,41 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "1.3.3"
+__version__ = "1.3.4"
+
+# ── Tuneable constants ─────────────────────────────────────────────────────────
+CTX_WARN_YELLOW         = 50    # context % at which status/prompt turns yellow
+CTX_WARN_RED            = 80    # context % at which status/prompt turns red
+MIN_TERMINAL_ROWS       = 10    # minimum rows required for scroll region mode
+COMPACT_FREE_RATIO      = 0.70  # fraction of context_window reserved for response headroom
+COMPACT_FORCE_MSG_COUNT = 300   # force compaction above this message count
+COMPACT_PRESERVE_COUNT  = 30    # recent messages to keep during compaction
+FILE_WATCHER_MAX_EVENTS = 20    # max file change events shown at once
+
+
+def _tmux_notify(title: str, body: str = "") -> None:
+    """Send a tmux display-message notification when running inside a tmux session.
+
+    Fires only when TMUX env var is set (i.e. inside tmux).
+    This is useful when you switch to another window while the AI is running —
+    you'll see a status-bar flash when the task finishes or an error occurs.
+    All errors are silently swallowed; notifications are strictly best-effort.
+    """
+    if not os.environ.get("TMUX"):
+        return
+    try:
+        msg = f"[eve] {title}"
+        if body:
+            msg += f": {body}"
+        msg = msg[:200]  # truncate to avoid tmux display issues
+        subprocess.run(
+            ["tmux", "display-message", "-d", "4000", msg],
+            timeout=2,
+            capture_output=True,
+        )
+    except Exception:
+        pass  # notification is strictly best-effort
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -292,10 +326,10 @@ class ScrollRegion:
         # Skip if colors/ANSI disabled
         if not C._enabled:
             return False
-        # Need at least 10 rows
+        # Need at least MIN_TERMINAL_ROWS rows
         try:
             size = shutil.get_terminal_size((80, 24))
-            if size.lines < 10:
+            if size.lines < MIN_TERMINAL_ROWS:
                 return False
         except (ValueError, OSError):
             return False
@@ -309,7 +343,7 @@ class ScrollRegion:
             cols = size.columns
         except (ValueError, OSError):
             return
-        if rows < 10:
+        if rows < MIN_TERMINAL_ROWS:
             return
 
         scroll_end = rows - self.STATUS_ROWS
@@ -369,7 +403,7 @@ class ScrollRegion:
         try:
             if not self._active:
                 return
-            if new_rows < 10:
+            if new_rows < MIN_TERMINAL_ROWS:
                 self._active = False
                 if self._rows > 0:
                     buf = f"\033[1;{self._rows}r"
@@ -489,8 +523,8 @@ def _debug_scroll_region(tui):
     if not is_tty:
         print(f"  {_c198}Not a TTY — cannot test.{_rst}\n")
         return
-    if rows < 10:
-        print(f"  {_c198}Terminal too small (need >=10 rows).{_rst}\n")
+    if rows < MIN_TERMINAL_ROWS:
+        print(f"  {_c198}Terminal too small (need >={MIN_TERMINAL_ROWS} rows).{_rst}\n")
         return
 
     scroll_end = rows - 3
@@ -1278,7 +1312,7 @@ def _get_vram_gb():
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         pass  # nvidia-smi not available
     except Exception:
-        pass
+        pass  # unexpected nvidia-smi error; treat as no VRAM
     return 0
 
 
@@ -1445,8 +1479,9 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
             content, truncated = _load_instructions(global_md)
             trunc_note = "\n[Note: file truncated, only first 8000 bytes loaded]" if truncated else ""
             prompt += f"\n# Global Instructions\n{_sanitize_instructions(content)}{trunc_note}\n"
-        except Exception:
-            pass
+        except Exception as e:
+            if config.debug:
+                print(f"[debug] Failed to load global instructions ({global_md}): {e}", file=sys.stderr)
 
     # 2. Parent directory hierarchy → cwd (walk up from cwd to find CLAUDE.md in parent dirs)
     # Checks both root CLAUDE.md and .claude/CLAUDE.md at each level
@@ -1783,7 +1818,7 @@ class OllamaClient:
             try:
                 error_body = e.read().decode("utf-8", errors="replace")[:500]
             except Exception:
-                pass
+                pass  # body unreadable; proceed with empty error_body
             finally:
                 e.close()
             if e.code == 404:
@@ -1899,7 +1934,7 @@ class OllamaClient:
             try:
                 resp.close()
             except Exception:
-                pass
+                pass  # response already consumed or never opened
 
     def tokenize(self, model, text):
         """Count tokens via Ollama /api/tokenize. Falls back to len//4."""
@@ -1920,7 +1955,7 @@ class OllamaClient:
             if tokens is not None:
                 return len(tokens)
         except Exception:
-            pass
+            pass  # tokenize API unavailable; caller falls back to len//4 estimate
         return len(text) // 4
 
     def chat_sync(self, model, messages, tools=None):
@@ -2034,7 +2069,7 @@ class RAGEngine:
                 data = json.loads(resp.read())
                 return data["embeddings"][0]
         except Exception:
-            pass
+            pass  # /api/embed failed; try legacy /api/embeddings endpoint
 
         # Fallback: /api/embeddings (older Ollama)
         url = f"{host}/api/embeddings"
@@ -3173,7 +3208,7 @@ class EditTool(Tool):
             if len(content) <= 1_048_576:
                 _undo_stack.append((file_path, content))
         except Exception:
-            pass
+            pass  # undo stack push failed (e.g. deque full); non-critical
 
         try:
             # Atomic write: mkstemp + rename (crash-safe, no predictable name)
@@ -4785,7 +4820,7 @@ class MCPClient:
             self._proc.stdin.write(notif.encode("utf-8"))
             self._proc.stdin.flush()
         except Exception:
-            pass
+            pass  # initialized notification has no response; pipe error is non-fatal
         return result
 
     def list_tools(self):
@@ -5154,7 +5189,7 @@ class FileWatcher:
                         self._changes.extend(changes)
                     self._snapshots = new_snap
             except Exception:
-                pass
+                pass  # best-effort; resume on next poll interval
 
     def get_pending_changes(self):
         """Get and clear pending file changes. Returns list of (type, path)."""
@@ -5169,11 +5204,11 @@ class FileWatcher:
             return ""
         lines = ["[File Watcher] External file changes detected:"]
         icons = {"created": "+", "modified": "~", "deleted": "-"}
-        for ctype, cpath in changes[:20]:  # cap at 20
+        for ctype, cpath in changes[:FILE_WATCHER_MAX_EVENTS]:
             relpath = os.path.relpath(cpath, self.cwd)
             lines.append(f"  {icons.get(ctype, '?')} {relpath} ({ctype})")
-        if len(changes) > 20:
-            lines.append(f"  ... and {len(changes) - 20} more")
+        if len(changes) > FILE_WATCHER_MAX_EVENTS:
+            lines.append(f"  ... and {len(changes) - FILE_WATCHER_MAX_EVENTS} more")
         return "\n".join(lines)
 
     def refresh_snapshot(self):
@@ -5181,7 +5216,7 @@ class FileWatcher:
         try:
             self._snapshots = self._scan()
         except Exception:
-            pass
+            pass  # best-effort; stale snapshot is harmless
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -6086,9 +6121,9 @@ class Session:
         """Trim old messages if context is getting too large.
         Uses sidecar model for intelligent summarization when available."""
         # Force compaction if too many messages regardless of token estimate
-        if not force and len(self.messages) > 300:
+        if not force and len(self.messages) > COMPACT_FORCE_MSG_COUNT:
             force = True
-        max_tokens = self.config.context_window * 0.70  # leave 30% room for response + overhead
+        max_tokens = self.config.context_window * COMPACT_FREE_RATIO  # reserve headroom for response
         if not force and self.get_token_estimate() < max_tokens:
             return
         # Prevent infinite re-compaction: skip if we already compacted at this message count
@@ -6096,8 +6131,8 @@ class Session:
             return
         self._last_compact_msg_count = len(self.messages)
 
-        # Always keep last 20 messages
-        preserve_count = min(30, len(self.messages))  # Keep more context for coding tasks
+        # Always keep last COMPACT_PRESERVE_COUNT messages
+        preserve_count = min(COMPACT_PRESERVE_COUNT, len(self.messages))
         cutoff = len(self.messages) - preserve_count
 
         # --- Sidecar summarization path ---
@@ -6205,7 +6240,7 @@ class Session:
             index[cwd_key] = self.session_id
             Session._save_project_index(self.config, index)
         except Exception:
-            pass  # non-critical
+            pass  # project index is non-critical; session itself was saved successfully
 
     MAX_SESSION_FILE_SIZE = 50 * 1024 * 1024  # 50MB safety limit
 
@@ -6561,9 +6596,9 @@ class TUI:
             plan_tag = f"{_rl_ansi(chr(27)+'[38;5;226m')}[PLAN]{_rl_reset} " if plan_mode else ""
             if session:
                 pct = min(int((session.get_token_estimate() / session.config.context_window) * 100), 100)
-                if pct < 50:
+                if pct < CTX_WARN_YELLOW:
                     ctx_color = _rl_ansi("\033[38;5;240m")
-                elif pct < 80:
+                elif pct < CTX_WARN_RED:
                     ctx_color = _rl_ansi("\033[38;5;226m")
                 else:
                     ctx_color = _rl_ansi("\033[38;5;196m")
@@ -7440,7 +7475,7 @@ class TUI:
         pct = min(int((tokens / config.context_window) * 100), 100)
         bar_len = 20
         filled = int(bar_len * pct / 100)
-        bar_color = _ansi("\033[38;5;46m") if pct < 50 else _ansi("\033[38;5;226m") if pct < 80 else _ansi("\033[38;5;196m")
+        bar_color = _ansi("\033[38;5;46m") if pct < CTX_WARN_YELLOW else _ansi("\033[38;5;226m") if pct < CTX_WARN_RED else _ansi("\033[38;5;196m")
         bar = bar_color + "█" * filled + _c240 + "░" * (bar_len - filled) + C.RESET
         sep_w = min(35, self._term_cols - 4)
         sep = "━" * sep_w
@@ -7764,13 +7799,14 @@ class Agent:
                 # 3. Add to history
                 self.session.add_assistant_message(text, tool_calls if tool_calls else None)
 
-                # 4. If no tool calls, we're done — fire Stop hook
+                # 4. If no tool calls, we're done — fire Stop hook and tmux notify
                 if not tool_calls:
                     self.hooks.fire("Stop", {
                         "session_id": self.session.session_id,
                         "iterations": iteration,
                         "msgs": len(self.session.messages),
                     })
+                    _tmux_notify("Done", f"{iteration + 1} step(s)")
                     break
 
                 # 5. Detect infinite tool call loops
@@ -8045,6 +8081,7 @@ class Agent:
                     _p(f"{C.DIM}Download it:  ollama pull {self.config.model}{C.RESET}")
                 elif e.code == 400:
                     _p(f"{C.DIM}The request was rejected — the model name or context may be invalid.{C.RESET}")
+                _tmux_notify("Error", f"HTTP {e.code}")
                 break
             except urllib.error.URLError as e:
                 self.tui.stop_spinner()
@@ -8055,6 +8092,7 @@ class Agent:
                 _p(f"\n{C.RED}Lost connection to Ollama (the local AI engine).{C.RESET}")
                 _p(f"{C.DIM}It may have crashed or been closed. Restart it:  ollama serve{C.RESET}")
                 _p(f"{C.DIM}Your conversation is still here — just try again after restarting.{C.RESET}")
+                _tmux_notify("Error", "Ollama connection lost")
                 break
             except Exception as e:
                 self.tui.stop_spinner()
@@ -8068,11 +8106,13 @@ class Agent:
                     traceback.print_exc()
                 else:
                     _p(f"{C.DIM}(Run with --debug for full details){C.RESET}")
+                _tmux_notify("Error", str(e)[:60])
                 break
         else:
             _p(f"\n{C.YELLOW}The AI took {self.MAX_ITERATIONS} steps without finishing.{C.RESET}")
             _p(f"{C.DIM}Your work so far is saved. Try breaking the task into smaller steps,{C.RESET}")
             _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
+            _tmux_notify("Stopped", f"reached {self.MAX_ITERATIONS} step limit")
 
         # Stop ESC monitor (scroll region stays active — managed by main loop)
         self._last_typeahead = _esc_monitor.get_typeahead()
@@ -8144,7 +8184,7 @@ def _read_latest_plan(agent):
             with open(plan_path, "r", encoding="utf-8") as f:
                 return f.read()[:8000]
         except Exception:
-            pass
+            pass  # plan file unreadable; try fallback below
     # Fallback: find newest .md in plans/
     plans_dir = os.path.join(agent.config.cwd, ".eve-cli", "plans")
     if os.path.isdir(plans_dir):
@@ -8158,7 +8198,7 @@ def _read_latest_plan(agent):
                 with open(md_files[0], "r", encoding="utf-8") as f:
                     return f.read()[:8000]
             except Exception:
-                pass
+                pass  # fallback plan file also unreadable; return empty string
     return ""
 
 
@@ -8280,8 +8320,9 @@ def main():
                             break
             except (EOFError, KeyboardInterrupt):
                 print()
-            except Exception:
-                pass
+            except Exception as e:
+                if config.debug:
+                    print(f"[debug] Ollama start attempt failed: {e}", file=sys.stderr)
         if not ok:
             sys.exit(1)
 
@@ -8498,11 +8539,11 @@ def main():
                 if result.returncode == 0 and result.stdout.strip():
                     return result.stdout.strip()
             except Exception:
-                pass
+                pass  # statusline script failed; fall back to built-in status line
         # Default built-in status line
-        if pct >= 80:
+        if pct >= CTX_WARN_RED:
             ctx_color = "\033[38;5;196m"
-        elif pct >= 50:
+        elif pct >= CTX_WARN_YELLOW:
             ctx_color = "\033[38;5;226m"
         else:
             ctx_color = "\033[38;5;51m"
@@ -8659,7 +8700,7 @@ def main():
                     _c51 = _ansi("\033[38;5;51m")
                     _c87 = _ansi("\033[38;5;87m")
                     _c240 = _ansi("\033[38;5;240m")
-                    bar_color = _ansi("\033[38;5;46m") if pct < 50 else _ansi("\033[38;5;226m") if pct < 80 else _ansi("\033[38;5;196m")
+                    bar_color = _ansi("\033[38;5;46m") if pct < CTX_WARN_YELLOW else _ansi("\033[38;5;226m") if pct < CTX_WARN_RED else _ansi("\033[38;5;196m")
                     bar = bar_color + "█" * filled + _c240 + "░" * (bar_len - filled) + C.RESET
                     # Session duration
                     _elapsed = int(time.time() - _session_start_time)
@@ -8672,7 +8713,7 @@ def main():
                     print(f"  {_c87}~{tokens:,}{C.RESET} / {_c240}{config.context_window:,} tokens{C.RESET}")
                     print(f"  {_c87}{msgs}{C.RESET} {_c240}total messages  ({_new_msgs} this session){C.RESET}")
                     print(f"  {_c87}Duration:{C.RESET} {_c240}{_dur_str}{C.RESET}  {_c87}Model:{C.RESET} {_c240}{config.model}{C.RESET}")
-                    if pct >= 80:
+                    if pct >= CTX_WARN_RED:
                         print(f"  {_ansi(chr(27)+'[38;5;196m')}⚠ Context almost full! Use /compact or /clear{C.RESET}")
                     print(f"  {_c51}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
                     continue
@@ -8688,9 +8729,9 @@ def main():
                     ROWS = 5
                     TOTAL = COLS * ROWS  # 100 cells
                     filled_cells = min(int(pct * TOTAL / 100), TOTAL)
-                    if pct < 50:
+                    if pct < CTX_WARN_YELLOW:
                         cell_color = _ansi("\033[38;5;46m")    # green
-                    elif pct < 80:
+                    elif pct < CTX_WARN_RED:
                         cell_color = _ansi("\033[38;5;226m")   # yellow
                     else:
                         cell_color = _ansi("\033[38;5;196m")   # red
@@ -8705,7 +8746,7 @@ def main():
                                 line += _c240 + "░" + C.RESET
                         print(line)
                     print(f"  {_c87}{pct}%{C.RESET} {_c240}({tokens:,} / {config.context_window:,} tokens){C.RESET}")
-                    if pct >= 80:
+                    if pct >= CTX_WARN_RED:
                         print(f"  {_ansi(chr(27)+'[38;5;196m')}⚠ Context nearly full — use /compact to free space{C.RESET}")
                     print(f"  {_c51}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
                     continue
@@ -9206,7 +9247,7 @@ def main():
                                     _existing["mcpServers"]["playwright"] = _mcp_data["mcpServers"]["playwright"]
                                     _mcp_data = _existing
                             except Exception:
-                                pass
+                                pass  # malformed existing config; overwrite it entirely
                         try:
                             with open(_mcp_path, "w", encoding="utf-8") as _mf:
                                 json.dump(_mcp_data, _mf, indent=2, ensure_ascii=False)
@@ -9292,7 +9333,7 @@ def main():
                             with open(_stats_file, encoding="utf-8") as _sf:
                                 _stats = json.load(_sf)
                         except Exception:
-                            pass
+                            pass  # corrupted stats file; start fresh
                     _today = datetime.now().strftime("%Y-%m-%d")
                     _today_data = _stats.get(_today, {"sessions": 0, "msgs": 0, "tool_calls": 0})
                     _total_sessions = sum(v.get("sessions", 0) for v in _stats.values())
@@ -9325,7 +9366,7 @@ def main():
                         with open(_stats_file, "w", encoding="utf-8") as _sf:
                             json.dump(_stats, _sf, ensure_ascii=False, indent=2)
                     except Exception:
-                        pass
+                        pass  # stats persistence is non-critical
                     print(f"\n  {_c51s}━━ Session Stats ━━━━━━━━━━━━━━━━━━{C.RESET}")
                     print(f"  {_c87s}This session:{C.RESET}")
                     print(f"    Duration:    {_c226s}{_dur_str}{C.RESET}")
@@ -9625,9 +9666,9 @@ def main():
                 tui._scroll_print(f"  {_ansi(chr(27)+'[38;5;240m')}(type-ahead: \"{_typeahead_text}\"){C.RESET}")
             # Auto-save after each interaction (user's work is never lost)
             session.save()
-            # Auto-compact: if context > 70%, silently compact to free space
+            # Auto-compact: if context > COMPACT_FREE_RATIO, silently compact to free space
             _pre_compact_tokens = session.get_token_estimate()
-            _auto_compact_threshold = config.context_window * 0.70
+            _auto_compact_threshold = config.context_window * COMPACT_FREE_RATIO
             if _pre_compact_tokens > _auto_compact_threshold and not session._just_compacted:
                 session.compact_if_needed()
                 _post_compact_tokens = session.get_token_estimate()
@@ -9677,18 +9718,18 @@ def main():
         try:
             readline.write_history_file(config.history_file)
         except Exception:
-            pass
+            pass  # history save is non-critical
     # Cleanup file watcher
     try:
         agent.file_watcher.stop()
     except Exception:
-        pass
+        pass  # best-effort cleanup
     # Cleanup MCP server subprocesses
     for mcp in _mcp_clients:
         try:
             mcp.stop()
         except Exception:
-            pass
+            pass  # best-effort cleanup
     print(f"\n  {_ansi(chr(27)+'[38;5;51m')}✦ Goodbye! ✦{C.RESET}")
 
 
