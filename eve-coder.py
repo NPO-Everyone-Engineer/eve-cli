@@ -1525,6 +1525,7 @@ Tool usage constraints:
 - Read: use instead of cat/head/tail. Can read text, images (base64), PDF (text extraction), notebooks (.ipynb)
 - Write: ALWAYS use absolute paths
 - Edit: old_string must match file contents exactly (whitespace matters)
+- MultiEdit: apply coordinated edits across multiple files in one call
 - Glob: use instead of find command
 - Grep: use instead of grep/rg shell commands
 - WebFetch: fetch a specific URL's content
@@ -1659,6 +1660,12 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
                   file=sys.stderr)
 
     prompt += _collect_project_context(cwd)
+
+    # Inject persistent memory
+    memory = Memory(config.config_dir)
+    mem_text = memory.format_for_prompt()
+    if mem_text:
+        prompt += mem_text
 
     return prompt
 
@@ -3603,6 +3610,90 @@ class EditTool(Tool):
             return f"Edited {file_path} ({count} replacement{'s' if count > 1 else ''})\n{diff_text}"
         except Exception as e:
             return f"Error writing file: {e}"
+
+
+class MultiEditTool(Tool):
+    """Apply multiple file edits in a single tool call."""
+    name = "MultiEdit"
+    description = (
+        "Apply multiple edits across one or more files in a single call. "
+        "Each edit specifies a file_path, old_string, and new_string. "
+        "Use this when you need to make coordinated changes across files "
+        "(e.g., rename a function and update all call sites)."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "edits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "Absolute path to the file"},
+                        "old_string": {"type": "string", "description": "Exact string to find"},
+                        "new_string": {"type": "string", "description": "Replacement string"},
+                    },
+                    "required": ["file_path", "old_string", "new_string"],
+                },
+                "description": "List of edits to apply",
+            },
+        },
+        "required": ["edits"],
+    }
+
+    def execute(self, params):
+        edits = params.get("edits", [])
+        if not edits:
+            return "Error: no edits provided"
+        if len(edits) > 20:
+            return "Error: too many edits (max 20)"
+
+        results = []
+        success_count = 0
+
+        for i, edit in enumerate(edits):
+            fpath = edit.get("file_path", "")
+            old_s = edit.get("old_string", "")
+            new_s = edit.get("new_string", "")
+
+            if not fpath or not os.path.isabs(fpath):
+                results.append(f"[{i+1}] Error: invalid path '{fpath}'")
+                continue
+
+            if os.path.islink(fpath):
+                results.append(f"[{i+1}] Error: symlink not allowed '{fpath}'")
+                continue
+            if _is_protected_path(fpath):
+                results.append(f"[{i+1}] Error: protected path '{fpath}'")
+                continue
+
+            if not os.path.isfile(fpath):
+                results.append(f"[{i+1}] Error: file not found '{fpath}'")
+                continue
+
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+
+                if old_s not in content:
+                    results.append(f"[{i+1}] Error: old_string not found in {os.path.basename(fpath)}")
+                    continue
+
+                count = content.count(old_s)
+                if count > 1:
+                    results.append(f"[{i+1}] Warning: {count} occurrences in {os.path.basename(fpath)}, replacing first only")
+
+                new_content = content.replace(old_s, new_s, 1)
+                with open(fpath, "w", encoding="utf-8", newline="") as f:
+                    f.write(new_content)
+
+                results.append(f"[{i+1}] OK: {os.path.basename(fpath)}")
+                success_count += 1
+            except OSError as e:
+                results.append(f"[{i+1}] Error: {e}")
+
+        summary = f"MultiEdit: {success_count}/{len(edits)} edits applied\n"
+        return summary + "\n".join(results)
 
 
 class GlobTool(Tool):
@@ -6191,7 +6282,7 @@ class ToolRegistry:
 
     def register_defaults(self):
         """Register all built-in tools."""
-        for cls in [BashTool, ReadTool, WriteTool, EditTool, GlobTool,
+        for cls in [BashTool, ReadTool, WriteTool, EditTool, MultiEditTool, GlobTool,
                     GrepTool, WebFetchTool, WebSearchTool, NotebookEditTool,
                     TaskCreateTool, TaskListTool, TaskGetTool, TaskUpdateTool,
                     AskUserQuestionTool]:
@@ -6208,10 +6299,10 @@ class PermissionMgr:
 
     SAFE_TOOLS = {"Read", "Glob", "Grep", "SubAgent", "AskUserQuestion",
                    "TaskCreate", "TaskList", "TaskGet", "TaskUpdate"}
-    ASK_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit"}
+    ASK_TOOLS = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"}
     NETWORK_TOOLS = {"WebFetch", "WebSearch"}
 
-    _NO_PERSIST_ALLOW = {"Bash", "Write", "Edit", "NotebookEdit"}
+    _NO_PERSIST_ALLOW = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"}
 
     def __init__(self, config):
         self.yes_mode = config.yes_mode
@@ -6666,6 +6757,91 @@ def _extract_tool_calls_from_text(text, known_tools=None):
             seen.add(key)
             deduped.append(tc)
     return deduped, remaining_text.strip()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Memory — Persistent cross-session knowledge
+# ════════════════════════════════════════════════════════════════════════════════
+
+class Memory:
+    """Persistent memory for cross-session knowledge."""
+
+    MAX_ENTRIES = 100
+    MAX_ENTRY_SIZE = 500  # chars per entry
+
+    def __init__(self, config_dir):
+        self._dir = os.path.join(config_dir, "memory")
+        os.makedirs(self._dir, exist_ok=True)
+        self._file = os.path.join(self._dir, "memory.json")
+        self._entries = self._load()
+
+    def _load(self):
+        if not os.path.isfile(self._file) or os.path.islink(self._file):
+            return []
+        try:
+            with open(self._file, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data[:self.MAX_ENTRIES]
+        except (json.JSONDecodeError, OSError):
+            pass
+        return []
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self._file), exist_ok=True)
+            with open(self._file, "w", encoding="utf-8") as f:
+                json.dump(self._entries, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def add(self, content, category="general"):
+        """Add a memory entry."""
+        content = content[:self.MAX_ENTRY_SIZE]
+        entry = {
+            "content": content,
+            "category": category,
+            "created": datetime.now().isoformat(),
+        }
+        for e in self._entries:
+            if e.get("content") == content:
+                return
+        self._entries.append(entry)
+        if len(self._entries) > self.MAX_ENTRIES:
+            self._entries = self._entries[-self.MAX_ENTRIES:]
+        self._save()
+
+    def remove(self, index):
+        """Remove entry by index."""
+        if 0 <= index < len(self._entries):
+            self._entries.pop(index)
+            self._save()
+            return True
+        return False
+
+    def search(self, query):
+        """Simple keyword search."""
+        query_lower = query.lower()
+        return [e for e in self._entries if query_lower in e.get("content", "").lower()]
+
+    def format_for_prompt(self, max_chars=1500):
+        """Format recent memories for system prompt injection."""
+        if not self._entries:
+            return ""
+        lines = []
+        total = 0
+        for e in reversed(self._entries):
+            line = f"- [{e.get('category', 'general')}] {e['content']}"
+            if total + len(line) > max_chars:
+                break
+            lines.append(line)
+            total += len(line)
+        if not lines:
+            return ""
+        return "\n# Persistent Memory\n" + "\n".join(reversed(lines)) + "\n"
+
+    def list_all(self):
+        return list(self._entries)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -7258,9 +7434,9 @@ class TUI:
                     "/status", "/save", "/compact", "/yes", "/no", "/tokens",
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
-                    "/checkpoint", "/rollback", "/autotest", "/watch", "/skills",
+                    "/checkpoint", "/rollback", "/autotest", "/gentest", "/watch", "/skills",
                     "/browser", "/fork", "/index", "/pr", "/gh",
-                    "/team",
+                    "/team", "/memory",
                 ]
                 def _completer(text, state):
                     try:
@@ -7959,6 +8135,7 @@ class TUI:
             "Read": ("📄", _ansi("\033[38;5;87m")),
             "Write": ("✏️ ", _ansi("\033[38;5;198m")),
             "Edit": ("📝", _ansi("\033[38;5;208m")),
+            "MultiEdit": ("📝", _ansi("\033[38;5;208m")),
             "Glob": ("🔍", _ansi("\033[38;5;51m")),
             "Grep": ("🔎", _ansi("\033[38;5;39m")),
             "WebFetch": ("🌐", _ansi("\033[38;5;46m")),
@@ -8026,6 +8203,14 @@ class TUI:
                     break
                 _p(f"  {_dg}  + {ln[:100]}{C.RESET}")
                 shown += 1
+        elif name == "MultiEdit":
+            edits = params.get("edits", [])
+            _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}\u2192{C.RESET} {C.WHITE}{len(edits)} edits{C.RESET}")
+            for e in edits[:5]:
+                fp = os.path.basename(e.get("file_path", ""))
+                _p(f"  {_ansi(chr(27)+'[38;5;240m')}  {fp}{C.RESET}")
+            if len(edits) > 5:
+                _p(f"  {_ansi(chr(27)+'[38;5;240m')}  ... +{len(edits)-5} more{C.RESET}")
         elif name in ("Glob", "Grep"):
             pat = params.get("pattern", "")
             search_path = params.get("path", "")
@@ -8095,6 +8280,9 @@ class TUI:
             elif name in ("Write", "Edit"):
                 fp = params.get("file_path", "")
                 key_arg = f" {os.path.basename(fp)}" if fp else ""
+            elif name == "MultiEdit":
+                edits = params.get("edits", [])
+                key_arg = f" {len(edits)} edits"
             elif name in ("Glob", "Grep"):
                 key_arg = " `" + _truncate_to_display_width(params.get("pattern", ""), 60) + "`"
             elif name == "WebSearch":
@@ -8420,12 +8608,19 @@ class TUI:
   {_c198}/rollback{C.RESET}          Rollback to last checkpoint
   {_c51}━━ Extensions {sep[13:]}{C.RESET}
   {_c198}/autotest{C.RESET}          Toggle auto syntax+test after edits
+  {_c198}/gentest{C.RESET} <file>    Generate unit tests for a Python file
   {_c198}/watch{C.RESET}             Toggle file watcher
   {_c198}/skills{C.RESET}            List loaded skills
   {_c198}/hooks{C.RESET}             List loaded hooks
   {_c198}/index{C.RESET}             Code intelligence (symbols, definitions, references)
   {_c51}━━ Teams {sep[8:]}{C.RESET}
   {_c198}/team{C.RESET} <goal>       Launch agent team to work on goal collaboratively
+  {_c51}━━ Memory {sep[9:]}{C.RESET}
+  {_c198}/memory{C.RESET}             List stored memories
+  {_c198}/memory add{C.RESET} <text>  Save a persistent memory (prefix [category] optional)
+  {_c198}/memory rm{C.RESET} <index>  Remove a memory by index
+  {_c198}/memory search{C.RESET} <q>  Search memories by keyword
+  {_c198}/memory clear{C.RESET}       Clear all memories
   {_c51}━━ Keyboard {sep[11:]}{C.RESET}
   {_c198}Ctrl+C{C.RESET}             Stop current task
   {_c198}Ctrl+C x2{C.RESET}          Exit (within 1.5s)
@@ -10405,6 +10600,101 @@ def main():
                         print(f"{C.YELLOW}{msg}{C.RESET}")
                     continue
 
+                # ── Generate tests ───────────────────────────────────
+                elif cmd == "/gentest":
+                    if not args:
+                        print(f"{C.YELLOW}Usage: /gentest <file.py>{C.RESET}")
+                        continue
+                    target_file = args.strip()
+                    if not os.path.isabs(target_file):
+                        target_file = os.path.join(config.cwd, target_file)
+                    if not os.path.isfile(target_file):
+                        print(f"{C.RED}File not found: {target_file}{C.RESET}")
+                        continue
+                    try:
+                        with open(target_file, "r", encoding="utf-8", errors="replace") as f:
+                            source_code = f.read(10000)
+                    except OSError as e:
+                        print(f"{C.RED}Cannot read file: {e}{C.RESET}")
+                        continue
+                    test_style = ""
+                    tests_dir = os.path.join(config.cwd, "tests")
+                    if os.path.isdir(tests_dir):
+                        for fname in os.listdir(tests_dir):
+                            if fname.startswith("test_") and fname.endswith(".py"):
+                                try:
+                                    with open(os.path.join(tests_dir, fname), "r", encoding="utf-8", errors="replace") as f:
+                                        test_style = f.read(3000)
+                                    break
+                                except OSError:
+                                    pass
+                    basename = os.path.basename(target_file)
+                    test_filename = f"test_{basename}"
+                    test_path = os.path.join(config.cwd, "tests", test_filename)
+                    style_ref = ""
+                    if test_style:
+                        style_ref = f"\n\nExisting test style reference:\n```python\n{test_style}\n```\nMatch this style."
+                    gen_messages = [
+                        {"role": "system", "content": (
+                            "You are a test generator. Given a Python source file, generate comprehensive "
+                            "unit tests using unittest. Include edge cases and error cases. "
+                            "Output ONLY the Python test code, nothing else. No markdown fences."
+                            f"{style_ref}"
+                        )},
+                        {"role": "user", "content": f"Generate tests for this file ({basename}):\n\n```python\n{source_code}\n```"},
+                    ]
+                    tui.start_spinner("Generating tests")
+                    try:
+                        resp = client.chat(
+                            model=config.model,
+                            messages=gen_messages,
+                            tools=None,
+                            stream=False,
+                        )
+                    finally:
+                        tui.stop_spinner()
+                    test_code = ""
+                    if isinstance(resp, dict):
+                        choices = resp.get("choices", [])
+                        if choices:
+                            test_code = choices[0].get("message", {}).get("content", "").strip()
+                    test_code = re.sub(r'<think>.*?</think>\s*', '', test_code, flags=re.DOTALL)
+                    test_code = re.sub(r'^```python\s*\n?', '', test_code)
+                    test_code = re.sub(r'\n?```\s*$', '', test_code)
+                    if not test_code:
+                        print(f"{C.RED}Failed to generate tests.{C.RESET}")
+                        continue
+                    os.makedirs(os.path.join(config.cwd, "tests"), exist_ok=True)
+                    init_file = os.path.join(config.cwd, "tests", "__init__.py")
+                    if not os.path.exists(init_file):
+                        open(init_file, "w").close()
+                    if os.path.exists(test_path):
+                        print(f"{C.YELLOW}Test file already exists: {test_path}{C.RESET}")
+                        print(f"{C.DIM}Preview:{C.RESET}")
+                        for ln in test_code.split("\n")[:20]:
+                            print(f"  {C.DIM}{ln}{C.RESET}")
+                        if test_code.count("\n") > 20:
+                            print(f"  {C.DIM}... ({test_code.count(chr(10))+1} lines total){C.RESET}")
+                        if not config.yes_mode:
+                            ans = input(f"{C.CYAN}Overwrite? [y/N] {C.RESET}").strip().lower()
+                            if ans not in ("y", "yes"):
+                                continue
+                    with open(test_path, "w", encoding="utf-8") as f:
+                        f.write(test_code)
+                    print(f"{C.GREEN}Generated: {test_path}{C.RESET}")
+                    print(f"{C.DIM}({test_code.count(chr(10))+1} lines, run with: python3 -m unittest tests.{test_filename[:-3]}){C.RESET}")
+                    try:
+                        result = subprocess.run(
+                            ["python3", "-m", "py_compile", test_path],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        if result.returncode != 0:
+                            print(f"{C.YELLOW}Warning: Generated test has syntax errors:{C.RESET}")
+                            print(f"{C.DIM}{result.stderr}{C.RESET}")
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+                    continue
+
                 # ── Auto test toggle ─────────────────────────────────
                 elif cmd == "/autotest":
                     agent.auto_test.enabled = not agent.auto_test.enabled
@@ -10813,6 +11103,55 @@ def main():
                     _debug_scroll_region(tui)
                     continue
 
+                elif cmd == "/memory":
+                    memory = Memory(config.config_dir)
+                    _mem_parts = user_input.split(None, 1)
+                    args = _mem_parts[1].strip() if len(_mem_parts) > 1 else ""
+                    if not args:
+                        entries = memory.list_all()
+                        if not entries:
+                            print(f"{C.DIM}No memories stored. Use /memory add <text> to add.{C.RESET}")
+                        else:
+                            print(f"\n  {_ansi(chr(27)+'[38;5;51m')}━━ Memory ({len(entries)} entries) ━━{C.RESET}")
+                            for i, e in enumerate(entries):
+                                cat = e.get("category", "general")
+                                print(f"  {_ansi(chr(27)+'[38;5;240m')}[{i}]{C.RESET} {_ansi(chr(27)+'[38;5;87m')}({cat}){C.RESET} {e['content']}")
+                            print()
+                    elif args.startswith("add "):
+                        text = args[4:].strip()
+                        if text:
+                            cat_match = re.match(r'\[(\w+)\]\s*(.*)', text)
+                            if cat_match:
+                                memory.add(cat_match.group(2), cat_match.group(1))
+                            else:
+                                memory.add(text)
+                            print(f"{C.GREEN}Memory added.{C.RESET}")
+                        else:
+                            print(f"{C.YELLOW}Usage: /memory add <text>{C.RESET}")
+                    elif args.startswith("remove ") or args.startswith("rm "):
+                        idx_str = args.split(None, 1)[1] if len(args.split()) > 1 else ""
+                        try:
+                            idx = int(idx_str)
+                            if memory.remove(idx):
+                                print(f"{C.GREEN}Memory #{idx} removed.{C.RESET}")
+                            else:
+                                print(f"{C.RED}Invalid index.{C.RESET}")
+                        except ValueError:
+                            print(f"{C.YELLOW}Usage: /memory remove <index>{C.RESET}")
+                    elif args.startswith("search "):
+                        query = args[7:].strip()
+                        results = memory.search(query)
+                        if results:
+                            for e in results:
+                                print(f"  {_ansi(chr(27)+'[38;5;87m')}({e.get('category', 'general')}){C.RESET} {e['content']}")
+                        else:
+                            print(f"{C.DIM}No matching memories.{C.RESET}")
+                    elif args == "clear":
+                        memory._entries.clear()
+                        memory._save()
+                        print(f"{C.GREEN}All memories cleared.{C.RESET}")
+                    continue
+
                 elif cmd == "/team":
                     parts = user_input.split(None, 1)
                     team_args = parts[1].strip() if len(parts) > 1 else ""
@@ -10882,9 +11221,9 @@ def main():
                                      "/tokens", "/commit", "/diff", "/git", "/plan",
                                      "/approve", "/act", "/execute", "/undo", "/init",
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",
-                                     "/rollback", "/autotest", "/skills", "/hooks",
+                                     "/rollback", "/autotest", "/gentest", "/skills", "/hooks",
                                      "/image", "/browser", "/fork", "/index",
-                                     "/pr", "/gh", "/team"]
+                                     "/pr", "/gh", "/team", "/memory"]
                         _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                         if not _close:
                             _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []
