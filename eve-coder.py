@@ -115,7 +115,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -9752,7 +9752,7 @@ class Agent:
                     _p(f"\n{C.BBLUE}assistant{C.RESET}: ", end="")
                     self.tui._render_markdown(result)
                     _p()
-                    # Removed 'return' → continue to main loop so LLM can handle follow-up tasks
+                    # 'return' を削除 → メインループに進みLLMが後続タスクを処理する
 
         # RAG: inject relevant context before the user message
         if self.rag_engine and self.config.rag:
