@@ -403,7 +403,11 @@ vaporwave_progress() {
 #   → 戻り値: コマンドの終了コード
 
 # [SEC] Use mktemp for unpredictable temp file path (avoid symlink attacks)
-SPINNER_LOG="$(mktemp /tmp/eve-cli-install-XXXXXX.log 2>/dev/null || echo "/tmp/eve-cli-install-$RANDOM-$$.log")"
+# Fail-closed: do NOT fall back to predictable paths
+SPINNER_LOG="$(mktemp /tmp/eve-cli-install-XXXXXX.log)" || {
+    echo -e "${RED}❌ Error: Failed to create temporary log file${NC}"
+    exit 1
+}
 
 # [SEC] Ensure temp log is cleaned up on exit or interrupt
 _INSTALL_OK=0
@@ -460,14 +464,49 @@ sha256_file() {
     fi
 }
 
+# [SEC] Verify downloaded file against expected SHA-256 checksum
+# Usage: verify_checksum <file> <expected_hash> <label>
+# Returns: 0 if match, 1 if mismatch or error
+verify_checksum() {
+    local file="$1"
+    local expected="$2"
+    local label="$3"
+    
+    if [ -z "$expected" ]; then
+        vapor_warn "No checksum provided for ${label} (skipping verification)"
+        return 0
+    fi
+    
+    local actual
+    actual="$(sha256_file "$file" 2>/dev/null)" || {
+        vapor_error "Failed to compute checksum for ${label}"
+        return 1
+    }
+    
+    if [ "$actual" != "$expected" ]; then
+        vapor_error "Checksum verification failed for ${label}"
+        vapor_error "  Expected: ${expected}"
+        vapor_error "  Actual:   ${actual}"
+        vapor_error "File may be corrupted or tampered. Aborting."
+        rm -f "$file"
+        return 1
+    fi
+    
+    vapor_info "Checksum verified for ${label}"
+    return 0
+}
+
 download_to_temp() {
     local url="$1"
     local suffix="${2:-.tmp}"
     local tmp
-    tmp="$(mktemp "/tmp/eve-cli-download-XXXXXX${suffix}" 2>/dev/null || true)"
-    if [ -z "$tmp" ]; then
-        tmp="/tmp/eve-cli-download-${RANDOM}-$$${suffix}"
-    fi
+    # [SEC] Fail-closed: do NOT fall back to predictable paths
+    tmp="$(mktemp "/tmp/eve-cli-download-XXXXXX${suffix}")" || {
+        vapor_error "Failed to create temporary file for download"
+        return 1
+    }
+    # [SEC] Restrict file permissions (owner read/write only)
+    chmod 600 "$tmp"
     if ! curl -fsSL "$url" -o "$tmp"; then
         rm -f "$tmp"
         return 1
@@ -802,10 +841,26 @@ if [ "$IS_MAC" -eq 1 ]; then
         vapor_warn "⚠️  You may also be asked for your Mac password (sudo)."
         vapor_info "Homebrew 🍺 $(msg installing)"
         echo ""
+        
+        # [SEC] Download Homebrew installer with optional checksum verification
+        # Set EVE_CLI_HOMEBREW_INSTALLER_HASH to enable strict verification
         local_brew_installer="$(download_to_temp "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh" ".sh")"
+        if [ -z "${local_brew_installer:-}" ]; then
+            vapor_error "Failed to download Homebrew installer"
+            exit 1
+        fi
+        
+        # [SEC] Verify checksum if provided via environment variable
+        if [ -n "${EVE_CLI_HOMEBREW_INSTALLER_HASH:-}" ]; then
+            if ! verify_checksum "$local_brew_installer" "$EVE_CLI_HOMEBREW_INSTALLER_HASH" "Homebrew installer"; then
+                vapor_error "Homebrew installer verification failed"
+                exit 1
+            fi
+        fi
+        
         # NOTE: Do NOT use run_with_spinner here — Homebrew installer needs
         # interactive TTY for sudo password prompt. Spinner would swallow it.
-        if [ -n "${local_brew_installer:-}" ] && /bin/bash "$local_brew_installer"; then
+        if /bin/bash "$local_brew_installer"; then
             if [ -f /opt/homebrew/bin/brew ]; then
                 eval "$(/opt/homebrew/bin/brew shellenv)"
             fi
@@ -835,8 +890,24 @@ else
         # sudo internally and needs interactive TTY for password prompt.
         vapor_info "Ollama 🦙 $(msg installing)"
         echo ""
+        
+        # [SEC] Download Ollama installer with optional checksum verification
+        # Set EVE_CLI_OLLAMA_INSTALLER_HASH to enable strict verification
         local_ollama_installer="$(download_to_temp "https://ollama.com/install.sh" ".sh")"
-        if [ -n "${local_ollama_installer:-}" ] && sh "$local_ollama_installer"; then
+        if [ -z "${local_ollama_installer:-}" ]; then
+            vapor_error "Failed to download Ollama installer"
+            exit 1
+        fi
+        
+        # [SEC] Verify checksum if provided via environment variable
+        if [ -n "${EVE_CLI_OLLAMA_INSTALLER_HASH:-}" ]; then
+            if ! verify_checksum "$local_ollama_installer" "$EVE_CLI_OLLAMA_INSTALLER_HASH" "Ollama installer"; then
+                vapor_error "Ollama installer verification failed"
+                exit 1
+            fi
+        fi
+        
+        if sh "$local_ollama_installer"; then
             vapor_success "Ollama 🦙 $(msg install_done)"
         else
             vapor_error "Ollama 🦙 $(msg install_fail)"
