@@ -115,7 +115,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -10832,6 +10832,9 @@ def main():
 
     # One-shot mode
     if config.prompt:
+        # Build system prompt once (shared across all loop iterations)
+        system_prompt = _build_system_prompt(config)
+        
         if config.loop_mode:
             # Loop mode: re-run until done_string is detected or max iterations reached
             for loop_i in range(1, config.max_loop_iterations + 1):
@@ -10841,7 +10844,7 @@ def main():
                 print(f"{'='*60}")
 
                 # Create new session and agent for each iteration (no history carryover)
-                session = Session(config)
+                session = Session(config, system_prompt)
                 agent = Agent(config, client, registry, permissions, session, tui)
                 agent.run(config.prompt)
 
@@ -10853,6 +10856,8 @@ def main():
                 print(f"\n  Loop ended: reached max iterations ({config.max_loop_iterations}).")
         else:
             # Standard one-shot mode
+            session = Session(config, system_prompt)
+            agent = Agent(config, client, registry, permissions, session, tui)
             agent.run(config.prompt)
         session.save()
         if config.output_format in ("json", "stream-json"):
