@@ -10854,12 +10854,14 @@ def main():
     if config.prompt:
         # Build system prompt once (shared across all loop iterations)
         system_prompt = _build_system_prompt(config)
+        exit_code = 0  # Track exit code for CI/CD
         
         if config.loop_mode:
             # Loop mode: re-run until done_string is detected or max iterations/time reached
             import time
             loop_start_time = time.time()
             loop_i = 0
+            loop_success = False
             while loop_i < config.max_loop_iterations:
                 loop_i += 1
                 
@@ -10868,6 +10870,7 @@ def main():
                     elapsed_hours = (time.time() - loop_start_time) / 3600.0
                     if elapsed_hours >= config.max_loop_hours:
                         print(f"\n  Loop ended: reached max time ({config.max_loop_hours:.1f} hours).")
+                        exit_code = 2  # Timeout
                         break
                     remaining_hours = config.max_loop_hours - elapsed_hours
                     print(f"\n{'='*60}")
@@ -10882,19 +10885,51 @@ def main():
                 # Create new session and agent for each iteration (no history carryover)
                 session = Session(config, system_prompt)
                 agent = Agent(config, client, registry, permissions, session, tui)
-                agent.run(config.prompt)
+                try:
+                    agent.run(config.prompt)
+                except Exception as e:
+                    print(f"\n{C.RED}Loop iteration failed: {e}{C.RESET}")
+                    exit_code = 1  # Error
+                    if config.output_format in ("json", "stream-json"):
+                        _output = {
+                            "role": "error",
+                            "error": str(e),
+                            "model": config.model,
+                            "session_id": session.session_id,
+                        }
+                        print(json.dumps(_output, ensure_ascii=False))
+                    sys.exit(exit_code)
 
                 last_output = agent.get_last_output()
                 if config.done_string in last_output:
                     print(f"\n  Loop complete: '{config.done_string}' detected.")
+                    loop_success = True
                     break
             else:
                 print(f"\n  Loop ended: reached max iterations ({config.max_loop_iterations}).")
+                exit_code = 3  # Max iterations reached without success
+            
+            # Set success if loop completed normally
+            if loop_success and exit_code == 0:
+                exit_code = 0
         else:
             # Standard one-shot mode
             session = Session(config, system_prompt)
             agent = Agent(config, client, registry, permissions, session, tui)
-            agent.run(config.prompt)
+            try:
+                agent.run(config.prompt)
+            except Exception as e:
+                print(f"\n{C.RED}Execution failed: {e}{C.RESET}")
+                exit_code = 1
+                if config.output_format in ("json", "stream-json"):
+                    _output = {
+                        "role": "error",
+                        "error": str(e),
+                        "model": config.model,
+                    }
+                    print(json.dumps(_output, ensure_ascii=False))
+                sys.exit(exit_code)
+        
         session.save()
         if config.output_format in ("json", "stream-json"):
             # Extract last assistant message from session
@@ -10908,9 +10943,10 @@ def main():
                 "content": _last_content,
                 "model": config.model,
                 "session_id": session.session_id,
+                "exit_code": exit_code,
             }
             print(json.dumps(_output, ensure_ascii=False))
-        return
+        sys.exit(exit_code)
 
     # Interactive mode
     _last_ctrl_c = [0.0]  # mutable container for closure
@@ -12458,6 +12494,7 @@ Review this code for:
         except Exception:
             pass
     print(f"\n  {_ansi(chr(27)+'[38;5;51m')}✦ Goodbye! ✦{C.RESET}")
+    sys.exit(0)  # Normal exit
 
 
 if __name__ == "__main__":
