@@ -1542,6 +1542,119 @@ def _get_vram_gb():
     return 0
 
 
+def _calc_subagent_parallel_cap(ram_gb=None, cpu_count=None, hard_max=8):
+    """Calculate dynamic parallel capacity for sub-agents based on machine specs.
+    
+    Args:
+        ram_gb: System RAM in GB (auto-detected if None)
+        cpu_count: CPU core count (auto-detected if None)
+        hard_max: Absolute maximum parallel agents (default: 8)
+    
+    Returns:
+        int: Recommended parallel agent limit (1 to hard_max)
+    
+    Rules:
+        - RAM 16GB未満 または CPU 4コア以下: 上限 2
+        - RAM 16-31GB または CPU 8コア以下: 上限 4
+        - RAM 32-63GB または CPU 12コア以下: 上限 6
+        - RAM 64GB以上 かつ CPU 12コア超: 上限 8
+        - 最終値は min(推奨値，hard_max)、下限は 1
+    """
+    # Auto-detect if not provided
+    if ram_gb is None:
+        ram_gb = _get_ram_gb()
+    if cpu_count is None:
+        cpu_count = os.cpu_count() or 4  # Fallback to 4 if detection fails
+    
+    # Validate inputs (fail-safe)
+    if not isinstance(ram_gb, (int, float)) or ram_gb <= 0:
+        ram_gb = 16  # Fallback assumption
+    if not isinstance(cpu_count, int) or cpu_count <= 0:
+        cpu_count = 4  # Fallback assumption
+    
+    # Calculate recommended limit based on RAM and CPU
+    # Use the more generous of RAM-based or CPU-based limits
+    if ram_gb < 16 or cpu_count <= 4:
+        recommended = 2
+    elif ram_gb < 32 or cpu_count <= 8:
+        recommended = 4
+    elif ram_gb < 64 or cpu_count <= 12:
+        recommended = 6
+    else:
+        recommended = 8
+    
+    # Apply hard max and ensure minimum of 1
+    result = max(1, min(recommended, hard_max))
+    return result
+
+
+def _get_subagent_max_parallel():
+    """Get max parallel sub-agents from config/env or calculate dynamically.
+    
+    Checks in order:
+    1. Environment variable SUBAGENT_MAX_PARALLEL
+    2. Config file setting
+    3. Dynamic calculation based on machine specs
+    
+    Returns:
+        int: Max parallel agents (1-12)
+    """
+    # Check environment variable first (highest priority)
+    env_val = os.environ.get("SUBAGENT_MAX_PARALLEL")
+    if env_val:
+        try:
+            val = int(env_val)
+            if 1 <= val <= 12:
+                return val
+            # If out of range, clamp to safe bounds
+            return max(1, min(val, 12))
+        except ValueError:
+            pass  # Invalid value, fall through to dynamic calculation
+    
+    # Check config file
+    config_dir = os.path.expanduser("~/.config/eve-cli")
+    config_file = os.path.join(config_dir, "config")
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("SUBAGENT_MAX_PARALLEL="):
+                        val = int(line.split("=", 1)[1].strip())
+                        if 1 <= val <= 12:
+                            return val
+                        return max(1, min(val, 12))
+        except (ValueError, IndexError, OSError):
+            pass  # Invalid value, fall through to dynamic calculation
+    
+    # Dynamic calculation with hard max of 8
+    return _calc_subagent_parallel_cap(hard_max=8)
+
+
+def _get_team_max_agents():
+    """Get max team agents from config/env or calculate dynamically.
+    
+    Similar to _get_subagent_max_parallel but for AgentTeam.
+    Checks SUBAGENT_MAX_PARALLEL first, then TEAM_MAX_AGENTS.
+    
+    Returns:
+        int: Max team agents (1-12)
+    """
+    # Check TEAM_MAX_AGENTS environment variable
+    env_val = os.environ.get("TEAM_MAX_AGENTS")
+    if env_val:
+        try:
+            val = int(env_val)
+            if 1 <= val <= 12:
+                return val
+            return max(1, min(val, 12))
+        except ValueError:
+            pass
+    
+    # Check SUBAGENT_MAX_PARALLEL as fallback
+    return _get_subagent_max_parallel()
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # System Prompt
 # ════════════════════════════════════════════════════════════════════════════════
@@ -6467,12 +6580,14 @@ class ParallelAgentTool(Tool):
 
     @property
     def parameters(self):
+        # Get dynamic max based on machine specs
+        max_parallel = _get_subagent_max_parallel()
         return {
             "type": "object",
             "properties": {
                 "tasks": {
                     "type": "array",
-                    "description": "Array of task objects, each with 'prompt' (required) and optional 'max_turns' (default 10) and 'allow_writes' (default false)",
+                    "description": f"Array of task objects (max {max_parallel} tasks based on system specs)",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -6483,7 +6598,7 @@ class ParallelAgentTool(Tool):
                         "required": ["prompt"],
                     },
                     "minItems": 1,
-                    "maxItems": 4,
+                    "maxItems": max_parallel,
                 },
             },
             "required": ["tasks"],
@@ -6493,8 +6608,14 @@ class ParallelAgentTool(Tool):
         tasks = params.get("tasks", [])
         if not tasks:
             return "Error: at least one task is required"
-        if len(tasks) > 4:
-            tasks = tasks[:4]
+        
+        # Get dynamic max and clamp tasks
+        max_parallel = _get_subagent_max_parallel()
+        original_count = len(tasks)
+        if len(tasks) > max_parallel:
+            tasks = tasks[:max_parallel]
+            with _print_lock:
+                _scroll_aware_print(f"{C.DIM}  Note: Clamped from {original_count} to {max_parallel} tasks (system limit){C.RESET}", flush=True)
 
         with _print_lock:
             _scroll_aware_print(f"\n  {_ansi(chr(27)+'[38;5;141m')}🤖 Launching {len(tasks)} parallel agents...{C.RESET}",
@@ -6550,7 +6671,7 @@ class AgentTeam:
     Communication: via the shared _task_store
     """
 
-    MAX_TEAMMATES = 4
+    MAX_TEAMMATES = 4  # Dynamic: updated in __init__ based on system specs
     MAX_TEAM_DURATION = 600  # 10 min hard cap
 
     def __init__(self, config, client, registry, permissions):
@@ -6561,6 +6682,8 @@ class AgentTeam:
         self._teammates = {}   # name -> thread
         self._results = {}     # name -> result_text
         self._stop_event = threading.Event()
+        # Override with dynamic max based on system specs
+        self.MAX_TEAMMATES = _get_team_max_agents()
 
     def run(self, goal, num_teammates=2, allow_writes=False):
         """Run a team session: create tasks from goal, then dispatch teammates.
@@ -12278,10 +12401,13 @@ Review this code for:
                     team_args = parts[1].strip() if len(parts) > 1 else ""
 
                     if not team_args:
+                        max_agents = _get_team_max_agents()
                         print(f"  {C.CYAN}Usage: /team <goal>{C.RESET}")
                         print(f"  {C.DIM}Decomposes a goal into tasks and runs multiple agents in parallel.{C.RESET}")
-                        print(f"  {C.DIM}Options: /team -n 3 <goal>  (set number of agents, default 2){C.RESET}")
-                        print(f"  {C.DIM}         /team -w <goal>    (allow write operations){C.RESET}")
+                        print(f"  {C.DIM}Options: /team -n <N> <goal>  (set number of agents, default 2, max {max_agents}){C.RESET}")
+                        print(f"  {C.DIM}         /team -w <goal>     (allow write operations){C.RESET}")
+                        print(f"  {C.DIM}Note: Max agents is dynamically calculated based on system specs.{C.RESET}")
+                        print(f"  {C.DIM}      Override with SUBAGENT_MAX_PARALLEL or TEAM_MAX_AGENTS env vars.{C.RESET}")
                         continue
 
                     # Parse options
