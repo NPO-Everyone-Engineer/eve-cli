@@ -1,0 +1,58 @@
+# Python
+*.pyc
+__pycache__/
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Node
+node_modules/
+
+# Secrets - NEVER commit these
+.env
+.env.*
+*credentials*
+*secret*
+*api_key*
+*.pem
+*.key
+
+# Claude Code
+.claude/
+
+# qwen3.5 rules
+.qwen/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# vibe-local RAG index (local, user-specific — not for version control)
+.vibe/rag/
+
+# EvE CLI local config (project-specific commands, skills, hooks — user-defined)
+.eve-cli/
+
+# Local test artifacts
+tests/
+
+# Dev notes
+make.md
+
+# Docs
+00_Docs/
+
+# Markdown docs
+*.md
+!README.md
