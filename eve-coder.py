@@ -115,7 +115,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.0.2"
+__version__ = "2.1.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -9738,14 +9738,16 @@ class Agent:
                 if pa_tool:
                     if not skip_add:
                         self.session.add_user_message(user_input)
+                        skip_add = True  # Prevent double-add in main loop
                     tasks_payload = [{"prompt": t, "max_turns": 10} for t in parallel_tasks]
                     _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}⚡ Auto-detected {len(parallel_tasks)} parallel tasks{C.RESET}")
                     result = pa_tool.execute({"tasks": tasks_payload})
+                    # Add parallel result to conversation and continue to main loop for follow-up tasks
                     self.session.add_assistant_message(result, [])
                     _p(f"\n{C.BBLUE}assistant{C.RESET}: ", end="")
                     self.tui._render_markdown(result)
                     _p()
-                    return
+                    # Removed 'return' → continue to main loop so LLM can handle follow-up tasks
 
         # RAG: inject relevant context before the user message
         if self.rag_engine and self.config.rag:
