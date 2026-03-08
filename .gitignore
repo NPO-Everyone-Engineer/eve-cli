@@ -51,9 +51,10 @@ tests/__pycache__/
 # Dev notes
 make.md
 
-# Docs
-00_Docs/
-
 # Markdown docs
 *.md
 !README.md
+!00_Docs/implementation-status.md
+
+# Docs
+00_Docs/
