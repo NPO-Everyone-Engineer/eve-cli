@@ -115,7 +115,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -4959,6 +4959,11 @@ class AskUserQuestionTool(Tool):
 
         try:
             answer = input(f"  {_ansi(C.CYAN)}>{_ansi(C.RESET)} ").strip()
+            # Strip terminal escape sequences (same as TUI.get_input)
+            import re as _re
+            answer = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z~]', '', answer)
+            answer = _re.sub(r'(?:\x1b\[)?27;2;13~', '', answer)
+            answer = answer.strip()
         except (EOFError, KeyboardInterrupt):
             return "User cancelled the question."
 
