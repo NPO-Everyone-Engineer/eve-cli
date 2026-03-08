@@ -10981,7 +10981,6 @@ def main():
         
         if config.loop_mode:
             # Loop mode: re-run until done_string is detected or max iterations/time reached
-            import time
             loop_start_time = time.time()
             loop_i = 0
             loop_success = False
