@@ -115,7 +115,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -2232,7 +2232,7 @@ class OllamaClient:
         # Validate message order before API call (prevent 500 errors from malformed tool_call/tool sequences)
         # Create a temporary session to validate the messages
         from types import SimpleNamespace
-        _temp_session = SimpleNamespace(messages=messages, _estimate_tokens=self._estimate_tokens)
+        _temp_session = SimpleNamespace(messages=messages, _estimate_tokens=Session._estimate_tokens)
         # Monkey-patch the validate method to work on the temp session
         _temp_session.validate_message_order = lambda: self._validate_messages_static(messages)
         _is_valid, _err_msg = _temp_session.validate_message_order()
