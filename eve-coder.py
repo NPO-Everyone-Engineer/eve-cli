@@ -115,7 +115,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.1.2"
+__version__ = "2.2.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -771,6 +771,7 @@ class Config:
         self.loop_mode = False
         self.max_loop_iterations = 5
         self.done_string = "DONE"
+        self.max_loop_hours = None  # Time-based limit (default: no limit)
 
         # Paths (primary: eve-cli, with backward compat for old eve-coder dirs)
         if os.name == "nt":
@@ -957,6 +958,8 @@ class Config:
                             help="Max re-runs in loop mode (default: 5)")
         parser.add_argument("--done-string", default="DONE",
                             help="Completion signal string that stops the loop (default: DONE)")
+        parser.add_argument("--max-loop-hours", type=float, default=None,
+                            help="Max execution time in hours for loop mode (default: no limit, max: 72)")
         # RAG options
         parser.add_argument("--rag", action="store_true", help="Enable RAG mode")
         parser.add_argument("--rag-mode", choices=["query"], default="query",
@@ -1025,6 +1028,16 @@ class Config:
             self.max_loop_iterations = args.max_loop_iterations
         if args.done_string:
             self.done_string = args.done_string
+        if args.max_loop_hours is not None:
+            # Validate and cap at 72 hours (3 days)
+            if args.max_loop_hours > 72:
+                print(f"{C.YELLOW}Warning: --max-loop-hours capped at 72 hours (3 days){C.RESET}")
+                self.max_loop_hours = 72.0
+            elif args.max_loop_hours < 0:
+                print(f"{C.RED}Error: --max-loop-hours must be positive{C.RESET}")
+                sys.exit(1)
+            else:
+                self.max_loop_hours = args.max_loop_hours
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -10843,11 +10856,27 @@ def main():
         system_prompt = _build_system_prompt(config)
         
         if config.loop_mode:
-            # Loop mode: re-run until done_string is detected or max iterations reached
-            for loop_i in range(1, config.max_loop_iterations + 1):
-                print(f"\n{'='*60}")
-                print(f"  Loop iteration {loop_i}/{config.max_loop_iterations} "
-                      f"(remaining: {config.max_loop_iterations - loop_i})")
+            # Loop mode: re-run until done_string is detected or max iterations/time reached
+            import time
+            loop_start_time = time.time()
+            loop_i = 0
+            while loop_i < config.max_loop_iterations:
+                loop_i += 1
+                
+                # Check time-based limit
+                if config.max_loop_hours is not None:
+                    elapsed_hours = (time.time() - loop_start_time) / 3600.0
+                    if elapsed_hours >= config.max_loop_hours:
+                        print(f"\n  Loop ended: reached max time ({config.max_loop_hours:.1f} hours).")
+                        break
+                    remaining_hours = config.max_loop_hours - elapsed_hours
+                    print(f"\n{'='*60}")
+                    print(f"  Loop iteration {loop_i}/{config.max_loop_iterations} "
+                          f"(time remaining: {remaining_hours:.2f}h)")
+                else:
+                    print(f"\n{'='*60}")
+                    print(f"  Loop iteration {loop_i}/{config.max_loop_iterations} "
+                          f"(remaining: {config.max_loop_iterations - loop_i})")
                 print(f"{'='*60}")
 
                 # Create new session and agent for each iteration (no history carryover)

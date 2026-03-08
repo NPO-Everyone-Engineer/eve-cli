@@ -45,7 +45,8 @@ node_modules/
 .eve-cli/
 
 # Local test artifacts
-tests/
+tests/*.log
+tests/__pycache__/
 
 # Dev notes
 make.md
