@@ -2085,6 +2085,106 @@ class OllamaClient:
             },
         }
 
+    @staticmethod
+    def _validate_messages_static(messages):
+        """Static version of validate_message_order for use in OllamaClient.
+        
+        Returns (is_valid, error_message) tuple.
+        """
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            role = msg.get("role")
+            
+            if role == "assistant" and msg.get("tool_calls"):
+                tool_call_ids = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
+                if not tool_call_ids:
+                    i += 1
+                    continue
+                
+                found_ids = set()
+                j = i + 1
+                while j < len(messages) and found_ids != tool_call_ids:
+                    next_msg = messages[j]
+                    next_role = next_msg.get("role")
+                    
+                    if next_role == "tool":
+                        tid = next_msg.get("tool_call_id")
+                        if tid in tool_call_ids:
+                            found_ids.add(tid)
+                        j += 1
+                    elif next_role in ("user", "assistant"):
+                        missing = tool_call_ids - found_ids
+                        if missing:
+                            return (False, f"Missing tool results for tool_call_ids: {missing}. "
+                                          f"Message order violated at index {j}.")
+                        break
+                    else:
+                        j += 1
+                
+                missing = tool_call_ids - found_ids
+                if missing:
+                    return (False, f"Missing tool results for tool_call_ids: {missing}")
+                
+                i = j
+            else:
+                i += 1
+        
+        return (True, None)
+
+    @staticmethod
+    def _repair_message_order(messages):
+        """Repair message order by ensuring tool results immediately follow tool_calls.
+        
+        This is a defensive measure to prevent 500 errors from Ollama Cloud API.
+        Returns a new messages list with corrected order.
+        """
+        repaired = []
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            role = msg.get("role")
+            
+            if role == "assistant" and msg.get("tool_calls"):
+                repaired.append(msg)
+                tool_call_ids = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
+                
+                # Scan ahead to find ALL tool results for this assistant message
+                # Collect tool results and intervening messages separately
+                tool_results = []
+                intervening = []
+                j = i + 1
+                while j < len(messages) and tool_call_ids:
+                    next_msg = messages[j]
+                    next_role = next_msg.get("role")
+                    
+                    if next_role == "tool":
+                        tid = next_msg.get("tool_call_id")
+                        if tid in tool_call_ids:
+                            tool_results.append(next_msg)
+                            tool_call_ids.discard(tid)
+                        j += 1
+                    elif next_role in ("user", "assistant"):
+                        # Save intervening message, keep looking for tool results
+                        intervening.append(next_msg)
+                        j += 1
+                    else:
+                        j += 1
+                
+                # Add all tool results immediately after assistant
+                repaired.extend(tool_results)
+                
+                # Then add intervening messages
+                repaired.extend(intervening)
+                
+                # Continue from where we left off
+                i = j
+            else:
+                repaired.append(msg)
+                i += 1
+        
+        return repaired
+
     def chat(self, model, messages, tools=None, stream=True):
         """Send chat request via Ollama native /api/chat.
 
@@ -2110,6 +2210,21 @@ class OllamaClient:
                     stream = False
 
         api_messages = self._prepare_messages_for_native(messages)
+        
+        # Validate message order before API call (prevent 500 errors from malformed tool_call/tool sequences)
+        # Create a temporary session to validate the messages
+        from types import SimpleNamespace
+        _temp_session = SimpleNamespace(messages=messages, _estimate_tokens=self._estimate_tokens)
+        # Monkey-patch the validate method to work on the temp session
+        _temp_session.validate_message_order = lambda: self._validate_messages_static(messages)
+        _is_valid, _err_msg = _temp_session.validate_message_order()
+        if not _is_valid:
+            if self.debug:
+                print(f"{C.DIM}[debug] Message order validation failed: {_err_msg}{C.RESET}", file=sys.stderr)
+            # Auto-repair: ensure tool results immediately follow their tool_calls
+            messages = self._repair_message_order(messages)
+            api_messages = self._prepare_messages_for_native(messages)
+        
         payload = {
             "model": model,
             "messages": api_messages,
@@ -7630,6 +7745,57 @@ class Session:
         """Return full message list with system prompt prepended."""
         return [{"role": "system", "content": self.system_prompt}] + self.messages
 
+    def validate_message_order(self):
+        """Validate that tool_calls and tool results are properly paired.
+        
+        Returns (is_valid, error_message) tuple.
+        Ensures no user/assistant messages appear between tool_calls and their tool results.
+        """
+        i = 0
+        while i < len(self.messages):
+            msg = self.messages[i]
+            role = msg.get("role")
+            
+            if role == "assistant" and msg.get("tool_calls"):
+                # Found assistant with tool_calls — collect all expected tool_call_ids
+                tool_call_ids = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
+                if not tool_call_ids:
+                    i += 1
+                    continue
+                
+                # Next messages should be tool results for these tool_call_ids
+                found_ids = set()
+                j = i + 1
+                while j < len(self.messages) and found_ids != tool_call_ids:
+                    next_msg = self.messages[j]
+                    next_role = next_msg.get("role")
+                    
+                    if next_role == "tool":
+                        tid = next_msg.get("tool_call_id")
+                        if tid in tool_call_ids:
+                            found_ids.add(tid)
+                        j += 1
+                    elif next_role in ("user", "assistant"):
+                        # Invalid: user/assistant message appeared before all tool results
+                        missing = tool_call_ids - found_ids
+                        if missing:
+                            return (False, f"Missing tool results for tool_call_ids: {missing}. "
+                                          f"Message order violated at index {j}.")
+                        break
+                    else:
+                        j += 1
+                
+                # Check if all tool_call_ids were found
+                missing = tool_call_ids - found_ids
+                if missing:
+                    return (False, f"Missing tool results for tool_call_ids: {missing}")
+                
+                i = j
+            else:
+                i += 1
+        
+        return (True, None)
+
     def get_token_estimate(self):
         return self._token_estimate + self._estimate_tokens(self.system_prompt)
 
@@ -9858,8 +10024,6 @@ class Agent:
                         self.tui.show_tool_result(tool_name, result.output, result.is_error,
                                                   duration=_pdur, params=tool_params)
                         results.append(result)
-                        if result.is_error and result.output:
-                            self._auto_fix_error(tool_name, tool_params, result.output)
                         # PostToolUse hook (parallel path)
                         if self.hook_mgr and self.hook_mgr.has_hooks:
                             self.hook_mgr.fire_post_tool(tool_name, result.output, result.is_error)
@@ -9895,8 +10059,6 @@ class Agent:
                             self.tui.show_tool_result(tool_name, output, is_error=_is_err,
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
-                            if _is_err and output:
-                                self._auto_fix_error(tool_name, tool_params, output)
                             # PostToolUse hook (sequential path)
                             if self.hook_mgr and self.hook_mgr.has_hooks:
                                 self.hook_mgr.fire_post_tool(tool_name, output, _is_err)
@@ -9952,7 +10114,6 @@ class Agent:
                             error_msg = f"Tool error: {e}"
                             self.tui.show_tool_result(tool_name, error_msg, True, duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, error_msg, True))
-                            self._auto_fix_error(tool_name, tool_params, error_msg)
 
                 # 6. Add tool results to history
                 # If interrupted mid-tool-loop, pad missing results so the
@@ -9964,6 +10125,13 @@ class Agent:
                         if tid and tid not in called_ids:
                             results.append(ToolResult(tid, "Cancelled by user", True))
                 self.session.add_tool_results(results)
+
+                # 6b. Auto-fix error injection (after tool results to maintain message order)
+                # This prevents user messages from being inserted between tool_calls and tool results
+                for tc_id, tool_name, tool_params, tool in validated_calls:
+                    result = next((r for r in results if r.id == tc_id), None)
+                    if result and result.is_error and result.output:
+                        self._auto_fix_error(tool_name, tool_params, result.output)
 
                 # Skip compaction if interrupted — just save partial results and break
                 if self._interrupted.is_set():
