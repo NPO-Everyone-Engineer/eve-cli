@@ -767,6 +767,11 @@ class Config:
         # System prompt customization
         self.system_prompt_file = None  # --system-prompt-file
 
+        # Loop mode for one-shot execution
+        self.loop_mode = False
+        self.max_loop_iterations = 5
+        self.done_string = "DONE"
+
         # Paths (primary: eve-cli, with backward compat for old eve-coder dirs)
         if os.name == "nt":
             appdata = os.environ.get("LOCALAPPDATA",
@@ -945,6 +950,13 @@ class Config:
         # System prompt customization
         parser.add_argument("--system-prompt-file", metavar="PATH",
                             help="Append system prompt from file")
+        # Loop mode for one-shot execution
+        parser.add_argument("--loop", action="store_true",
+                            help="Loop mode: re-run the prompt until --done-string is output")
+        parser.add_argument("--max-loop-iterations", type=int, default=5,
+                            help="Max re-runs in loop mode (default: 5)")
+        parser.add_argument("--done-string", default="DONE",
+                            help="Completion signal string that stops the loop (default: DONE)")
         # RAG options
         parser.add_argument("--rag", action="store_true", help="Enable RAG mode")
         parser.add_argument("--rag-mode", choices=["query"], default="query",
@@ -1007,6 +1019,12 @@ class Config:
             self.markdown_renderer = args.markdown_renderer
         if args.system_prompt_file:
             self.system_prompt_file = args.system_prompt_file
+        if args.loop:
+            self.loop_mode = True
+        if args.max_loop_iterations is not None:
+            self.max_loop_iterations = args.max_loop_iterations
+        if args.done_string:
+            self.done_string = args.done_string
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -9627,6 +9645,13 @@ class Agent:
         self.auto_test = AutoTestRunner(config.cwd)
         self.file_watcher = FileWatcher(config.cwd)
 
+        # Store last assistant output for loop mode completion detection
+        self._last_output: str = ""
+
+    def get_last_output(self) -> str:
+        """Return the last assistant text output for loop mode completion detection."""
+        return self._last_output
+
     @staticmethod
     def _detect_parallel_tasks(user_input):
         """Detect if user input contains multiple independent tasks that can run in parallel.
@@ -9866,6 +9891,9 @@ class Agent:
 
                 # 3. Add to history
                 self.session.add_assistant_message(text, tool_calls if tool_calls else None)
+
+                # Store last assistant output for loop mode completion detection
+                self._last_output = text
 
                 # 4. If no tool calls, we're done
                 if not tool_calls:
@@ -10524,6 +10552,14 @@ def main():
     # Parse config
     config = Config().load()
 
+    # Validate loop mode arguments
+    if config.loop_mode and not config.prompt:
+        print(f"{C.RED}Error: --loop can only be used with -p/--prompt{C.RESET}")
+        sys.exit(1)
+    if config.max_loop_iterations < 1:
+        print(f"{C.RED}Error: --max-loop-iterations must be >= 1{C.RESET}")
+        sys.exit(1)
+
     # Handle --list-sessions
     if config.list_sessions:
         sessions = Session.list_sessions(config)
@@ -10796,7 +10832,28 @@ def main():
 
     # One-shot mode
     if config.prompt:
-        agent.run(config.prompt)
+        if config.loop_mode:
+            # Loop mode: re-run until done_string is detected or max iterations reached
+            for loop_i in range(1, config.max_loop_iterations + 1):
+                print(f"\n{'='*60}")
+                print(f"  Loop iteration {loop_i}/{config.max_loop_iterations} "
+                      f"(remaining: {config.max_loop_iterations - loop_i})")
+                print(f"{'='*60}")
+
+                # Create new session and agent for each iteration (no history carryover)
+                session = Session(config)
+                agent = Agent(config, client, registry, permissions, session, tui)
+                agent.run(config.prompt)
+
+                last_output = agent.get_last_output()
+                if config.done_string in last_output:
+                    print(f"\n  Loop complete: '{config.done_string}' detected.")
+                    break
+            else:
+                print(f"\n  Loop ended: reached max iterations ({config.max_loop_iterations}).")
+        else:
+            # Standard one-shot mode
+            agent.run(config.prompt)
         session.save()
         if config.output_format in ("json", "stream-json"):
             # Extract last assistant message from session
