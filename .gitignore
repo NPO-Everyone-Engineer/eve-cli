@@ -54,7 +54,7 @@ make.md
 # Markdown docs
 *.md
 !README.md
-!00_Docs/implementation-status.md
+!docs/*.md
 
 # Docs
 00_Docs/
