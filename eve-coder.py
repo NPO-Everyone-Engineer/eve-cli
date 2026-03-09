@@ -8416,20 +8416,32 @@ class TUI:
                             # @file completion
                             prefix = text[1:]
                             try:
-                                if os.path.sep in prefix:
-                                    dirn = os.path.dirname(prefix) or "."
+                                # Handle trailing separator correctly (e.g., "dir/subdir/")
+                                if prefix.endswith(os.path.sep):
+                                    dirn = prefix
+                                    base = ""
+                                elif os.path.sep in prefix:
+                                    dirn = os.path.dirname(prefix) + os.path.sep
                                     base = os.path.basename(prefix)
                                 else:
                                     dirn = "."
                                     base = prefix
-                                entries = os.listdir(dirn)
+                                # Normalize: remove trailing separator for listdir, but keep for path building
+                                dirn_for_list = dirn.rstrip(os.path.sep) or "."
+                                entries = os.listdir(dirn_for_list)
                                 for e in sorted(entries):
                                     if e.startswith(base) and not e.startswith("."):
-                                        full = os.path.join(dirn, e) if dirn != "." else e
-                                        if os.path.isdir(os.path.join(dirn, e)):
-                                            options.append("@" + full + os.path.sep)
+                                        # Build the full path for isdir check
+                                        full_path = os.path.join(dirn_for_list, e)
+                                        # Build the option string with proper @ prefix and separators
+                                        if dirn == ".":
+                                            option_path = e
                                         else:
-                                            options.append("@" + full)
+                                            option_path = dirn + e
+                                        if os.path.isdir(full_path):
+                                            options.append("@" + option_path + os.path.sep)
+                                        else:
+                                            options.append("@" + option_path)
                             except OSError:
                                 pass
                         else:
