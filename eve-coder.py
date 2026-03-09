@@ -5193,35 +5193,46 @@ class AskUserQuestionTool(Tool):
         if not question:
             return "Error: question is required"
 
-        with _print_lock:
-            print(f"\n{_ansi(C.CYAN)}{_ansi(C.BOLD)}Question:{_ansi(C.RESET)} {question}")
-            if options:
-                for i, opt in enumerate(options, 1):
-                    print(f"  {_ansi(C.CYAN)}{i}.{_ansi(C.RESET)} {opt}")
-                print(f"  {_ansi(C.DIM)}Enter number or type your own answer:{_ansi(C.RESET)}")
-            else:
-                print(f"  {_ansi(C.DIM)}Type your answer:{_ansi(C.RESET)}")
+        # Temporarily teardown scroll region for proper input handling
+        _scroll_mode_active = False
+        if _active_scroll_region is not None and _active_scroll_region._active:
+            _scroll_mode_active = True
+            _active_scroll_region.teardown()
 
         try:
-            answer = input(f"  {_ansi(C.CYAN)}>{_ansi(C.RESET)} ").strip()
-            # Strip terminal escape sequences (same as TUI.get_input)
-            import re as _re
-            answer = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z~]', '', answer)
-            answer = _re.sub(r'(?:\x1b\[)?27;2;13~', '', answer)
-            answer = answer.strip()
-        except (EOFError, KeyboardInterrupt):
-            return "User cancelled the question."
+            with _print_lock:
+                print(f"\n{_ansi(C.CYAN)}{_ansi(C.BOLD)}Question:{_ansi(C.RESET)} {question}")
+                if options:
+                    for i, opt in enumerate(options, 1):
+                        print(f"  {_ansi(C.CYAN)}{i}.{_ansi(C.RESET)} {opt}")
+                    print(f"  {_ansi(C.DIM)}Enter number or type your own answer:{_ansi(C.RESET)}")
+                else:
+                    print(f"  {_ansi(C.DIM)}Type your answer:{_ansi(C.RESET)}")
 
-        if not answer:
-            return "User provided no answer."
+            try:
+                answer = input(f"  {_ansi(C.CYAN)}>{_ansi(C.RESET)} ").strip()
+                # Strip terminal escape sequences (same as TUI.get_input)
+                import re as _re
+                answer = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z~]', '', answer)
+                answer = _re.sub(r'(?:\x1b\[)?27;2;13~', '', answer)
+                answer = answer.strip()
+            except (EOFError, KeyboardInterrupt):
+                return "User cancelled the question."
 
-        # If user entered a number, map to option
-        if options and answer.isdigit():
-            idx = int(answer) - 1
-            if 0 <= idx < len(options):
-                return f"User chose: {options[idx]}"
+            if not answer:
+                return "User provided no answer."
 
-        return f"User answered: {answer}"
+            # If user entered a number, map to option
+            if options and answer.isdigit():
+                idx = int(answer) - 1
+                if 0 <= idx < len(options):
+                    return f"User chose: {options[idx]}"
+
+            return f"User answered: {answer}"
+        finally:
+            # Restore scroll region if it was active
+            if _scroll_mode_active and _active_scroll_region is not None:
+                _active_scroll_region.setup()
 
 
 # Sub-Agent — Spawns a mini agent loop in a separate thread
