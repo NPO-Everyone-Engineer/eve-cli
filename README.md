@@ -220,12 +220,28 @@ eve-cli --learn --level 3  # 難易度調整（1-5）
 
 ## 推奨環境
 
+### メインモデル
+
 | 環境 | メモリ | 推奨モデル | 備考 |
 |------|-------|----------|------|
-| Apple Silicon Mac | 96GB+ | gpt-oss:120b | 最高性能 |
-| Apple Silicon Mac | 16GB | qwen3:8b | 標準的 |
-| Intel/Windows/Linux | 16GB+ | qwen3:8b | 標準的 |
-| クラウドモデル利用時 | 制限なし | qwen3.5:397b-cloud | Ollama有料版 |
+| Apple Silicon Mac | 32GB+ | `qwen3.5:32b` | 高性能 |
+| Apple Silicon Mac / Linux | 16GB | `qwen3.5:14b` | 標準 |
+| 省メモリ環境 | 8GB | `qwen3.5:9b` | 軽量 |
+| クラウドモデル利用時 | 制限なし | `qwen3.5:397b-cloud` | 最高性能・Ollama有料版 |
+
+### サイドカーモデル（会話要約・コンパクション用）
+
+会話の自動圧縮など内部処理に使われる軽量モデルです。メインモデルとは別に動作します。
+
+| メモリ | 推奨サイドカーモデル |
+|-------|------------------|
+| 8GB以上 | `qwen3.5:9b` |
+| 4GB以上 | `qwen3.5:3b` |
+
+```bash
+# 環境変数で設定
+export EVE_CLI_SIDECAR_MODEL="qwen3.5:3b"
+```
 
 > **画像認識**を使う場合は、ビジョン対応モデル（`llava`, `llama3.2-vision`, `gemma3` 等）が必要です。
 
