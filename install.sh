@@ -496,6 +496,60 @@ verify_checksum() {
     return 0
 }
 
+is_truthy() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|on|ON)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+confirm_unverified_remote_installer() {
+    local label="$1"
+    local url="$2"
+    local checksum_env="$3"
+    local allow_env="$4"
+    local checksum_value="${!checksum_env:-}"
+    local allow_value="${!allow_env:-}"
+    local allow_all_value="${EVE_CLI_ALLOW_UNVERIFIED_INSTALLERS:-}"
+
+    if [ -n "$checksum_value" ]; then
+        return 0
+    fi
+    if is_truthy "$allow_value" || is_truthy "$allow_all_value"; then
+        vapor_warn "$(msg unverified_installer_override)"
+        return 0
+    fi
+
+    echo ""
+    vapor_warn "$(msg unverified_installer_warn)"
+    echo "  ${label}: ${url}"
+    echo "  $(msg unverified_installer_hash_hint) ${checksum_env}=<sha256>"
+    echo "  $(msg unverified_installer_allow_hint) ${allow_env}=1"
+    echo "  $(msg unverified_installer_allow_hint) EVE_CLI_ALLOW_UNVERIFIED_INSTALLERS=1"
+
+    if ! [ -t 0 ] || ! [ -t 1 ]; then
+        vapor_error "$(msg unverified_installer_noninteractive)"
+        return 1
+    fi
+
+    local reply=""
+    printf "  %s " "$(msg unverified_installer_prompt)"
+    IFS= read -r reply || reply=""
+    case "$reply" in
+        y|Y|yes|YES)
+            return 0
+            ;;
+        *)
+            vapor_error "$(msg unverified_installer_denied)"
+            return 1
+            ;;
+    esac
+}
+
 download_to_temp() {
     local url="$1"
     local suffix="${2:-.tmp}"
@@ -841,6 +895,13 @@ if [ "$IS_MAC" -eq 1 ]; then
         vapor_warn "⚠️  You may also be asked for your Mac password (sudo)."
         vapor_info "Homebrew 🍺 $(msg installing)"
         echo ""
+        if ! confirm_unverified_remote_installer \
+            "Homebrew installer" \
+            "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh" \
+            "EVE_CLI_HOMEBREW_INSTALLER_HASH" \
+            "EVE_CLI_ALLOW_UNVERIFIED_HOMEBREW_INSTALLER"; then
+            exit 1
+        fi
         
         # [SEC] Download Homebrew installer with optional checksum verification
         # Set EVE_CLI_HOMEBREW_INSTALLER_HASH to enable strict verification
@@ -890,6 +951,13 @@ else
         # sudo internally and needs interactive TTY for password prompt.
         vapor_info "Ollama 🦙 $(msg installing)"
         echo ""
+        if ! confirm_unverified_remote_installer \
+            "Ollama installer" \
+            "https://ollama.com/install.sh" \
+            "EVE_CLI_OLLAMA_INSTALLER_HASH" \
+            "EVE_CLI_ALLOW_UNVERIFIED_OLLAMA_INSTALLER"; then
+            exit 1
+        fi
         
         # [SEC] Download Ollama installer with optional checksum verification
         # Set EVE_CLI_OLLAMA_INSTALLER_HASH to enable strict verification
@@ -1124,6 +1192,8 @@ else
         echo "  Re-run from a full checkout, or set EVE_CLI_INSTALL_REF=<commit-sha>."
         exit 1
     fi
+    vapor_warn "$(msg bootstrap_notice)"
+    echo "  $(msg bootstrap_notice_hint)"
     MANIFEST_TMP="$(download_to_temp "https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/${INSTALL_REF}/install-manifest.json" ".json")"
     if [ -z "${MANIFEST_TMP:-}" ]; then
         vapor_error "Failed to download install-manifest.json from GitHub"

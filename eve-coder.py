@@ -116,7 +116,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.2.2"
+__version__ = "2.3.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -774,6 +774,11 @@ class Config:
         self.done_string = "DONE"
         self.max_loop_hours = None  # Time-based limit (default: no limit)
 
+        # Learn mode (interactive explanation)
+        self.learn_mode = False
+        self.learn_level = 3  # 1-5 (1=concise, 5=very detailed)
+        self.learn_auto_explain = True  # auto-explain on errors
+
         # Paths (primary: eve-cli, with backward compat for old eve-coder dirs)
         if os.name == "nt":
             appdata = os.environ.get("LOCALAPPDATA",
@@ -995,6 +1000,11 @@ class Config:
                             help="Max parallel file edits (1-10, default: 5)")
         parser.add_argument("--no-progress", action="store_true",
                             help="Disable progress indicators for file operations")
+        # Learn mode
+        parser.add_argument("--learn", action="store_true",
+                            help="Enable learn mode: interactive explanations for code and errors")
+        parser.add_argument("--level", type=int, choices=[1, 2, 3, 4, 5], default=3,
+                            help="Learn mode level: 1=concise, 5=very detailed (default: 3)")
         args = parser.parse_args(argv)
 
         if args.prompt:
@@ -1068,6 +1078,11 @@ class Config:
         if args.no_progress:
             global _SHOW_PROGRESS
             _SHOW_PROGRESS = False
+        # Learn mode args
+        if args.learn:
+            self.learn_mode = True
+        if args.level:
+            self.learn_level = args.level
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -1916,11 +1931,7 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
         search_dir = parent
 
     # Load in order: most distant ancestor first, cwd last (so cwd overrides)
-    trusted_instruction_items = [
-        item for item in instruction_files
-        if item[1] != "CLAUDE.local.md"
-    ]
-    project_instruction_paths = [fpath for _, _, fpath in trusted_instruction_items]
+    project_instruction_paths = [fpath for _, _, fpath in instruction_files]
     should_load_project_instructions = True
     if project_instruction_paths:
         should_load_project_instructions = _ensure_repo_scope_trusted(
@@ -1934,11 +1945,7 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
 
     total_loaded = 0
     max_total = 8000
-    instruction_items_to_load = (
-        instruction_files
-        if should_load_project_instructions
-        else [item for item in instruction_files if item[1] == "CLAUDE.local.md"]
-    )
+    instruction_items_to_load = instruction_files if should_load_project_instructions else []
     for search_dir, fname, fpath in reversed(instruction_items_to_load):
         if total_loaded >= max_total:
             break
@@ -1977,6 +1984,40 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
         except Exception as e:
             print(f"{C.YELLOW}Warning: Could not read system prompt file: {e}{C.RESET}",
                   file=sys.stderr)
+
+    # Learn mode instructions
+    if config.learn_mode:
+        level_descriptions = {
+            1: "超簡潔 (very concise, for experts)",
+            2: "簡潔 (concise, for intermediate users)",
+            3: "標準 (standard, default)",
+            4: "詳細 (detailed, for beginners)",
+            5: "超詳細 (very detailed, for complete beginners)"
+        }
+        level_desc = level_descriptions.get(config.learn_level, "標準")
+        prompt += f"""
+# Learn Mode (Interactive Explanation)
+You are in LEARN MODE with level {config.learn_level} ({level_desc}).
+After generating code or fixing errors, ALWAYS provide educational explanations:
+
+1. After code generation: Add a "📖 なぜこう書くの？" section explaining:
+   - What the code does (1-2 sentences)
+   - Why this approach is used (with concrete examples)
+   - Alternative approaches if applicable
+   - Key takeaway (1-line summary)
+
+2. After errors: Add a "🔍 なぜエラーが起きたの？" section explaining:
+   - Why the error occurred (root cause)
+   - How to fix it (with before/after comparison)
+   - Key lesson to remember
+
+Adjust explanation depth and vocabulary based on level:
+- Level 1-2: Use technical terms, minimal hand-holding
+- Level 3: Balance technical terms with explanations
+- Level 4-5: Avoid jargon, use analogies, explain everything thoroughly
+
+Always use Japanese for explanations when the user writes in Japanese.
+"""
 
     return prompt
 
@@ -5205,14 +5246,19 @@ class SubAgentTool(Tool):
     READ_ONLY_TOOLS = frozenset({"Read", "Glob", "Grep", "WebFetch", "WebSearch"})
     # Additional tools when allow_writes is True
     WRITE_TOOLS = frozenset({"Bash", "Write", "Edit"})
+    NETWORK_TOOLS = frozenset({"WebFetch", "WebSearch"})
     # Hard cap on max_turns to prevent runaway loops
     HARD_MAX_TURNS = 20
 
-    def __init__(self, config, client, registry, permissions=None):
+    def __init__(self, config, client, registry, permissions=None, tui=None):
         self._config = config
         self._client = client
         self._registry = registry
         self._permissions = permissions
+        self._tui = tui
+
+    def set_tui(self, tui):
+        self._tui = tui
 
     @staticmethod
     def _make_isolated_tool(name, cwd):
@@ -5424,11 +5470,9 @@ class SubAgentTool(Tool):
                     })
                     continue
 
-                # SubAgent must respect the parent permission system
-                # Write tools (Bash, Write, Edit) require user confirmation
-                # unless the parent agent is in -y mode
-                if tc_name in self.WRITE_TOOLS and self._permissions is not None:
-                    if not self._permissions.check(tc_name, tc_args, None):
+                # SubAgent must respect the parent permission system.
+                if (tc_name in self.WRITE_TOOLS or tc_name in self.NETWORK_TOOLS) and self._permissions is not None:
+                    if not self._permissions.check(tc_name, tc_args, self._tui):
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc_id,
@@ -5867,11 +5911,38 @@ def _load_skills(config):
     Returns dict: name -> {"content": str, "skill_dir": str}
     """
     skills = {}  # name -> {"content": ..., "skill_dir": ...}
-    skill_dirs = [
-        os.path.join(config.config_dir, "skills"),
+    global_skill_dir = os.path.join(config.config_dir, "skills")
+    project_skill_dirs = [
         os.path.join(config.cwd, ".eve-cli", "skills"),
         os.path.join(config.cwd, "skills"),
     ]
+    project_skill_paths = []
+    for skill_dir in project_skill_dirs:
+        if not os.path.isdir(skill_dir):
+            continue
+        try:
+            for entry in os.listdir(skill_dir):
+                if not entry.endswith(".md"):
+                    continue
+                fpath = os.path.join(skill_dir, entry)
+                if os.path.islink(fpath) or not os.path.isfile(fpath):
+                    continue
+                project_skill_paths.append(fpath)
+        except OSError:
+            pass
+    load_project_skills = True
+    if project_skill_paths:
+        load_project_skills = _ensure_repo_scope_trusted(
+            config,
+            "skills",
+            "Project Skills Trust Required",
+            "Project skills are injected into the agent prompt and can influence tool usage.",
+            project_skill_paths,
+            preview_paths=project_skill_paths,
+        )
+    skill_dirs = [global_skill_dir]
+    if load_project_skills:
+        skill_dirs.extend(project_skill_dirs)
     for skill_dir in skill_dirs:
         if not os.path.isdir(skill_dir):
             continue
@@ -6552,11 +6623,15 @@ class MultiAgentCoordinator:
 
     MAX_PARALLEL = 4  # max concurrent agents
 
-    def __init__(self, config, client, registry, permissions):
+    def __init__(self, config, client, registry, permissions, tui=None):
         self._config = config
         self._client = client
         self._registry = registry
         self._permissions = permissions
+        self._tui = tui
+
+    def set_tui(self, tui):
+        self._tui = tui
 
     def run_parallel(self, tasks):
         """Run multiple sub-agent tasks in parallel.
@@ -6578,7 +6653,7 @@ class MultiAgentCoordinator:
                 # Inject agent label for UI display
                 labeled_task = dict(task)
                 labeled_task["_agent_label"] = f"Agent {idx + 1}/{total}"
-                sub = SubAgentTool(self._config, self._client, self._registry, self._permissions)
+                sub = SubAgentTool(self._config, self._client, self._registry, self._permissions, self._tui)
                 result = sub.execute(labeled_task)
                 results[idx] = {
                     "prompt": task.get("prompt", "")[:100],
@@ -9783,6 +9858,12 @@ class TUI:
   {_c198}/checkpoint{C.RESET}        Save non-invasive git checkpoint
   {_c198}/checkpoint list{C.RESET}   List available checkpoints
   {_c198}/rollback{C.RESET}          Rollback to last checkpoint
+  {_c51}━━ Learn Mode {sep[13:]}{C.RESET}
+  {_c198}/learn{C.RESET}             Toggle learn mode (ON/OFF)
+  {_c198}/learn on{C.RESET}          Enable learn mode
+  {_c198}/learn off{C.RESET}         Disable learn mode
+  {_c198}/learn level <1-5>{C.RESET} Set explanation level (1=concise, 5=detailed)
+  {_c198}/learn auto on|off{C.RESET} Toggle auto-explain for code/errors
   {_c51}━━ Extensions {sep[13:]}{C.RESET}
   {_c198}/autotest{C.RESET}          Toggle auto syntax+test after edits
   {_c198}/gentest{C.RESET} <file>    Generate unit tests for a Python file
@@ -9960,6 +10041,55 @@ class Agent:
         return []
 
     MAX_AUTO_FIX = 2  # max auto-fix attempts per run
+
+    def _add_learn_explanation(self, text, has_code, has_error):
+        """Add educational explanations in learn mode."""
+        if not self.config.learn_mode:
+            return
+        
+        level = self.config.learn_level
+        _p = self.tui._scroll_print
+        
+        # Determine explanation depth based on level
+        if level <= 2:
+            depth = "concise"
+        elif level <= 3:
+            depth = "standard"
+        else:
+            depth = "detailed"
+        
+        # Add code explanation
+        if has_code:
+            _p(f"\n{C.BCYAN}📖 なぜこう書くの？{C.RESET}")
+            if depth == "concise":
+                _p(f"{C.DIM}このコードは特定のタスクを効率的に処理するために設計されています。{C.RESET}")
+            elif depth == "standard":
+                _p(f"{C.DIM}このアプローチは、可読性とパフォーマンスのバランスを考慮しています。{C.RESET}")
+                _p(f"{C.DIM}主な利点：コードの再利用性、エラー処理の明確さ、保守性の向上{C.RESET}")
+            else:
+                _p(f"{C.DIM}このコードは以下の理由でこのように書かれています：{C.RESET}")
+                _p(f"{C.DIM}1. 可読性：他の開発者が理解しやすい{C.RESET}")
+                _p(f"{C.DIM}2. 保守性：将来的な変更が容易{C.RESET}")
+                _p(f"{C.DIM}3. 堅牢性：エラーケースを適切に処理{C.RESET}")
+                _p(f"{C.DIM}4. 効率性：パフォーマンスが最適化されている{C.RESET}")
+            _p()
+        
+        # Add error explanation
+        if has_error:
+            _p(f"{C.BMAGENTA}🔍 なぜエラーが起きたの？{C.RESET}")
+            if depth == "concise":
+                _p(f"{C.DIM}エラーは一般的な問題で、適切な対処法で解決できます。{C.RESET}")
+            elif depth == "standard":
+                _p(f"{C.DIM}エラーの根本原因を特定し、段階的に解決しましょう。{C.RESET}")
+                _p(f"{C.DIM}ヒント：エラーメッセージを注意深く読み、コンテキストを理解することが重要です。{C.RESET}")
+            else:
+                _p(f"{C.DIM}エラーが発生する理由は主に以下です：{C.RESET}")
+                _p(f"{C.DIM}1. 入力値の検証不足{C.RESET}")
+                _p(f"{C.DIM}2. 想定外の状態や条件{C.RESET}")
+                _p(f"{C.DIM}3. リソースの不足またはアクセス権限の問題{C.RESET}")
+                _p(f"{C.DIM}4. 依存関係のバージョン不一致{C.RESET}")
+                _p(f"{C.DIM}各エラーは学習の機会です。同じエラーを繰り返さないために、原因を深く理解しましょう。{C.RESET}")
+            _p()
 
     def _auto_fix_error(self, tool_name, tool_params, error_output):
         """Inject error context into session so LLM can auto-fix on next iteration."""
@@ -10174,6 +10304,14 @@ class Agent:
 
                 # Store last assistant output for loop mode completion detection
                 self._last_output = text
+
+                # Learn mode: add explanations after code or errors
+                if self.config.learn_mode and self.config.learn_auto_explain:
+                    # Check if response contains code blocks
+                    has_code = '```' in text
+                    has_error = any(err in text.lower() for err in ['error:', 'error -', 'exception', 'failed'])
+                    if has_code or has_error:
+                        self._add_learn_explanation(text, has_code, has_error)
 
                 # 4. If no tool calls, we're done
                 if not tool_calls:
@@ -10996,8 +11134,8 @@ def main():
     session.set_client(client)  # enable sidecar model for context compaction
     registry = ToolRegistry().register_defaults()
     permissions = PermissionMgr(config)
-    registry.register(SubAgentTool(config, client, registry, permissions))
-    coordinator = MultiAgentCoordinator(config, client, registry, permissions)
+    registry.register(SubAgentTool(config, client, registry, permissions, tui))
+    coordinator = MultiAgentCoordinator(config, client, registry, permissions, tui)
     registry.register(ParallelAgentTool(coordinator))
 
     # Initialize MCP servers
@@ -11840,6 +11978,52 @@ def main():
                         print(f"{C.YELLOW}Not in plan mode. Use /plan first.{C.RESET}")
                     else:
                         _exit_plan_mode(agent, session)
+                    continue
+
+                # ── Learn mode commands ────────────────────────────────
+                elif cmd == "/learn":
+                    parts = user_input.split()
+                    if len(parts) == 1:
+                        # Toggle learn mode
+                        config.learn_mode = not config.learn_mode
+                        status = "ON" if config.learn_mode else "OFF"
+                        print(f"{C.CYAN}Learn mode: {status}{C.RESET}")
+                        if config.learn_mode:
+                            print(f"{C.DIM}  Level: {config.learn_level} (use /learn level <1-5> to change){C.RESET}")
+                    elif len(parts) >= 2:
+                        subcmd = parts[1].lower()
+                        if subcmd == "on":
+                            config.learn_mode = True
+                            print(f"{C.GREEN}Learn mode: ON{C.RESET}")
+                        elif subcmd == "off":
+                            config.learn_mode = False
+                            print(f"{C.GREEN}Learn mode: OFF{C.RESET}")
+                        elif subcmd == "level" and len(parts) >= 3:
+                            try:
+                                level = int(parts[2])
+                                if 1 <= level <= 5:
+                                    config.learn_level = level
+                                    print(f"{C.GREEN}Learn level set to: {level}{C.RESET}")
+                                else:
+                                    print(f"{C.YELLOW}Level must be 1-5.{C.RESET}")
+                            except ValueError:
+                                print(f"{C.YELLOW}Invalid level. Use /learn level <1-5>{C.RESET}")
+                        elif subcmd == "auto":
+                            if len(parts) >= 3:
+                                val = parts[2].lower()
+                                if val in ("on", "true", "1"):
+                                    config.learn_auto_explain = True
+                                    print(f"{C.GREEN}Auto-explain: ON{C.RESET}")
+                                elif val in ("off", "false", "0"):
+                                    config.learn_auto_explain = False
+                                    print(f"{C.GREEN}Auto-explain: OFF{C.RESET}")
+                                else:
+                                    print(f"{C.YELLOW}Use /learn auto on|off{C.RESET}")
+                            else:
+                                status = "ON" if config.learn_auto_explain else "OFF"
+                                print(f"{C.DIM}Auto-explain: {status}{C.RESET}")
+                        else:
+                            print(f"{C.DIM}Usage: /learn [on|off|level <1-5>|auto on|off]{C.RESET}")
                     continue
 
                 # ── Git checkpoint & rollback ────────────────────────
