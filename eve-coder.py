@@ -10728,6 +10728,12 @@ def _enter_plan_mode(agent, session):
     _scroll_aware_print(f"  {_c240}Plan file: {plan_name}{C.RESET}")
     _scroll_aware_print(f"  {_c240}/approve → Act mode{C.RESET}")
     _scroll_aware_print(f"  {_c226}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+    # Update footer status to show PLAN mode
+    if agent.tui.scroll_region._active:
+        pct = min(int((session.get_token_estimate() / agent.config.context_window) * 100), 100)
+        agent.tui.scroll_region.update_status(
+            _build_footer_status(agent.config, pct, plan_mode=True)
+        )
 
 
 def _read_latest_plan(agent):
@@ -10783,6 +10789,12 @@ def _exit_plan_mode(agent, session):
     _scroll_aware_print(f"  {_c240}/plan → return to Plan mode{C.RESET}")
     _scroll_aware_print(f"  {_c240}/rollback → undo all changes since plan{C.RESET}")
     _scroll_aware_print(f"  {_c46}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+    # Update footer status to show ACT mode
+    if agent.tui.scroll_region._active:
+        pct = min(int((session.get_token_estimate() / agent.config.context_window) * 100), 100)
+        agent.tui.scroll_region.update_status(
+            _build_footer_status(agent.config, pct, plan_mode=False)
+        )
 
 
 def _build_footer_status(config, pct, plan_mode=False):
