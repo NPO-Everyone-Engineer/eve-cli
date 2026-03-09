@@ -38,6 +38,7 @@ import base64
 import atexit
 import struct
 import sqlite3
+import asyncio
 from abc import ABC, abstractmethod
 from datetime import datetime
 import collections
@@ -882,6 +883,15 @@ class Config:
                     elif key == "MARKDOWN_RENDERER" and val:
                         if val.lower() in ("glow", "simple"):
                             self.markdown_renderer = val.lower()
+                    elif key == "MAX_PARALLEL_FILES" and val:
+                        try:
+                            global _MAX_PARALLEL_FILES
+                            _MAX_PARALLEL_FILES = max(1, min(10, int(val)))
+                        except ValueError:
+                            pass
+                    elif key == "SHOW_PROGRESS" and val:
+                        global _SHOW_PROGRESS
+                        _SHOW_PROGRESS = val.lower() in ("true", "1", "yes")
         except (OSError, IOError):
             pass  # Config file unreadable — skip silently
 
@@ -905,6 +915,15 @@ class Config:
             renderer = os.environ["EVE_CLI_MARKDOWN_RENDERER"].lower()
             if renderer in ("glow", "simple"):
                 self.markdown_renderer = renderer
+        if os.environ.get("EVE_CLI_MAX_PARALLEL_FILES"):
+            try:
+                global _MAX_PARALLEL_FILES
+                _MAX_PARALLEL_FILES = max(1, min(10, int(os.environ["EVE_CLI_MAX_PARALLEL_FILES"])))
+            except ValueError:
+                pass
+        if os.environ.get("EVE_CLI_SHOW_PROGRESS"):
+            global _SHOW_PROGRESS
+            _SHOW_PROGRESS = os.environ["EVE_CLI_SHOW_PROGRESS"].lower() in ("true", "1", "yes")
 
     def _load_cli_args(self, argv=None):
         # Strip full-width spaces from args (common with Japanese IME input)
@@ -971,6 +990,11 @@ class Config:
                             help="Ollama embedding model (default: nomic-embed-text)")
         parser.add_argument("--rag-index", metavar="PATH",
                             help="Index files at PATH for RAG and exit")
+        # Parallel file operations
+        parser.add_argument("--max-parallel-files", type=int, metavar="N",
+                            help="Max parallel file edits (1-10, default: 5)")
+        parser.add_argument("--no-progress", action="store_true",
+                            help="Disable progress indicators for file operations")
         args = parser.parse_args(argv)
 
         if args.prompt:
@@ -1038,6 +1062,12 @@ class Config:
                 sys.exit(1)
             else:
                 self.max_loop_hours = args.max_loop_hours
+        if args.max_parallel_files is not None:
+            global _MAX_PARALLEL_FILES
+            _MAX_PARALLEL_FILES = max(1, min(10, args.max_parallel_files))
+        if args.no_progress:
+            global _SHOW_PROGRESS
+            _SHOW_PROGRESS = False
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -4014,14 +4044,19 @@ class EditTool(Tool):
             return f"Error writing file: {e}"
 
 
+# Global configuration for parallel file operations
+_MAX_PARALLEL_FILES = 5  # Default max parallelism
+_SHOW_PROGRESS = True    # Show progress indicators
+
 class MultiEditTool(Tool):
-    """Apply multiple file edits in a single tool call."""
+    """Apply multiple file edits in a single tool call with parallel execution."""
     name = "MultiEdit"
     description = (
         "Apply multiple edits across one or more files in a single call. "
         "Each edit specifies a file_path, old_string, and new_string. "
         "Use this when you need to make coordinated changes across files "
-        "(e.g., rename a function and update all call sites)."
+        "(e.g., rename a function and update all call sites). "
+        "Files are processed in parallel (max 5 concurrent) for better performance."
     )
     parameters = {
         "type": "object",
@@ -4043,6 +4078,57 @@ class MultiEditTool(Tool):
         "required": ["edits"],
     }
 
+    # Thread-safe locks for file operations
+    _file_locks = {}
+    _file_locks_lock = threading.Lock()
+
+    def _get_file_lock(self, path):
+        """Get or create a lock for a specific file path."""
+        with self._file_locks_lock:
+            if path not in self._file_locks:
+                self._file_locks[path] = threading.Lock()
+            return self._file_locks[path]
+
+    def _validate_and_apply_edit(self, edit, index):
+        """Validate and apply a single edit. Returns (success, result_message)."""
+        fpath = edit.get("file_path", "")
+        old_s = edit.get("old_string", "")
+        new_s = edit.get("new_string", "")
+
+        if not fpath or not os.path.isabs(fpath):
+            return False, f"[{index+1}] Error: invalid path '{fpath}'"
+
+        if os.path.islink(fpath):
+            return False, f"[{index+1}] Error: symlink not allowed '{fpath}'"
+        if _is_protected_path(fpath):
+            return False, f"[{index+1}] Error: protected path '{fpath}'"
+
+        if not os.path.isfile(fpath):
+            return False, f"[{index+1}] Error: file not found '{fpath}'"
+
+        # Acquire lock for this specific file to prevent concurrent writes
+        lock = self._get_file_lock(fpath)
+        with lock:
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+
+                if old_s not in content:
+                    return False, f"[{index+1}] Error: old_string not found in {os.path.basename(fpath)}"
+
+                count = content.count(old_s)
+                warning = ""
+                if count > 1:
+                    warning = f" [{count} occurrences, replacing first only]"
+
+                new_content = content.replace(old_s, new_s, 1)
+                with open(fpath, "w", encoding="utf-8", newline="") as f:
+                    f.write(new_content)
+
+                return True, f"[{index+1}] OK: {os.path.basename(fpath)}{warning}"
+            except OSError as e:
+                return False, f"[{index+1}] Error: {e}"
+
     def execute(self, params):
         edits = params.get("edits", [])
         if not edits:
@@ -4050,52 +4136,44 @@ class MultiEditTool(Tool):
         if len(edits) > 20:
             return "Error: too many edits (max 20)"
 
-        results = []
+        results = [None] * len(edits)
         success_count = 0
 
-        for i, edit in enumerate(edits):
-            fpath = edit.get("file_path", "")
-            old_s = edit.get("old_string", "")
-            new_s = edit.get("new_string", "")
+        # Show progress if enabled
+        if _SHOW_PROGRESS and len(edits) > 1:
+            print(f"\n{C.CYAN}Processing {len(edits)} file(s) in parallel (max {_MAX_PARALLEL_FILES} concurrent)...{C.RESET}")
 
-            if not fpath or not os.path.isabs(fpath):
-                results.append(f"[{i+1}] Error: invalid path '{fpath}'")
-                continue
+        # Process edits in parallel using ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_PARALLEL_FILES) as executor:
+            # Submit all tasks
+            future_to_index = {
+                executor.submit(self._validate_and_apply_edit, edit, i): i
+                for i, edit in enumerate(edits)
+            }
 
-            if os.path.islink(fpath):
-                results.append(f"[{i+1}] Error: symlink not allowed '{fpath}'")
-                continue
-            if _is_protected_path(fpath):
-                results.append(f"[{i+1}] Error: protected path '{fpath}'")
-                continue
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    success, result_msg = future.result()
+                    results[index] = result_msg
+                    if success:
+                        success_count += 1
 
-            if not os.path.isfile(fpath):
-                results.append(f"[{i+1}] Error: file not found '{fpath}'")
-                continue
+                    # Show progress update
+                    if _SHOW_PROGRESS and len(edits) > 1:
+                        completed = sum(1 for r in results if r is not None)
+                        status = f"{C.GREEN}✓{C.RESET}" if success else f"{C.RED}✗{C.RESET}"
+                        fname = os.path.basename(edits[index].get("file_path", "unknown"))
+                        print(f"  {status} {fname} ({completed}/{len(edits)})")
 
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
+                except Exception as e:
+                    results[index] = f"[{index+1}] Error: {e}"
 
-                if old_s not in content:
-                    results.append(f"[{i+1}] Error: old_string not found in {os.path.basename(fpath)}")
-                    continue
-
-                count = content.count(old_s)
-                if count > 1:
-                    results.append(f"[{i+1}] Warning: {count} occurrences in {os.path.basename(fpath)}, replacing first only")
-
-                new_content = content.replace(old_s, new_s, 1)
-                with open(fpath, "w", encoding="utf-8", newline="") as f:
-                    f.write(new_content)
-
-                results.append(f"[{i+1}] OK: {os.path.basename(fpath)}")
-                success_count += 1
-            except OSError as e:
-                results.append(f"[{i+1}] Error: {e}")
-
-        summary = f"MultiEdit: {success_count}/{len(edits)} edits applied\n"
-        return summary + "\n".join(results)
+        # Filter out None results and build final output
+        final_results = [r for r in results if r is not None]
+        summary = f"\n{C.BOLD}MultiEdit: {success_count}/{len(edits)} edits applied{C.RESET}\n"
+        return summary + "\n".join(final_results)
 
 
 class GlobTool(Tool):

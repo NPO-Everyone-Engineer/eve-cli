@@ -87,6 +87,7 @@
 ## CLI キャッチアップ計画（Codex / Claude / Gemini）
 
 EvE CLI を主要コーディング CLI と同等以上の運用体験に引き上げるため、優先機能を整理したロードマップを策定しています。
+詳細な実装指示書は [00_Docs/20260308_cli_catchup_instruction.md](00_Docs/20260308_cli_catchup_instruction.md) を参照してください。
 
 ### P0（最優先：必須機能）
 
