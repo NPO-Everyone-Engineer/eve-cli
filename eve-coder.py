@@ -115,7 +115,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.2.1"
+__version__ = "2.2.2"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -7566,19 +7566,63 @@ class Memory:
         self._dir = os.path.join(config_dir, "memory")
         os.makedirs(self._dir, exist_ok=True)
         self._file = os.path.join(self._dir, "memory.json")
-        self._entries = self._load()
+        self._entries, needs_migration = self._load()
+        if needs_migration:
+            self._save()
+
+    @classmethod
+    def _normalize_entry(cls, raw_entry):
+        """Normalize legacy memory entries to the current schema."""
+        if isinstance(raw_entry, str):
+            content = raw_entry
+            category = "general"
+            created = None
+        elif isinstance(raw_entry, dict):
+            content = raw_entry.get("content")
+            if content is None:
+                content = raw_entry.get("text")
+            if content is None:
+                return None
+            category = raw_entry.get("category", "general")
+            created = raw_entry.get("created")
+            if not isinstance(created, str) or not created:
+                created = raw_entry.get("created_at")
+        else:
+            return None
+
+        if not isinstance(content, str):
+            content = str(content)
+        content = content[:cls.MAX_ENTRY_SIZE]
+
+        entry = {
+            "content": content,
+            "category": category if isinstance(category, str) and category else "general",
+        }
+        if isinstance(created, str) and created:
+            entry["created"] = created
+        return entry
 
     def _load(self):
         if not os.path.isfile(self._file) or os.path.islink(self._file):
-            return []
+            return [], False
         try:
             with open(self._file, encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
-                return data[:self.MAX_ENTRIES]
+                entries = []
+                needs_migration = False
+                for raw_entry in data[:self.MAX_ENTRIES]:
+                    entry = self._normalize_entry(raw_entry)
+                    if entry is None:
+                        needs_migration = True
+                        continue
+                    if entry != raw_entry:
+                        needs_migration = True
+                    entries.append(entry)
+                return entries, needs_migration
         except (json.JSONDecodeError, OSError):
             pass
-        return []
+        return [], False
 
     def _save(self):
         try:
@@ -7624,7 +7668,10 @@ class Memory:
         lines = []
         total = 0
         for e in reversed(self._entries):
-            line = f"- [{e.get('category', 'general')}] {e['content']}"
+            content = e.get("content", "")
+            if not content:
+                continue
+            line = f"- [{e.get('category', 'general')}] {content}"
             if total + len(line) > max_chars:
                 break
             lines.append(line)
@@ -12274,7 +12321,7 @@ def main():
                             print(f"\n  {_ansi(chr(27)+'[38;5;51m')}━━ Memory ({len(entries)} entries) ━━{C.RESET}")
                             for i, e in enumerate(entries):
                                 cat = e.get("category", "general")
-                                print(f"  {_ansi(chr(27)+'[38;5;240m')}[{i}]{C.RESET} {_ansi(chr(27)+'[38;5;87m')}({cat}){C.RESET} {e['content']}")
+                                print(f"  {_ansi(chr(27)+'[38;5;240m')}[{i}]{C.RESET} {_ansi(chr(27)+'[38;5;87m')}({cat}){C.RESET} {e.get('content', '')}")
                             print()
                     elif args.startswith("add "):
                         text = args[4:].strip()
@@ -12302,7 +12349,7 @@ def main():
                         results = memory.search(query)
                         if results:
                             for e in results:
-                                print(f"  {_ansi(chr(27)+'[38;5;87m')}({e.get('category', 'general')}){C.RESET} {e['content']}")
+                                print(f"  {_ansi(chr(27)+'[38;5;87m')}({e.get('category', 'general')}){C.RESET} {e.get('content', '')}")
                         else:
                             print(f"{C.DIM}No matching memories.{C.RESET}")
                     elif args == "clear":
