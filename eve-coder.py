@@ -10774,13 +10774,21 @@ def _exit_plan_mode(agent, session):
     _scroll_aware_print(f"  {_c46}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
 
 
-def _build_footer_status(config, pct):
-    """Build the footer status string with network indicator."""
+def _build_footer_status(config, pct, plan_mode=False):
+    """Build the footer status string with network indicator and mode display."""
     if config.network_status == "online":
         net = "\033[38;5;46m● ON\033[0m"
     else:
         net = "\033[38;5;208m○ OFF\033[0m"
+    
+    # Mode indicator with color
+    if plan_mode:
+        mode = "\033[38;5;226mⓅ PLAN\033[0m"
+    else:
+        mode = "\033[38;5;46mⒶ ACT\033[0m"
+    
     return (f"\033[38;5;51m✦ Ready\033[0m "
+            f"\033[38;5;240m│\033[0m {mode} "
             f"\033[38;5;240m│\033[0m {net} "
             f"\033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m")
 
@@ -11359,7 +11367,7 @@ def main():
         # Store status BEFORE setup() so footer includes it in initial draw
         pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
         tui.scroll_region.update_status(
-            _build_footer_status(config, pct)
+            _build_footer_status(config, pct, plan_mode=agent._plan_mode)
         )
         tui.scroll_region.update_hint("")
         tui.scroll_region.setup()
@@ -12886,7 +12894,7 @@ Review this code for:
             if _scroll_mode and tui.scroll_region._active:
                 pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
                 tui.scroll_region.update_status(
-                    _build_footer_status(config, pct)
+                    _build_footer_status(config, pct, plan_mode=agent._plan_mode)
                 )
                 tui.scroll_region.update_hint("")
 
@@ -12909,7 +12917,7 @@ Review this code for:
             if _scroll_mode and tui.scroll_region._active:
                 pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
                 tui.scroll_region.update_status(
-                    _build_footer_status(config, pct)
+                    _build_footer_status(config, pct, plan_mode=agent._plan_mode)
                 )
                 tui.scroll_region.update_hint("")
             continue
