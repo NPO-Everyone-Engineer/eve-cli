@@ -27,7 +27,7 @@
 
 ### 基本機能
 
-- **ローカル + クラウド**: Ollamaのローカルモデルとクラウドモデル（`qwen3.5:397b-cloud` 等）を自由に切り替え
+- **ローカル + クラウド**: Ollamaのローカルモデル（`qwen3.5:9b` 等）とクラウドモデル（`qwen3.5:397b-cloud`）を自由に切り替え
 - **自動プロファイル切替**: ネットワーク状態を検知し、オンライン/オフラインで最適なモデルを自動選択
 - **ゼロ依存**: Python標準ライブラリのみ使用。pip install は一切不要
 - **日本語対応**: 日本語・英語・中国語でやり取り可能
@@ -157,16 +157,46 @@ eve-cli
 eve-cli -p "Hello Worldを作って"
 ```
 
-結果だけ受け取りたい場合に便利です。CI/CDスクリプトでも使えます。
+結果だけ受け取りたい場合に便利です。CI/CD スクリプトでも使えます。
+
+### 学習モード（コード解説）
+
+```bash
+# 学習モードで起動（難易度レベル 1-5）
+eve-cli --learn
+eve-cli --learn --level 3
+
+# 対話中に解説レベルを変更
+> /learn level 4
+```
+
+### Skills（カスタムコマンド）
+
+```bash
+# コード解説
+/custom explain src/main.py
+
+# コードレビュー
+/custom review src/
+
+# テスト生成
+/custom test calculator.py
+```
 
 ### よく使うオプション
 
 ```bash
-# モデルを指定して起動
-eve-cli --model qwen3:8b
+# ローカルモデルを指定して起動（標準）
+eve-cli --model qwen3.5:9b
 
-# クラウドモデルを使う（高性能・Ollama有料版）
+# ローカルモデル（高性能・メモリ16GB以上）
+eve-cli --model qwen3.5:14b
+
+# クラウドモデルを使う（最高性能・Ollama有料版）
 eve-cli --model qwen3.5:397b-cloud
+
+# サイドカーモデルを設定（会話要約・コンパクション用の軽量モデル）
+EVE_CLI_SIDECAR_MODEL=qwen3.5:3b eve-cli
 
 # 自動許可モード（毎回の確認をスキップ）
 eve-cli -y

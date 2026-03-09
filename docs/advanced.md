@@ -6,6 +6,7 @@
 - [プロジェクト設定ファイル](#プロジェクト設定ファイル)
 - [プロファイル設定（自動切替）](#プロファイル設定自動切替)
 - [Hooks（ライフサイクルフック）](#hooksライフサイクルフック)
+- [Skills（カスタムスキル）](#skills カスタムスキル)
 - [コードインテリジェンス](#コードインテリジェンス)
 - [ブラウザ操作（Playwright MCP）](#ブラウザ操作playwright-mcp)
 - [Agent Teams（マルチエージェント）](#agent-teamsマルチエージェント)
@@ -212,6 +213,132 @@ CONTEXT_WINDOW=8192
 | `EVE_HOOK_TOOL_NAME` | ツール名（PreToolUse/PostToolUse時） |
 | `EVE_HOOK_SESSION_ID` | セッションID |
 | `EVE_HOOK_CWD` | 作業ディレクトリ |
+
+---
+
+## Skills（カスタムスキル）
+
+Skills は、特定のタスクに特化した AI への指示セットです。カスタムコマンドとして再利用可能な形で定義でき、チーム全体で共有できます。
+
+### Skills とは
+
+Skills は以下の要素で構成されます：
+
+- **YAML フロントマター**: メタデータ（説明、許可ツール等）
+- **指示本文**: AI への詳細な指示とチェックリスト
+- **変数展開**: `$ARGUMENTS`, `$0`, `$1` 等で動的な値を埋め込み
+
+### 標準 Skills
+
+EvE CLI には以下の標準 Skills が付属しています：
+
+| Skill | 説明 | 使用例 |
+|-------|------|--------|
+| `explain` | コードの仕組みを詳細解説 | `/custom explain src/main.py` |
+| `review` | コードレビュー（セキュリティ・パフォーマンス・スタイル） | `/custom review src/` |
+| `test` | ユニットテストの自動生成 | `/custom test calculator.py` |
+| `learn` | 学習モード（対話的解説） | `eve-cli --learn` |
+
+### 使い方
+
+```bash
+# Skill を実行
+/custom explain <ファイル名またはトピック>
+/custom review [ディレクトリ]
+/custom test <ファイル名>
+
+# 学習モードで起動
+eve-cli --learn
+eve-cli --learn --level 3
+```
+
+### 保存場所
+
+Skills は以下のディレクトリに `.md` ファイルとして保存します：
+
+| ディレクトリ | 用途 | Git 管理 |
+|-------------|------|---------|
+| `~/.config/eve-cli/skills/` | グローバル Skills（全プロジェクト共通） | — |
+| `.eve-cli/skills/` | チーム共有 Skills | する |
+| `skills/` | プロジェクトルートの Skills | する |
+
+### Skill ファイルの形式
+
+```markdown
+---
+description: スキルの説明
+allowed-tools: [Read, Write, Bash]
+---
+# スキル名
+
+## 概要
+スキルの簡単な説明。
+
+## 使用方法
+具体的な使い方。
+
+## 出力形式
+期待される出力の形式。
+
+## 使用例
+```bash
+/custom skill-name arg1 arg2
+```
+
+## ヒント
+追加の情報やベストプラクティス。
+```
+
+### カスタム Skills の作成例
+
+```markdown
+---
+description: API ドキュメント生成
+allowed-tools: [Read, Write, Glob]
+---
+# API ドキュメント生成
+
+指定されたファイルから API ドキュメントを生成します。
+
+## 要件
+- Markdown 形式
+- 各関数の説明、引数、戻り値を含む
+- 使用例を記載
+
+## 出力先
+docs/api/<filename>.md
+```
+
+### 変数展開
+
+Skill ファイル内で使用できる変数：
+
+| 変数 | 説明 |
+|------|------|
+| `$ARGUMENTS` | コマンドの全引数 |
+| `$0` | Skill 名 |
+| `$1`, `$2`, ... | 位置引数 |
+| `$SKILL_DIR` | Skill ディレクトリのパス |
+| `$CWD` | 現在の作業ディレクトリ |
+
+### 許可ツール
+
+`allowed-tools` で使用できるツールを制限できます：
+
+```markdown
+---
+allowed-tools: [Read, Glob, Grep]
+---
+```
+
+これにより、Skill が読み取り専用であることを保証できます。
+
+### ヒント
+
+- **チーム共有**: `.eve-cli/skills/` に保存して Git で共有
+- **個人用**: `~/.config/eve-cli/skills/` に保存
+- **モジュール化**: 大きな Skill は複数のファイルに分割
+- **テスト**: 作成した Skill を実際に試して改善
 
 ---
 
