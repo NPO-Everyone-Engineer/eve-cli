@@ -29,9 +29,34 @@ class TestLoopModeConfig(unittest.TestCase):
         config.load([])
         
         self.assertFalse(config.loop_mode)
+        self.assertEqual(config.max_agent_steps, Config.DEFAULT_MAX_AGENT_STEPS)
         self.assertEqual(config.max_loop_iterations, 5)
         self.assertEqual(config.done_string, "DONE")
         self.assertIsNone(config.max_loop_hours)
+
+    def test_max_agent_steps(self):
+        """Test setting max agent steps."""
+        config = Config()
+        config.load(["--max-agent-steps", "80"])
+
+        self.assertEqual(config.max_agent_steps, 80)
+
+    def test_max_agent_steps_capped(self):
+        """Test that max agent steps is capped for safety."""
+        config = Config()
+        with patch("builtins.print") as mock_print:
+            config.load(["--max-agent-steps", "500"])
+
+        self.assertEqual(config.max_agent_steps, Config.HARD_MAX_AGENT_STEPS)
+        printed_args = [str(arg) for call in mock_print.call_args_list for arg in call[0]]
+        self.assertTrue(any("max-agent-steps capped" in arg for arg in printed_args))
+
+    def test_max_agent_steps_negative(self):
+        """Test that negative max agent steps raises error."""
+        config = Config()
+        with self.assertRaises(SystemExit):
+            with patch("builtins.print"):
+                config.load(["--max-agent-steps", "-1"])
 
     def test_loop_mode_enabled(self):
         """Test enabling loop mode."""

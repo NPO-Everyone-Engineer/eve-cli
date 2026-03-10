@@ -116,7 +116,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.3.1"
+__version__ = "2.4.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -728,6 +728,8 @@ class Config:
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
     DEFAULT_CONTEXT_WINDOW = 32768
+    DEFAULT_MAX_AGENT_STEPS = 50
+    HARD_MAX_AGENT_STEPS = 200
 
     def __init__(self):
         self.ollama_host = self.DEFAULT_OLLAMA_HOST
@@ -736,6 +738,7 @@ class Config:
         self.max_tokens = self.DEFAULT_MAX_TOKENS
         self.temperature = self.DEFAULT_TEMPERATURE
         self.context_window = self.DEFAULT_CONTEXT_WINDOW
+        self.max_agent_steps = self.DEFAULT_MAX_AGENT_STEPS
         self.prompt = None          # -p one-shot prompt
         self.output_format = "text" # --output-format (text, json, stream-json)
         self.yes_mode = False       # -y auto-approve
@@ -800,6 +803,25 @@ class Config:
         # Custom commands directory
         self.commands_dir = os.path.join(self.config_dir, "commands")
         self.project_commands_dir = os.path.join(os.getcwd(), ".eve-cli", "commands")
+
+    def _normalize_max_agent_steps(self, value, *, emit_errors=False):
+        try:
+            steps = int(value)
+        except (TypeError, ValueError):
+            return None
+        if steps < 1:
+            if emit_errors:
+                print(f"{C.RED}Error: --max-agent-steps must be >= 1{C.RESET}")
+                sys.exit(1)
+            return None
+        if steps > self.HARD_MAX_AGENT_STEPS:
+            if emit_errors:
+                print(
+                    f"{C.YELLOW}Warning: --max-agent-steps capped at "
+                    f"{self.HARD_MAX_AGENT_STEPS}{C.RESET}"
+                )
+            return self.HARD_MAX_AGENT_STEPS
+        return steps
 
     def load(self, argv=None):
         """Load config from file, then env, then CLI args (later overrides earlier)."""
@@ -885,6 +907,10 @@ class Config:
                             self.context_window = int(val)
                         except ValueError:
                             pass
+                    elif key == "MAX_AGENT_STEPS" and val:
+                        parsed = self._normalize_max_agent_steps(val)
+                        if parsed is not None:
+                            self.max_agent_steps = parsed
                     elif key == "MARKDOWN_RENDERER" and val:
                         if val.lower() in ("glow", "simple"):
                             self.markdown_renderer = val.lower()
@@ -912,6 +938,14 @@ class Config:
             self.sidecar_model = os.environ["EVE_CODER_SIDECAR"]
         if os.environ.get("EVE_CLI_SIDECAR_MODEL"):
             self.sidecar_model = os.environ["EVE_CLI_SIDECAR_MODEL"]
+        if os.environ.get("EVE_CODER_MAX_AGENT_STEPS"):
+            parsed = self._normalize_max_agent_steps(os.environ["EVE_CODER_MAX_AGENT_STEPS"])
+            if parsed is not None:
+                self.max_agent_steps = parsed
+        if os.environ.get("EVE_CLI_MAX_AGENT_STEPS"):
+            parsed = self._normalize_max_agent_steps(os.environ["EVE_CLI_MAX_AGENT_STEPS"])
+            if parsed is not None:
+                self.max_agent_steps = parsed
         if os.environ.get("EVE_CLI_PROFILE"):
             self.profile = os.environ["EVE_CLI_PROFILE"]
         if os.environ.get("EVE_CODER_DEBUG") == "1" or os.environ.get("EVE_CLI_DEBUG") == "1":
@@ -962,6 +996,14 @@ class Config:
         parser.add_argument("--max-tokens", type=int, help="Max output tokens")
         parser.add_argument("--temperature", type=float, help="Sampling temperature")
         parser.add_argument("--context-window", type=int, help="Context window size")
+        parser.add_argument(
+            "--max-agent-steps",
+            type=int,
+            help=(
+                f"Max internal AI steps per request "
+                f"(default: {self.DEFAULT_MAX_AGENT_STEPS}, max: {self.HARD_MAX_AGENT_STEPS})"
+            ),
+        )
         parser.add_argument("--version", action="version", version=f"eve-coder {__version__}")
         parser.add_argument("--profile", help="Connection profile: auto, online, offline, or custom name")
         parser.add_argument("--dangerously-skip-permissions", action="store_true",
@@ -1035,6 +1077,10 @@ class Config:
         if args.context_window is not None:
             self.context_window = args.context_window
             self._cli_context_window_set = True
+        if args.max_agent_steps is not None:
+            parsed = self._normalize_max_agent_steps(args.max_agent_steps, emit_errors=True)
+            if parsed is not None:
+                self.max_agent_steps = parsed
         if args.profile:
             self.profile = args.profile
         # RAG args
@@ -9977,7 +10023,7 @@ class TUI:
 class Agent:
     """The main agent that orchestrates LLM calls and tool execution."""
 
-    MAX_ITERATIONS = 50  # safety limit
+    HARD_MAX_ITERATIONS = Config.HARD_MAX_AGENT_STEPS
     MAX_RETRIES = 2      # retries for malformed LLM responses
     MAX_SAME_TOOL_REPEAT = 3  # prevent infinite same-tool loops
     PARALLEL_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep"})  # read-only, no side effects
@@ -10014,6 +10060,7 @@ class Agent:
         self.change_tracker = GitChangeTracker(config.cwd)
         self.auto_test = AutoTestRunner(config.cwd)
         self.file_watcher = FileWatcher(config.cwd)
+        self.max_iterations = max(1, min(config.max_agent_steps, self.HARD_MAX_ITERATIONS))
 
         # Store last assistant output for loop mode completion detection
         self._last_output: str = ""
@@ -10205,7 +10252,7 @@ class Agent:
         )
         _esc_monitor.start()
 
-        for iteration in range(self.MAX_ITERATIONS):
+        for iteration in range(self.max_iterations):
             if self._interrupted.is_set() or _esc_monitor.pressed:
                 if _esc_monitor.pressed:
                     _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
@@ -10299,7 +10346,7 @@ class Agent:
                 self.session._just_compacted = False
 
                 # Handle empty response from local LLM (retry with backoff, max 3)
-                if not text and not tool_calls and iteration < self.MAX_ITERATIONS - 1:
+                if not text and not tool_calls and iteration < self.max_iterations - 1:
                     _empty_retries += 1
                     if _empty_retries > 3:
                         _p(f"\n{C.YELLOW}The AI returned empty responses (the model may be overloaded or incompatible).{C.RESET}")
@@ -10660,7 +10707,7 @@ class Agent:
                     _p(f"{C.DIM}(Run with --debug for full details){C.RESET}")
                 break
         else:
-            _p(f"\n{C.YELLOW}The AI took {self.MAX_ITERATIONS} steps without finishing.{C.RESET}")
+            _p(f"\n{C.YELLOW}The AI took {self.max_iterations} steps without finishing.{C.RESET}")
             _p(f"{C.DIM}Your work so far is saved. Try breaking the task into smaller steps,{C.RESET}")
             _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
 
