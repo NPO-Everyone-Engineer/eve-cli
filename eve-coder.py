@@ -193,6 +193,25 @@ def _get_terminal_width():
         return 80
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# Dangerous Command Detection
+# ════════════════════════════════════════════════════════════════════════════════
+
+DANGEROUS_COMMANDS = [
+    "rm", "sudo", "chmod", "chown",
+    "dd", "mkfs", "fdisk",
+    "curl", "wget",
+    "> /", "| sh", "| bash",
+    "shutdown", "reboot", "kill", "pkill",
+]
+
+def is_dangerous_command(command: str) -> bool:
+    """Check if a command contains dangerous keywords."""
+    if not command:
+        return False
+    return any(keyword in command for keyword in DANGEROUS_COMMANDS)
+
+
 def _char_display_width(ch):
     """Return terminal display width of a single character (1 or 2)."""
     return 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
@@ -9728,6 +9747,29 @@ class TUI:
         elif tool_name in ("WebFetch", "WebSearch"):
             detail = params.get("url", params.get("query", ""))
 
+        # Determine command string for risk assessment
+        command_str = ""
+        if tool_name == "Bash":
+            command_str = params.get("command", "")
+        elif tool_name == "Write":
+            command_str = params.get("file_path", "")
+        elif tool_name == "Edit":
+            command_str = params.get("file_path", "")
+
+        # Determine warning color and text based on risk level
+        if tool_name == "Bash" and is_dangerous_command(command_str):
+            warning_color = _ansi("\033[38;5;196m")  # Red
+            warning_icon = "⚠️"
+            warning_title = "[高リスク]"
+            warning_message = "このコマンドは破壊的な操作を含む可能性があります。"
+            warning_sub = "実行内容を十分に確認してから許可してください。"
+        else:
+            warning_color = _ansi("\033[38;5;226m")  # Yellow
+            warning_icon = "⚡"
+            warning_title = "[注意]"
+            warning_message = "AI がファイルを変更・コマンドを実行します。"
+            warning_sub = "内容を確認してから許可してください。"
+
         # Box-style permission prompt (Japanese display text, English keys retained)
         _y = _ansi("\033[38;5;226m")
         _w = _ansi("\033[38;5;255m")
@@ -9745,6 +9787,10 @@ class TUI:
                     print(f"  {_y}│{C.RESET} {_w}{chunk}{C.RESET}")
         for extra_line in detail_extra:
             print(f"  {_y}│{C.RESET} {extra_line}")
+        print(f"  {_y}│{C.RESET}")
+        # Show risk warning
+        print(f"  {_y}│{C.RESET} {warning_color}{warning_icon} {warning_title} {warning_message}{C.RESET}")
+        print(f"  {_y}│{C.RESET} {warning_color}   {warning_sub}{C.RESET}")
         print(f"  {_y}│{C.RESET}")
         persist_hint = " (保存)" if tool_name not in {"Bash", "Write", "Edit", "NotebookEdit"} else ""
         print(f"  {_y}│{C.RESET}  [y] 一度許可   [a] 常に許可{persist_hint}")
