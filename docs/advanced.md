@@ -1,70 +1,62 @@
-# EvE CLI — 高度な機能
+# 高度な機能
+
+EvE CLI のカスタマイズや高度な設定について解説します。
+
+> 基本的な使い方は [使い方ガイド](usage.md) をご覧ください。
+
+---
 
 ## 目次
 
 - [メモリ（長期記憶）](#メモリ長期記憶)
 - [プロジェクト設定ファイル](#プロジェクト設定ファイル)
-- [プロファイル設定（自動切替）](#プロファイル設定自動切替)
+- [プロファイル（ネットワーク自動切替）](#プロファイルネットワーク自動切替)
 - [Hooks（ライフサイクルフック）](#hooksライフサイクルフック)
-- [Skills（カスタムスキル）](#skills カスタムスキル)
+- [Skills（カスタムスキル）](#skillsカスタムスキル)
 - [コードインテリジェンス](#コードインテリジェンス)
-- [ブラウザ操作（Playwright MCP）](#ブラウザ操作playwright-mcp)
-- [Agent Teams（マルチエージェント）](#agent-teamsマルチエージェント)
-- [環境変数・設定](#環境変数設定)
+- [ブラウザ操作（MCP）](#ブラウザ操作mcp)
+- [Agent Teams](#agent-teams)
+- [環境変数・設定ファイル一覧](#環境変数設定ファイル一覧)
 
 ---
 
 ## メモリ（長期記憶）
 
-セッション間で情報を記憶する機能です。プロジェクトの規約やユーザーの好みを覚えておくことで、毎回説明する手間が省けます。
+セッション間で情報を記憶する機能です。プロジェクトの規約やユーザーの好みを覚えておけます。
 
-### メモリの追加
+### 基本操作
 
 ```
 > /memory add コミットメッセージは日本語で書く
 > /memory add [style] インデントはスペース4つ
-> /memory add [project] データベースはPostgreSQLを使用
+> /memory                         # 一覧表示
+> /memory search インデント        # 検索
+> /memory remove 1                # 削除
+> /memory clear                   # 全削除
 ```
 
 `[カテゴリ]` を付けると整理しやすくなります（省略可）。
 
-### メモリの一覧表示
-
-```
-> /memory
-  [0] (general) コミットメッセージは日本語で書く
-  [1] (style) インデントはスペース4つ
-  [2] (project) データベースはPostgreSQLを使用
-```
-
-### メモリの検索・削除
-
-```
-> /memory search インデント    # キーワード検索
-> /memory remove 1             # インデックス1のメモリを削除
-> /memory clear                # すべて削除
-```
-
 ### 仕組み
 
-- メモリは `~/.config/eve-cli/memory/memory.json` に保存
-- 起動時に自動でシステムプロンプトに注入されるので、AIが常に覚えています
-- 最大100エントリ、各エントリ最大500文字
+- 保存先: `~/.config/eve-cli/memory/memory.json`
+- 起動時にシステムプロンプトに自動注入
+- 最大 100 エントリ、各エントリ最大 500 文字
 
 ---
 
 ## プロジェクト設定ファイル
 
-プロジェクトごとにAIへの指示を設定できます。チーム全体で共有する規約や、個人の好みを記述します。
+プロジェクトごとに AI への指示を設定できます。
 
-### ファイルの優先順位（すべてマージされます）
+### 設定ファイルの種類（すべてマージされます）
 
-| ファイル | 用途 | Git管理 |
+| ファイル | 用途 | Git 管理 |
 |---------|------|---------|
-| `~/.config/eve-cli/CLAUDE.md` | グローバル設定（全プロジェクト共通） | — |
+| `~/.config/eve-cli/CLAUDE.md` | グローバル（全プロジェクト共通） | ― |
 | `.eve-cli/CLAUDE.md` | チーム共有設定 | する |
-| `CLAUDE.md` | プロジェクトルートの設定 | する |
-| `CLAUDE.local.md` | 個人設定（自分だけ） | しない（.gitignore推奨） |
+| `CLAUDE.md` | プロジェクトルート | する |
+| `CLAUDE.local.md` | 個人設定（自分だけ） | しない |
 | `.eve-coder.json` | 旧形式（後方互換） | する |
 
 ### 自動生成
@@ -73,7 +65,7 @@
 > /init
 ```
 
-プロジェクトの言語・フレームワーク・ビルドコマンドを自動検出し、`.eve-cli/CLAUDE.md` を生成します。
+プロジェクトの言語・フレームワーク・ビルドコマンドを自動検出して `.eve-cli/CLAUDE.md` を生成します。
 
 ### 設定例
 
@@ -82,103 +74,67 @@
 
 ## コーディング規約
 - TypeScript を使用
-- インデントはスペース2つ
+- インデントはスペース 2 つ
 - 関数名は camelCase
 
 ## テスト
 - Jest を使用
-- カバレッジ80%以上を維持
+- カバレッジ 80% 以上を維持
 
 ## コミット
 - Conventional Commits 形式
 - 日本語で記述
 ```
 
-### 階層的マージ
-
-親ディレクトリからカレントディレクトリまでの全階層を探索し、見つかった設定ファイルをすべてマージします。合計サイズは8KBに制限されます。
-
 ### セキュリティ
 
-プロジェクト内の `CLAUDE.md` / `.eve-cli/CLAUDE.md` / `.eve-coder.json` などは、**初回に信頼確認が必要**です。
-信頼後にファイル内容が変わった場合は再確認が必要で、状態は `~/.config/eve-cli/trusted_repos.json` に保存されます。
-
-### コンテキスト自動収集
-
-設定ファイルに加えて、起動時に以下の情報を自動収集してAIに提供します:
-
-- **Gitブランチ名** と **直近5コミット**
-- **ディレクトリ構造**（主要ファイル/フォルダ一覧）
-- **プロジェクト種別**（package.json → Node.js、requirements.txt → Python 等を自動検出）
+プロジェクト内の設定ファイル（`CLAUDE.md` / `.eve-cli/CLAUDE.md` / `.eve-coder.json`）は、初回に信頼確認が必要です。ファイル内容が変わると再確認されます。
 
 ---
 
-## プロファイル設定（自動切替）
+## プロファイル（ネットワーク自動切替）
 
 ネットワーク状態に応じてモデルを自動切り替えできます。
 
 ### 設定方法
 
-`~/.config/eve-cli/config` にプロファイルセクションを追加:
+`~/.config/eve-cli/config` にプロファイルセクションを追加：
 
 ```ini
-# デフォルト: ネットワーク状態を自動検知
 PROFILE=auto
 
-# オンライン時 → クラウドモデルを使用（高性能）
 [profile:online]
 MODEL=qwen3.5:397b-cloud
 SIDECAR_MODEL=qwen3:8b
 
-# オフライン時 → ローカルモデルにフォールバック
 [profile:offline]
 MODEL=qwen3:8b
 SIDECAR_MODEL=qwen3:4b
-
-# カスタムプロファイル（例: カフェのWi-Fi環境）
-[profile:cafe]
-MODEL=qwen3:4b
-CONTEXT_WINDOW=8192
 ```
 
 ### 動作
 
-| 設定値 | 動作 |
-|--------|------|
-| `PROFILE=auto` | 起動時にネットワーク接続を自動検知し、`online` または `offline` プロファイルを選択 |
-| `PROFILE=online` | 常にオンラインプロファイルを使用 |
-| `PROFILE=offline` | 常にオフラインプロファイルを使用 |
-| `PROFILE=<カスタム名>` | 指定したプロファイルを使用 |
+| 設定 | 動作 |
+|------|------|
+| `auto` | ネットワーク接続を自動検知して切替 |
+| `online` | 常にオンライン設定を使用 |
+| `offline` | 常にオフライン設定を使用 |
+| カスタム名 | 指定したプロファイルを使用 |
 
-- `--model` / `--ollama-host` / `--max-tokens` / `--temperature` / `--context-window` はプロファイル設定より優先されます
-- フッターに `● ON` / `○ OFF` でネットワーク状態が常時表示されます
+コマンドラインオプション（`--model` 等）はプロファイル設定より優先されます。
 
 ---
 
 ## Hooks（ライフサイクルフック）
 
-エージェントのライフサイクルイベントに対して、カスタムシェルコマンドを実行できます。
+エージェントのイベントに対してカスタムコマンドを実行できます。
 
 ### 設定ファイル
 
-- `~/.config/eve-cli/hooks.json` （グローバル — 常に信頼）
-- `.eve-cli/hooks.json` （プロジェクト単位 — **初回に信頼確認が必要**）
-
-> **セキュリティ警告**: プロジェクトレベルの `.eve-cli/hooks.json` はリポジトリに含まれるファイルです。
-> 悪意あるリポジトリがフックを通じて任意のコマンドを実行する可能性があるため、
-> 初回読み込み時に内容を表示して明示的な許可を求めます。
-> 信頼状態は `~/.config/eve-cli/trusted_hooks.json` にリポジトリごとに保存されます。
-> `hooks.json` または参照しているリポジトリ内スクリプトが変更されると信頼は無効化され、再確認が必要になります。
-
-### セキュリティ制限
-
-| 制限 | 内容 |
-|------|------|
-| **コマンドallowlist** | プロジェクトフックは `echo`, `bash`, `python3`, `node`, `grep` 等の安全なコマンドのみ実行可能 |
-| **リポジトリ内スクリプト検証** | フックが参照する repo 内スクリプトもハッシュ検証対象。symlink や repo 外参照は拒否 |
-| **SessionStart制限** | プロジェクトフックからの `SessionStart` イベントはデフォルトでブロック |
-| **shell=False実行** | シェルインジェクション防止のため、コマンドは配列として安全に実行 |
-| **タイムアウト** | フックごとに設定可能（最大30秒） |
+| ファイル | 用途 | 信頼確認 |
+|---------|------|---------|
+| `~/.config/eve-cli/hooks.json` | グローバル | 不要（常に信頼） |
+| `.eve-cli/hooks.json` | プロジェクト | 初回に必要 |
 
 ### 設定例
 
@@ -196,100 +152,55 @@ CONTEXT_WINDOW=8192
 
 | イベント | タイミング | 用途例 |
 |---------|-----------|--------|
-| `SessionStart` | セッション開始時 | 環境チェック、ログ開始 |
-| `PreToolUse` | ツール実行前 | カスタム承認ロジック、ログ |
+| `SessionStart` | セッション開始時 | 環境チェック |
+| `PreToolUse` | ツール実行前 | カスタム承認、ログ |
 | `PostToolUse` | ツール実行後 | 結果のログ、通知 |
 | `Stop` | セッション終了時 | クリーンアップ |
 
-> **PreToolUse** フックが非ゼロで終了すると、そのツール実行はブロックされます。
+`PreToolUse` フックが非ゼロで終了すると、そのツール実行はブロックされます。
 
-### 環境変数
-
-フック実行時に以下の環境変数が設定されます:
+### フック実行時の環境変数
 
 | 変数 | 説明 |
 |------|------|
 | `EVE_HOOK_EVENT` | イベント名 |
-| `EVE_HOOK_TOOL_NAME` | ツール名（PreToolUse/PostToolUse時） |
-| `EVE_HOOK_SESSION_ID` | セッションID |
+| `EVE_HOOK_TOOL_NAME` | ツール名 |
+| `EVE_HOOK_SESSION_ID` | セッション ID |
 | `EVE_HOOK_CWD` | 作業ディレクトリ |
+
+### セキュリティ制限
+
+- プロジェクトフックは allowlist のコマンドのみ実行可能（`echo`, `bash`, `python3`, `node` 等）
+- リポジトリ内スクリプトはハッシュ検証対象
+- symlink やリポジトリ外への参照は拒否
+- タイムアウト: 最大 30 秒
 
 ---
 
 ## Skills（カスタムスキル）
 
-Skills は、特定のタスクに特化した AI への指示セットです。カスタムコマンドとして再利用可能な形で定義でき、チーム全体で共有できます。
-
-### Skills とは
-
-Skills は以下の要素で構成されます：
-
-- **YAML フロントマター**: メタデータ（説明、許可ツール等）
-- **指示本文**: AI への詳細な指示とチェックリスト
-- **変数展開**: `$ARGUMENTS`, `$0`, `$1` 等で動的な値を埋め込み
+特定のタスクに特化した AI への指示セットを再利用可能な形で定義できます。
 
 ### 標準 Skills
 
-EvE CLI には以下の標準 Skills が付属しています：
-
-| Skill | 説明 | 使用例 |
+| Skill | 説明 | 使い方 |
 |-------|------|--------|
-| `explain` | コードの仕組みを詳細解説 | `/custom explain src/main.py` |
-| `review` | コードレビュー（セキュリティ・パフォーマンス・スタイル） | `/custom review src/` |
-| `test` | ユニットテストの自動生成 | `/custom test calculator.py` |
-| `learn` | 学習モード（対話的解説） | `eve-cli --learn` |
-
-### 使い方
-
-```bash
-# Skill を実行
-/custom explain <ファイル名またはトピック>
-/custom review [ディレクトリ]
-/custom test <ファイル名>
-
-# 学習モードで起動
-eve-cli --learn
-eve-cli --learn --level 3
-```
+| `explain` | コードの仕組みを解説 | `/custom explain src/main.py` |
+| `review` | コードレビュー | `/custom review src/` |
+| `test` | テスト自動生成 | `/custom test calculator.py` |
+| `learn` | 学習モード | `eve-cli --learn` |
 
 ### 保存場所
 
-Skills は以下のディレクトリに `.md` ファイルとして保存します：
-
 | ディレクトリ | 用途 | Git 管理 |
 |-------------|------|---------|
-| `~/.config/eve-cli/skills/` | グローバル Skills（全プロジェクト共通） | — |
-| `.eve-cli/skills/` | チーム共有 Skills | する |
-| `skills/` | プロジェクトルートの Skills | する |
+| `~/.config/eve-cli/skills/` | グローバル（全プロジェクト共通） | ― |
+| `.eve-cli/skills/` | チーム共有 | する |
+| `skills/` | プロジェクトルート | する |
 
-### Skill ファイルの形式
+### カスタム Skill の作り方
 
-```markdown
----
-description: スキルの説明
-allowed-tools: [Read, Write, Bash]
----
-# スキル名
-
-## 概要
-スキルの簡単な説明。
-
-## 使用方法
-具体的な使い方。
-
-## 出力形式
-期待される出力の形式。
-
-## 使用例
-```bash
-/custom skill-name arg1 arg2
-```
-
-## ヒント
-追加の情報やベストプラクティス。
-```
-
-### カスタム Skills の作成例
+`.md` ファイルとして保存します：
 
 ```markdown
 ---
@@ -303,15 +214,12 @@ allowed-tools: [Read, Write, Glob]
 ## 要件
 - Markdown 形式
 - 各関数の説明、引数、戻り値を含む
-- 使用例を記載
 
 ## 出力先
 docs/api/<filename>.md
 ```
 
 ### 変数展開
-
-Skill ファイル内で使用できる変数：
 
 | 変数 | 説明 |
 |------|------|
@@ -321,171 +229,89 @@ Skill ファイル内で使用できる変数：
 | `$SKILL_DIR` | Skill ディレクトリのパス |
 | `$CWD` | 現在の作業ディレクトリ |
 
-### 許可ツール
-
-`allowed-tools` で使用できるツールを制限できます：
-
-```markdown
----
-allowed-tools: [Read, Glob, Grep]
----
-```
-
-これにより、Skill が読み取り専用であることを保証できます。
-
-### ヒント
-
-- **チーム共有**: `.eve-cli/skills/` に保存して Git で共有
-- **個人用**: `~/.config/eve-cli/skills/` に保存
-- **モジュール化**: 大きな Skill は複数のファイルに分割
-- **テスト**: 作成した Skill を実際に試して改善
-
 ---
 
 ## コードインテリジェンス
 
-プロジェクト内の関数・クラス・変数の定義と参照を高速検索できます。
-
-### 対応言語
-
-Python, JavaScript/TypeScript, Go, Rust, Ruby, Java
-
-### 使い方
+プロジェクト内の関数・クラス・変数を高速検索できます。
 
 ```
 > /index build              # インデックスを構築（初回のみ）
 > /index search "handleClick"  # 関数名を検索
 > /index file src/app.py    # ファイル内のシンボル一覧
-> /index status             # インデックスの状態
 ```
 
-### 仕組み
+対応言語: Python, JavaScript/TypeScript, Go, Rust, Ruby, Java
 
-- 正規表現ベースのシンボル抽出（高速・依存なし）
-- `class`, `def`, `function`, `const`, `struct` 等を自動検出
-- AIが自動的に `/index` を使ってコードベースを理解します
+正規表現ベースのシンボル抽出で、外部依存なしに高速動作します。
 
 ---
 
-## ブラウザ操作（Playwright MCP）
+## ブラウザ操作（MCP）
 
-EvE CLI からブラウザを操作できます。Webページの表示、スクリーンショット、フォーム入力、クリックなどが可能です。
+[Playwright MCP](https://github.com/anthropics/mcp) を使って、EvE CLI からブラウザを操作できます。
 
 ### セットアップ
 
 ```bash
-# Node.js が必要（未インストールの場合）
 brew install node
-
-# eve-cli 内でセットアップ
 eve-cli
 > /browser setup
 ```
 
-セットアップ後、eve-cli を再起動するとブラウザ操作ツールが自動で読み込まれます。
+セットアップ後、再起動するとブラウザ操作ツールが自動で読み込まれます。
 
-### 使用例
+### 使い方
 
 ```
 > https://example.com を開いてページの内容を教えて
 > Google で "EvE CLI" を検索して最初の結果を教えて
-> https://example.com のスクリーンショットを撮って
 > フォームに名前を入力して送信ボタンを押して
 ```
 
-### MCP設定
+### MCP 設定ファイル
 
-グローバル設定（`~/.config/eve-cli/mcp.json`）は常に信頼されます:
+| ファイル | 用途 | 信頼確認 |
+|---------|------|---------|
+| `~/.config/eve-cli/mcp.json` | グローバル | 不要 |
+| `.eve-cli/mcp.json` | プロジェクト | 初回に必要 |
 
-```json
-{
-  "mcpServers": {
-    "playwright": {
-      "command": "npx",
-      "args": ["@playwright/mcp@latest"]
-    }
-  }
-}
-```
-
-### プロジェクトレベルMCPのセキュリティ
-
-プロジェクト内の `.eve-cli/mcp.json` は**初回に信頼確認が必要**です。
-
-> **なぜ確認が必要？**
-> リポジトリに含まれる `mcp.json` は、MCPサーバーとして任意のコマンドを起動できます。
-> 悪意あるリポジトリがこれを悪用する可能性があるため、明示的な信頼が必要です。
-
-| セキュリティ制限 | 内容 |
-|----------------|------|
-| **初回確認** | 内容を表示し、ユーザーの明示的な許可を求める |
-| **ハッシュ検証** | ファイル変更時は信頼が無効化され再確認が必要 |
-| **コマンドallowlist** | `npx`, `node`, `python3`, `deno` 等の安全なコマンドのみ許可 |
-| **リポジトリ単位** | 信頼状態は `~/.config/eve-cli/trusted_repos.json` にリポジトリごとに保存 |
+プロジェクトレベルの MCP 設定は、リポジトリに含まれるファイルのためセキュリティ確認が必要です。
 
 ---
 
-## Agent Teams（マルチエージェント）
+## Agent Teams
 
-大きなタスクを複数のAIエージェントに分担させる機能です。
+複数の AI エージェントに大きなタスクを分担させる機能です。
 
 ### 使い方
 
 ```
 > /team このプロジェクトにログイン機能を追加して
-
-# オプション指定
-> /team -n "auth-team" -w 3 認証システムの設計・実装・テストを行って
+> /team -n "auth-team" -w 3 認証の設計・実装・テストを行って
 ```
-
-### オプション
-
-| オプション | 説明 | デフォルト |
-|-----------|------|-----------|
-| `-n <name>` | チーム名 | 自動生成 |
-| `-w <count>` | ワーカー（エージェント）数 | 2 |
 
 ### 仕組み
 
 1. リーダーエージェントがゴールをサブタスクに分解
-2. ワーカーエージェントがそれぞれのタスクを並列で実行
+2. ワーカーエージェントが並列で実行
 3. 共有タスクストアで進捗を管理
-4. 10分のタイムアウトで安全に制限
+4. 10 分のタイムアウトで安全に制限
 
 ---
 
-## 環境変数・設定
+## 環境変数・設定ファイル一覧
 
 ### 環境変数
 
 | 変数 | 説明 | 例 |
 |------|------|-----|
-| `EVE_CLI_MODEL` | デフォルトモデル名 | `qwen3:8b` |
-| `EVE_CLI_SIDECAR_MODEL` | サイドカーモデル名（要約等に使用） | `qwen3:4b` |
-| `EVE_CLI_PROFILE` | 接続プロファイル | `auto`, `online`, `offline` |
-| `EVE_CLI_DEBUG` | デバッグモード | `1` で有効 |
-| `OLLAMA_HOST` | Ollamaホスト URL | `http://localhost:11434` |
-
-### シェル設定（~/.zshrc または ~/.bashrc）
-
-```bash
-# デフォルトモデルを設定
-export EVE_CLI_MODEL="qwen3:8b"
-
-# クラウドモデルを使う場合
-export EVE_CLI_MODEL="qwen3.5:397b-cloud"
-
-# サイドカーモデル（会話要約用の軽量モデル）
-export EVE_CLI_SIDECAR_MODEL="qwen3:4b"
-
-# デバッグモードを有効化
-export EVE_CLI_DEBUG=1
-
-# Ollamaのホストを変更（デフォルト: http://localhost:11434）
-export OLLAMA_HOST="http://localhost:11434"
-```
-
-設定後、ターミナルを再起動するか `source ~/.zshrc` を実行してください。
+| `EVE_CLI_MODEL` | デフォルトモデル | `qwen3:8b` |
+| `EVE_CLI_SIDECAR_MODEL` | サイドカーモデル | `qwen3:4b` |
+| `EVE_CLI_PROFILE` | 接続プロファイル | `auto` |
+| `EVE_CLI_DEBUG` | デバッグモード | `1` |
+| `EVE_CLI_MAX_AGENT_STEPS` | AI ステップ上限 | `80` |
+| `OLLAMA_HOST` | Ollama ホスト URL | `http://localhost:11434` |
 
 ### 設定ファイル（~/.config/eve-cli/config）
 
@@ -496,8 +322,6 @@ OLLAMA_HOST=http://localhost:11434
 MAX_TOKENS=4096
 TEMPERATURE=0.25
 CONTEXT_WINDOW=65536
-
-# プロファイル: auto（デフォルト）、online、offline、カスタム名
 PROFILE=auto
 ```
 
@@ -505,10 +329,12 @@ PROFILE=auto
 
 | ファイル | 内容 |
 |---------|------|
-| `~/.config/eve-cli/config` | メイン設定ファイル |
-| `~/.config/eve-cli/permissions.json` | ツール許可・拒否設定（自動保存） |
+| `~/.config/eve-cli/config` | メイン設定 |
+| `~/.config/eve-cli/permissions.json` | ツール許可・拒否（自動保存） |
 | `~/.config/eve-cli/memory/memory.json` | 長期メモリ |
-| `~/.config/eve-cli/hooks.json` | グローバルフック設定 |
-| `~/.config/eve-cli/mcp.json` | MCPサーバー設定 |
+| `~/.config/eve-cli/hooks.json` | グローバルフック |
+| `~/.config/eve-cli/mcp.json` | MCP サーバー設定 |
 | `~/.config/eve-cli/CLAUDE.md` | グローバルプロジェクト指示 |
 | `~/.config/eve-cli/skills/*.md` | カスタムスキル |
+| `~/.config/eve-cli/trusted_repos.json` | 信頼済みリポジトリ |
+| `~/.config/eve-cli/trusted_hooks.json` | 信頼済みフック |
