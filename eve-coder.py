@@ -9728,11 +9728,11 @@ class TUI:
         elif tool_name in ("WebFetch", "WebSearch"):
             detail = params.get("url", params.get("query", ""))
 
-        # Box-style permission prompt
+        # Box-style permission prompt (Japanese display text, English keys retained)
         _y = _ansi("\033[38;5;226m")
         _w = _ansi("\033[38;5;255m")
         box_w = min(46, _get_terminal_width() - 6)
-        print(f"\n  {_y}╭─ Permission Required {'─' * max(0, box_w - 23)}{C.RESET}")
+        print(f"\n  {_y}╭─ ツールの許可が必要です {'─' * max(0, box_w - 23)}{C.RESET}")
         print(f"  {_y}│{C.RESET} {color}{icon} {tool_name}{C.RESET}")
         if detail:
             # Show full detail, wrapping if needed
@@ -9746,9 +9746,9 @@ class TUI:
         for extra_line in detail_extra:
             print(f"  {_y}│{C.RESET} {extra_line}")
         print(f"  {_y}│{C.RESET}")
-        persist_hint = " (saved)" if tool_name not in {"Bash", "Write", "Edit", "NotebookEdit"} else ""
-        print(f"  {_y}│{C.RESET}  [y] Allow once   [a] Allow all{persist_hint}")
-        print(f"  {_y}│{C.RESET}  [n] Deny (Enter)  [d] Deny all   [Y] Approve everything")
+        persist_hint = " (保存)" if tool_name not in {"Bash", "Write", "Edit", "NotebookEdit"} else ""
+        print(f"  {_y}│{C.RESET}  [y] 一度許可   [a] 常に許可{persist_hint}")
+        print(f"  {_y}│{C.RESET}  [n] 拒否 (Enter)  [d] 常に拒否   [Y] 全て自動許可")
         print(f"  {_y}╰{'─' * box_w}{C.RESET}")
         try:
             reply = self._read_permission_input(f"  {_y}? {C.RESET}")
