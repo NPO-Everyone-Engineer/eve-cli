@@ -1254,10 +1254,22 @@ if echo "$PATH" | grep -q "${HOME}/.local/bin"; then
 fi
 
 # Detect shell rc file (used for PATH setup and post-install hint)
+# ファイルが存在しなくても現在のシェルに合わせて選択する（>> で新規作成される）
 SHELL_RC=""
 _current_shell="$(basename "${SHELL:-}" 2>/dev/null || echo "")"
-if [ "$_current_shell" = "fish" ] && [ -d "${HOME}/.config/fish" ]; then
+if [ "$_current_shell" = "fish" ]; then
+    mkdir -p "${HOME}/.config/fish"
     SHELL_RC="${HOME}/.config/fish/config.fish"
+elif [ "$_current_shell" = "zsh" ]; then
+    SHELL_RC="${HOME}/.zshrc"
+elif [ "$_current_shell" = "bash" ]; then
+    if [ -f "${HOME}/.bashrc" ]; then
+        SHELL_RC="${HOME}/.bashrc"
+    elif [ -f "${HOME}/.bash_profile" ]; then
+        SHELL_RC="${HOME}/.bash_profile"
+    else
+        SHELL_RC="${HOME}/.bashrc"
+    fi
 elif [ -f "${HOME}/.zshrc" ]; then
     SHELL_RC="${HOME}/.zshrc"
 elif [ -f "${HOME}/.bashrc" ]; then
