@@ -147,6 +147,7 @@ class C:
     BCYAN   = "\033[96m"
 
     _enabled = True
+    _theme = "normal"  # Current UI theme
 
     @classmethod
     def disable(cls):
@@ -154,6 +155,65 @@ class C:
             if attr.isupper() and isinstance(getattr(cls, attr), str) and attr != "_enabled":
                 setattr(cls, attr, "")
         cls._enabled = False
+
+    @classmethod
+    def apply_theme(cls, theme_name: str):
+        """Apply a UI theme by updating color codes."""
+        cls._theme = theme_name
+        if theme_name == "gal":
+            cls.RED     = "\033[38;5;207m"  # Pink
+            cls.GREEN   = "\033[38;5;141m"  # Purple
+            cls.YELLOW  = "\033[38;5;229m"  # Yellow
+            cls.BLUE    = "\033[38;5;141m"  # Purple
+            cls.MAGENTA = "\033[38;5;207m"  # Pink
+            cls.CYAN    = "\033[38;5;229m"  # Yellow
+            cls.BRED    = "\033[38;5;207m"
+            cls.BGREEN  = "\033[38;5;141m"
+            cls.BYELLOW = "\033[38;5;229m"
+            cls.BBLUE   = "\033[38;5;141m"
+            cls.BMAGENTA= "\033[38;5;207m"
+            cls.BCYAN   = "\033[38;5;229m"
+        elif theme_name == "dandy":
+            cls.RED     = "\033[38;5;172m"  # Brown/Gold
+            cls.GREEN   = "\033[38;5;178m"  # Light brown
+            cls.YELLOW  = "\033[38;5;166m"  # Orange
+            cls.BLUE    = "\033[38;5;172m"  # Brown
+            cls.MAGENTA = "\033[38;5;178m"  # Light brown
+            cls.CYAN    = "\033[38;5;166m"  # Orange
+            cls.BRED    = "\033[38;5;172m"
+            cls.BGREEN  = "\033[38;5;178m"
+            cls.BYELLOW = "\033[38;5;166m"
+            cls.BBLUE   = "\033[38;5;172m"
+            cls.BMAGENTA= "\033[38;5;178m"
+            cls.BCYAN   = "\033[38;5;166m"
+        elif theme_name == "bushi":
+            cls.RED     = "\033[38;5;1m"    # Red
+            cls.GREEN   = "\033[38;5;214m"  # Gold
+            cls.YELLOW  = "\033[38;5;236m"  # Dark
+            cls.BLUE    = "\033[38;5;1m"    # Red
+            cls.MAGENTA = "\033[38;5;214m"  # Gold
+            cls.CYAN    = "\033[38;5;236m"  # Dark
+            cls.BRED    = "\033[38;5;1m"
+            cls.BGREEN  = "\033[38;5;214m"
+            cls.BYELLOW = "\033[38;5;236m"
+            cls.BBLUE   = "\033[38;5;1m"
+            cls.BMAGENTA= "\033[38;5;214m"
+            cls.BCYAN   = "\033[38;5;236m"
+        else:  # normal
+            cls.RED     = "\033[31m"
+            cls.GREEN   = "\033[32m"
+            cls.YELLOW  = "\033[33m"
+            cls.BLUE    = "\033[34m"
+            cls.MAGENTA = "\033[35m"
+            cls.CYAN    = "\033[36m"
+            cls.WHITE   = "\033[37m"
+            cls.GRAY    = "\033[90m"
+            cls.BRED    = "\033[91m"
+            cls.BGREEN  = "\033[92m"
+            cls.BYELLOW = "\033[93m"
+            cls.BBLUE   = "\033[94m"
+            cls.BMAGENTA= "\033[95m"
+            cls.BCYAN   = "\033[96m"
 
 # On Windows, try to enable ANSI/VT processing in the console
 if os.name == "nt":
@@ -800,6 +860,7 @@ class Config:
         self.learn_mode = False
         self.learn_level = 3  # 1-5 (1=concise, 5=very detailed)
         self.learn_auto_explain = True  # auto-explain on errors
+        self.ui_theme = "normal"  # UI theme: normal, gal, dandy, bushi
 
         # Paths (primary: eve-cli, with backward compat for old eve-coder dirs)
         if os.name == "nt":
@@ -1066,6 +1127,9 @@ class Config:
                             help="Enable learn mode: interactive explanations for code and errors")
         parser.add_argument("--level", type=int, choices=[1, 2, 3, 4, 5], default=3,
                             help="Learn mode level: 1=concise, 5=very detailed (default: 3)")
+        # UI Theme
+        parser.add_argument("--theme", choices=["normal", "gal", "dandy", "bushi"], default="normal",
+                            help="UI theme: normal, gal, dandy, bushi (default: normal)")
         args = parser.parse_args(argv)
 
         if args.prompt:
@@ -1148,6 +1212,10 @@ class Config:
             self.learn_mode = True
         if args.level:
             self.learn_level = args.level
+        # UI Theme args
+        if args.theme:
+            self.ui_theme = args.theme
+            C.apply_theme(args.theme)
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -3256,7 +3324,19 @@ class Tool(ABC):
 
 class BashTool(Tool):
     name = "Bash"
-    description = "Execute a bash command. Use for git, npm, pip, python, curl, etc. Set run_in_background=true for long-running commands."
+    description = """bash コマンドをサブプロセスで実行する。
+
+使い分けの指針:
+- ファイル読み込みには Read ツールを使うこと（cat の代替）
+- ファイル書き込みには Write/Edit ツールを使うこと
+- ファイル検索には Glob/Grep ツールを使うこと
+- このツールはシステムコマンドや複合パイプライン専用
+
+制約事項:
+- バックグラウンド実行（&, nohup, setsid）は不可（run_in_background フラグを使用）
+- curl|sh 等のパイプシェルは安全のためブロック
+- タイムアウト：デフォルト 120 秒（最大 600 秒）
+- 機密環境変数は自動除去される"""
     parameters = {
         "type": "object",
         "properties": {
@@ -3900,7 +3980,12 @@ def _is_protected_path(file_path):
 
 class WriteTool(Tool):
     name = "Write"
-    description = "Write content to a file. Creates parent directories if needed."
+    description = """新規ファイルを作成する、または既存ファイルを全上書きする。
+
+重要:
+- 既存ファイルの一部を変更する場合は Edit ツールを使うこと
+- 大きなファイル（500 行超）は分割して生成することを検討
+- パスはプロジェクトルートからの相対パスまたは絶対パスで指定"""
     parameters = {
         "type": "object",
         "properties": {
@@ -12148,6 +12233,53 @@ def main():
                                 print(f"{C.DIM}Auto-explain: {status}{C.RESET}")
                         else:
                             print(f"{C.DIM}Usage: /learn [on|off|level <1-5>|auto on|off]{C.RESET}")
+                    continue
+                # ── UI Theme ────────────────────────────────────────
+                elif cmd == "/theme":
+                    parts = user_input.split()
+                    if len(parts) == 1:
+                        # Show current theme and available themes
+                        print(f"{C.BOLD}━━━ UI テーマ ━━━{C.RESET}")
+                        print(f"  現在のテーマ：{config.ui_theme}")
+                        print(f"  利用可能なテーマ:")
+                        themes_info = {
+                            "normal": ("standard", "▶"),
+                            "gal": ("vivid", "✨"),
+                            "dandy": ("elegant", "🎩"),
+                            "bushi": ("warrior", "⚔️")
+                        }
+                        for name, (style, icon) in themes_info.items():
+                            marker = "✓" if name == config.ui_theme else " "
+                            print(f"  {marker} {name:8} - {style} ({icon})")
+                        print(f"  使い方：/theme <theme_name>")
+                        print(f"  例：/theme gal")
+                    else:
+                        theme_name = parts[1].lower()
+                        if theme_name in ("normal", "gal", "dandy", "bushi"):
+                            config.ui_theme = theme_name
+                            C.apply_theme(theme_name)
+                            print(f"{C.GREEN}テーマを '{theme_name}' に変更しました。{C.RESET}")
+                            # Save to config file
+                            try:
+                                config_path = os.path.join(config.config_dir, "config")
+                                if os.path.exists(config_path):
+                                    with open(config_path, "r", encoding="utf-8") as f:
+                                        lines = f.readlines()
+                                    updated = False
+                                    for i, line in enumerate(lines):
+                                        if line.startswith("UI_THEME="):
+                                            lines[i] = "UI_THEME=" + theme_name + "\n"
+                                            updated = True
+                                            break
+                                    if not updated:
+                                        lines.append("UI_THEME=" + theme_name + "\n")
+                                    with open(config_path, "w", encoding="utf-8") as f:
+                                        f.writelines(lines)
+                            except (OSError, IOError):
+                                pass  # Config file write failed — skip silently
+                        else:
+                            print(f"{C.YELLOW}未知のテーマ：{theme_name}{C.RESET}")
+                            print(f"  利用可能なテーマ：normal, gal, dandy, bushi")
                     continue
 
                 # ── Git checkpoint & rollback ────────────────────────
