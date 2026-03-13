@@ -542,9 +542,10 @@ class ScrollRegion:
         status_row = self._rows - 1
         hint_row = self._rows
 
-        _dim = "\033[38;5;240m"
-        _sep_color = "\033[38;5;245m"   # brighter than _dim for visibility
-        _rst = "\033[0m"
+        # Use themed colors from C class
+        _dim = C.DIM
+        _sep_color = C.CYAN   # Use themed CYAN for separator (changes with theme)
+        _rst = C.RESET
 
         # Build entire footer as one string (prevents escape sequence fragmentation)
         buf = f"\033[{sep_row};1H\033[2K{_sep_color}{'─' * self._cols}{_rst}"
@@ -1133,7 +1134,7 @@ class Config:
         parser.add_argument("--level", type=int, choices=[1, 2, 3, 4, 5], default=3,
                             help="Learn mode level: 1=concise, 5=very detailed (default: 3)")
         # UI Theme
-        parser.add_argument("--theme", choices=["normal", "gal", "dandy", "bushi"], default="normal",
+        parser.add_argument("--theme", choices=["normal", "gal", "dandy", "bushi"], default=None,
                             help="UI theme: normal, gal, dandy, bushi (default: normal)")
         args = parser.parse_args(argv)
 
@@ -1224,6 +1225,9 @@ class Config:
         elif self.ui_theme and self.ui_theme != "normal":
             # Apply theme from config file if not default
             C.apply_theme(self.ui_theme)
+        else:
+            # Default theme (normal) - ensure it's applied
+            C.apply_theme("normal")
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
