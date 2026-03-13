@@ -160,6 +160,7 @@ class C:
     def apply_theme(cls, theme_name: str):
         """Apply a UI theme by updating color codes."""
         cls._theme = theme_name
+        cls._enabled = True  # Re-enable colors if they were disabled
         if theme_name == "gal":
             cls.RED     = "\033[38;5;207m"  # Pink
             cls.GREEN   = "\033[38;5;141m"  # Purple
@@ -173,6 +174,12 @@ class C:
             cls.BBLUE   = "\033[38;5;141m"
             cls.BMAGENTA= "\033[38;5;207m"
             cls.BCYAN   = "\033[38;5;229m"
+            # Banner gradient for gal theme (pink -> purple -> yellow)
+            cls.BANNER_GRADIENT = [
+                "\033[38;5;207m", "\033[38;5;206m", "\033[38;5;205m",
+                "\033[38;5;141m", "\033[38;5;142m", "\033[38;5;229m",
+            ]
+            cls.SEP_GRADIENT = [207, 206, 205, 141, 142, 229, 229, 142, 141, 205, 206, 207]
         elif theme_name == "dandy":
             cls.RED     = "\033[38;5;172m"  # Brown/Gold
             cls.GREEN   = "\033[38;5;178m"  # Light brown
@@ -186,6 +193,12 @@ class C:
             cls.BBLUE   = "\033[38;5;172m"
             cls.BMAGENTA= "\033[38;5;178m"
             cls.BCYAN   = "\033[38;5;166m"
+            # Banner gradient for dandy theme (brown -> gold -> orange)
+            cls.BANNER_GRADIENT = [
+                "\033[38;5;172m", "\033[38;5;173m", "\033[38;5;178m",
+                "\033[38;5;214m", "\033[38;5;166m", "\033[38;5;172m",
+            ]
+            cls.SEP_GRADIENT = [172, 173, 178, 214, 166, 172, 172, 166, 214, 178, 173, 172]
         elif theme_name == "bushi":
             cls.RED     = "\033[38;5;1m"    # Red
             cls.GREEN   = "\033[38;5;214m"  # Gold
@@ -199,6 +212,12 @@ class C:
             cls.BBLUE   = "\033[38;5;1m"
             cls.BMAGENTA= "\033[38;5;214m"
             cls.BCYAN   = "\033[38;5;236m"
+            # Banner gradient for bushi theme (red -> gold -> dark)
+            cls.BANNER_GRADIENT = [
+                "\033[38;5;1m", "\033[38;5;124m", "\033[38;5;160m",
+                "\033[38;5;214m", "\033[38;5;208m", "\033[38;5;236m",
+            ]
+            cls.SEP_GRADIENT = [1, 124, 160, 214, 208, 236, 236, 208, 214, 160, 124, 1]
         else:  # normal
             cls.RED     = "\033[31m"
             cls.GREEN   = "\033[32m"
@@ -212,6 +231,12 @@ class C:
             cls.BGREEN  = "\033[92m"
             cls.BYELLOW = "\033[93m"
             cls.BBLUE   = "\033[94m"
+            # Banner gradient for normal theme (blue gradient)
+            cls.BANNER_GRADIENT = [
+                "\033[38;5;51m", "\033[38;5;45m", "\033[38;5;39m",
+                "\033[38;5;33m", "\033[38;5;27m", "\033[38;5;21m",
+            ]
+            cls.SEP_GRADIENT = [51, 45, 39, 33, 27, 21, 21, 27, 33, 39, 45, 51]
             cls.BMAGENTA= "\033[95m"
             cls.BCYAN   = "\033[96m"
 
@@ -8786,7 +8811,8 @@ class TUI:
             # Minimal banner for tiny terminals
             banner_lines = ["  EVE-CLI"]
 
-        gradient = [
+        # Use theme-based gradient for banner
+        gradient = C.BANNER_GRADIENT if hasattr(C, 'BANNER_GRADIENT') else [
             _ansi("\033[38;5;198m"), _ansi("\033[38;5;199m"), _ansi("\033[38;5;200m"),
             _ansi("\033[38;5;201m"), _ansi("\033[38;5;165m"), _ansi("\033[38;5;129m"),
         ]
@@ -8795,13 +8821,15 @@ class TUI:
             color = gradient[i % len(gradient)]
             print(f"{color}{line}{C.RESET}")
 
-        # Subtitle with neon glow effect
-        print(f"\n  {_ansi(chr(27)+'[38;5;51m')}{C.BOLD}🚀 E v e r y o n e . E n g i n e e r   C L I 🚀{C.RESET}")
-        print(f"  {_ansi(chr(27)+'[38;5;87m')}v{__version__}{C.RESET}  "
+        # Subtitle with neon glow effect (use theme colors)
+        subtitle_color = C.CYAN if hasattr(C, 'CYAN') else _ansi(chr(27)+'[38;5;51m')
+        subtitle_dim = _ansi(chr(27)+'[38;5;87m') if C._theme == "normal" else C.GREEN
+        print(f"\n  {subtitle_color}{C.BOLD}🚀 E v e r y o n e . E n g i n e e r   C L I 🚀{C.RESET}")
+        print(f"  {subtitle_dim}v{__version__}{C.RESET}  "
               f"{C.DIM}// No login • Local + Cloud • Fully OSS • Powered by Ollama{C.RESET}")
 
-        # Adaptive rainbow separator (use ── U+2500 Na width, safe for CJK terminals)
-        sep_colors = [198, 199, 200, 201, 165, 129, 93, 57, 51, 45, 39, 33, 27, 33, 39, 45, 51, 57, 93, 129, 165, 201, 200, 199]
+        # Adaptive separator with theme-based colors
+        sep_colors = C.SEP_GRADIENT if hasattr(C, 'SEP_GRADIENT') else [198, 199, 200, 201, 165, 129, 93, 57, 51, 45, 39, 33, 27, 33, 39, 45, 51, 57, 93, 129, 165, 201, 200, 199]
         max_pairs = min(len(sep_colors), (term_w - 4) // 2)
         sep_line = "  "
         for i in range(max_pairs):
