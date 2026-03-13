@@ -12287,7 +12287,30 @@ def main():
                             config.ui_theme = theme_name
                             C.apply_theme(theme_name)
                             print(f"{C.GREEN}テーマを '{theme_name}' に変更しました。{C.RESET}")
-                            # Save to config file
+                            # Save to project config file (.eve-cli/config)
+                            try:
+                                project_config_path = os.path.join(os.getcwd(), ".eve-cli", "config")
+                                if os.path.exists(project_config_path):
+                                    with open(project_config_path, "r", encoding="utf-8") as f:
+                                        lines = f.readlines()
+                                    updated = False
+                                    for i, line in enumerate(lines):
+                                        if line.startswith("UI_THEME="):
+                                            lines[i] = "UI_THEME=" + theme_name + "\n"
+                                            updated = True
+                                            break
+                                    if not updated:
+                                        lines.append("UI_THEME=" + theme_name + "\n")
+                                    with open(project_config_path, "w", encoding="utf-8") as f:
+                                        f.writelines(lines)
+                                else:
+                                    # Create project config file if it doesn't exist
+                                    os.makedirs(os.path.dirname(project_config_path), exist_ok=True)
+                                    with open(project_config_path, "w", encoding="utf-8") as f:
+                                        f.write("UI_THEME=" + theme_name + "\n")
+                            except (OSError, IOError):
+                                pass  # Project config file write failed — skip silently
+                            # Also save to global config file (~/.config/eve-cli/config)
                             try:
                                 config_path = os.path.join(config.config_dir, "config")
                                 if os.path.exists(config_path):
@@ -12303,6 +12326,11 @@ def main():
                                         lines.append("UI_THEME=" + theme_name + "\n")
                                     with open(config_path, "w", encoding="utf-8") as f:
                                         f.writelines(lines)
+                                else:
+                                    # Create config file if it doesn't exist
+                                    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                                    with open(config_path, "w", encoding="utf-8") as f:
+                                        f.write("UI_THEME=" + theme_name + "\n")
                             except (OSError, IOError):
                                 pass  # Config file write failed — skip silently
                         else:
