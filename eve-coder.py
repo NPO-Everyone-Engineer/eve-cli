@@ -11793,14 +11793,28 @@ def main():
         tui.scroll_region.setup()
 
     while True:
+        # Start ESC monitor for input waiting (detect ? key during input prompt)
+        _input_esc_monitor = InputMonitor()
+        _input_esc_monitor.start()
+        
         try:
             user_input = tui.get_multiline_input(
                 session=session, plan_mode=agent._plan_mode,
                 prefill=_typeahead_text,
             )
             _typeahead_text = ""  # consumed
+            
+            # Check if ? was pressed during input waiting
+            if _input_esc_monitor._show_command_palette:
+                _input_esc_monitor.stop()
+                show_command_palette()
+                continue
+            
             if user_input is None:
+                _input_esc_monitor.stop()
                 break
+
+            _input_esc_monitor.stop()
 
             user_input = user_input.strip()
             if not user_input:
