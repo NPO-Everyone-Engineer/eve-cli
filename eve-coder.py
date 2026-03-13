@@ -3347,6 +3347,16 @@ class Tool(ABC):
     def _base_dir(self):
         return self.cwd or os.getcwd()
 
+    def _is_path_within_repo(self, file_path):
+        """Check if file_path is within the repo directory."""
+        try:
+            real_path = os.path.realpath(file_path)
+            real_repo = os.path.realpath(self._base_dir())
+            # Ensure the resolved path starts with the repo path
+            return real_path.startswith(real_repo + os.sep) or real_path == real_repo
+        except (OSError, ValueError):
+            return False
+
     def get_schema(self):
         """Return OpenAI function calling schema."""
         return {
@@ -3789,6 +3799,10 @@ class ReadTool(Tool):
         if not os.path.isabs(file_path):
             file_path = os.path.join(self._base_dir(), file_path)
 
+        # Security: Ensure file is within repo directory
+        if not self._is_path_within_repo(file_path):
+            return f"Error: access denied - file is outside repository: {file_path}"
+
         # Resolve symlinks to detect escapes
         try:
             real_path = os.path.realpath(file_path)
@@ -3798,6 +3812,9 @@ class ReadTool(Tool):
             return f"Error: file not found: {file_path}"
         if os.path.isdir(real_path):
             return f"Error: {file_path} is a directory, not a file"
+        # Double-check after resolution
+        if not self._is_path_within_repo(real_path):
+            return f"Error: access denied - resolved path is outside repository"
         # Use resolved path for actual reading
         file_path = real_path
 
@@ -4453,6 +4470,10 @@ class GlobTool(Tool):
         if not os.path.isabs(base):
             base = os.path.join(self._base_dir(), base)
 
+        # Security: Ensure base directory is within repo
+        if not self._is_path_within_repo(base):
+            return "Error: access denied - search path is outside repository"
+
         # Bounded heap to avoid collecting millions of matches into memory
         heap = []  # min-heap of (mtime, path) — keeps newest MAX_RESULTS items
         total_found = 0
@@ -4608,6 +4629,9 @@ class GrepTool(Tool):
 
         if not pat_str:
             return "Error: no pattern provided"
+        # Security: Ensure search path is within repo
+        if not self._is_path_within_repo(search_path):
+            return "Error: access denied - search path is outside repository"
         # ReDoS protection: limit pattern length and reject nested quantifiers
         if len(pat_str) > 500:
             return "Error: regex pattern too long (max 500 chars)"
@@ -6067,14 +6091,69 @@ def _compute_file_hash(fpath):
         return ""
 
 
+def _compute_mcp_trust_hashes(config, proj_mcp_path):
+    """Compute trust hashes for MCP config and any repo assets it references."""
+    hashes = {}
+    try:
+        with open(proj_mcp_path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or "mcpServers" not in data:
+            return {}
+        # Always hash the mcp.json itself
+        mcp_hash = _compute_file_hash(proj_mcp_path)
+        if mcp_hash:
+            hashes[os.path.join(".eve-cli", "mcp.json")] = mcp_hash
+        # Extract referenced repo assets from command/args
+        cwd = _repo_key(config)
+        for name, srv in data["mcpServers"].items():
+            if not isinstance(srv, dict):
+                continue
+            cmd = srv.get("command", "")
+            args = srv.get("args", [])
+            # Collect all potential file references from command and args
+            all_parts = cmd.split() + args
+            for part in all_parts:
+                # Check if part looks like a file path within repo
+                if not part:
+                    continue
+                # Resolve relative to cwd if not absolute
+                if not os.path.isabs(part):
+                    part = os.path.join(cwd, part)
+                try:
+                    real = os.path.realpath(part)
+                except (OSError, ValueError):
+                    continue
+                # Only include if within repo and is a regular file
+                if real != cwd and real.startswith(cwd + os.sep) and os.path.isfile(real) and not os.path.islink(real):
+                    rel = _repo_relpath(config, real)
+                    if rel and rel not in hashes:
+                        h = _compute_file_hash(real)
+                        if h:
+                            hashes[rel] = h
+    except (OSError, json.JSONDecodeError):
+        pass
+    return hashes
+
+
 def _is_mcp_trusted(config, proj_mcp_path):
     """Check if the project MCP config is trusted. Prompt user if not."""
-    return _ensure_repo_scope_trusted(
+    hashes = _compute_mcp_trust_hashes(config, proj_mcp_path)
+    if not hashes:
+        return False
+    trusted = _load_trusted_repos(config)
+    entry = trusted.get(_repo_key(config))
+    previous_hashes = _get_repo_scope_hashes(entry, "mcp")
+    if previous_hashes == hashes:
+        return True
+    if previous_hashes:
+        print(f"{C.YELLOW}Warning: trusted MCP config or referenced assets have changed.{C.RESET}",
+              file=sys.stderr)
+    return _prompt_repo_trust(
         config,
         "mcp",
         "MCP Trust Required",
         "Project MCP files can start local processes and expose external tools.",
-        [proj_mcp_path],
+        hashes,
         preview_paths=[proj_mcp_path],
     )
 
@@ -7652,8 +7731,8 @@ class HookManager:
             elif matcher and isinstance(matcher, dict) and not context:
                 # Matcher specified but no context — skip
                 continue
-            # Build environment with EVE_HOOK_ prefixed variables
-            env = os.environ.copy()
+            # Build sanitized environment (same as BashTool) to avoid leaking secrets
+            env = self._build_clean_env()
             env["EVE_HOOK_EVENT"] = event
             if context:
                 for k, v in context.items():

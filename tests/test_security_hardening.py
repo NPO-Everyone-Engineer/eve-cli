@@ -146,6 +146,78 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertIn("EVE_CLI_ALLOW_UNVERIFIED_HOMEBREW_INSTALLER", content)
         self.assertIn("EVE_CLI_ALLOW_UNVERIFIED_OLLAMA_INSTALLER", content)
 
+    def test_read_tool_blocks_path_escape_via_symlink(self):
+        config = self.make_config()
+        # Create a symlink pointing outside repo
+        outside_file = Path(self.test_dir, "outside.txt")
+        outside_file.write_text("secret", encoding="utf-8")
+        symlink = Path(self.project_dir, "escape.txt")
+        symlink.symlink_to(outside_file)
+
+        read_tool = eve_coder.ReadTool(cwd=config.cwd)
+        result = read_tool.execute({"file_path": str(symlink)})
+
+        self.assertIn("access denied", result.lower())
+
+    def test_read_tool_blocks_absolute_path_outside_repo(self):
+        config = self.make_config()
+        outside_file = Path(self.test_dir, "outside.txt")
+        outside_file.write_text("secret", encoding="utf-8")
+
+        read_tool = eve_coder.ReadTool(cwd=config.cwd)
+        result = read_tool.execute({"file_path": str(outside_file)})
+
+        self.assertIn("access denied", result.lower())
+
+    def test_glob_tool_blocks_search_path_outside_repo(self):
+        config = self.make_config()
+        outside_dir = Path(self.test_dir, "outside_dir")
+        outside_dir.mkdir(exist_ok=True)
+        Path(outside_dir, "test.py").write_text("print('x')", encoding="utf-8")
+
+        glob_tool = eve_coder.GlobTool(cwd=config.cwd)
+        result = glob_tool.execute({"pattern": "*.py", "path": str(outside_dir)})
+
+        self.assertIn("access denied", result.lower())
+
+    def test_grep_tool_blocks_search_path_outside_repo(self):
+        config = self.make_config()
+        outside_file = Path(self.test_dir, "outside.txt")
+        outside_file.write_text("secret data", encoding="utf-8")
+
+        grep_tool = eve_coder.GrepTool(cwd=config.cwd)
+        result = grep_tool.execute({"pattern": "secret", "path": str(outside_file)})
+
+        self.assertIn("access denied", result.lower())
+
+    def test_mcp_trust_hashes_includes_referenced_assets(self):
+        config = self.make_config()
+        eve_cli_dir = Path(self.project_dir, ".eve-cli")
+        eve_cli_dir.mkdir(exist_ok=True)
+        mcp_file = eve_cli_dir / "mcp.json"
+        # Create a referenced asset
+        asset_file = Path(self.project_dir, "assets", "config.yaml")
+        asset_file.parent.mkdir(exist_ok=True)
+        asset_file.write_text("key: value", encoding="utf-8")
+        mcp_file.write_text(
+            '{"mcpServers": {"test": {"command": "python3", "args": ["' + str(asset_file) + '"]}}}',
+            encoding="utf-8",
+        )
+
+        hashes = eve_coder._compute_mcp_trust_hashes(config, str(mcp_file))
+
+        self.assertIn(".eve-cli/mcp.json", hashes)
+        # Check that referenced asset within repo is included
+        self.assertTrue(any("assets/config.yaml" in k for k in hashes.keys()))
+
+    def test_hooks_use_sanitized_environment(self):
+        config = self.make_config()
+        hooks_mgr = eve_coder.HookManager(config)
+        # Verify _build_clean_env is used (check source code)
+        import inspect
+        source = inspect.getsource(hooks_mgr.fire)
+        self.assertIn("_build_clean_env()", source)
+
 
 if __name__ == "__main__":
     unittest.main()
