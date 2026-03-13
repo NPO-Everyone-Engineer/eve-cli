@@ -49,16 +49,8 @@ import shlex
 try:
     import readline
     HAS_READLINE = True
-    # Detect libedit vs GNU readline
-    _is_libedit = 'libedit' in (readline.__doc__ or '')
-    # Bind Shift+Enter (CSI 27;2;13~) to prevent raw escape sequence leak.
-    try:
-        if _is_libedit:
-            readline.parse_and_bind("bind -s '\\e[27;2;13~' '\\n'")
-        else:
-            readline.parse_and_bind(r'"\e[27;2;13~": "\n"')
-    except Exception:
-        pass
+    # NOTE: Do NOT use bind -s on macOS libedit - it breaks Japanese IME input.
+    # Shift+Enter escape sequences are stripped post-input via regex instead.
 except ImportError:
     HAS_READLINE = False
 
@@ -116,7 +108,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.4.3"
+__version__ = "2.4.4"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -811,7 +803,7 @@ class ScrollRegion:
 
         hint = self._hint_text or ""
         mode_display = self._mode_display or ""
-        hint_prefix = f" {_dim}ESC: stop  ?: コマンド"
+        hint_prefix = f" {_dim}ESC: 中断"
         if mode_display:
             hint_prefix += f" {_dim}| {mode_display}"
         if hint:
@@ -918,25 +910,20 @@ def _debug_scroll_region(tui):
 # ════════════════════════════════════════════════════════════════════════════════
 
 class InputMonitor:
-    """Detect ESC key press and capture type-ahead during agent execution.
+    """Detect ESC key press for interrupt during agent execution.
 
     Unix-only: uses termios + tty.setcbreak for real-time key detection.
     On Windows (or when termios is unavailable), all methods are no-ops.
 
-    Type-ahead: any non-ESC characters typed during agent execution are
-    buffered and can be injected into readline's next input() call via
-    get_typeahead() + readline.set_startup_hook.
+    NOTE: Type-ahead capture was removed due to IME compatibility issues.
+    Only ESC key detection is supported for safe interrupt functionality.
     """
 
     def __init__(self, on_typeahead=None):
         self._pressed = threading.Event()
-        self._show_command_palette = False  # ? key flag for command palette
         self._stop_event = threading.Event()
         self._thread = None
         self._old_settings = None
-        self._typeahead = []      # buffered keystrokes (bytes)
-        self._typeahead_lock = threading.Lock()
-        self._on_typeahead = on_typeahead  # callback(text) for live type-ahead display
 
     @property
     def pressed(self):
@@ -949,8 +936,6 @@ class InputMonitor:
             return
         self._pressed.clear()
         self._stop_event.clear()
-        with self._typeahead_lock:
-            self._typeahead.clear()
         try:
             self._old_settings = termios.tcgetattr(sys.stdin)
         except termios.error:
@@ -963,18 +948,8 @@ class InputMonitor:
         self._thread = threading.Thread(target=self._poll, daemon=True)
         self._thread.start()
 
-    def get_typeahead(self):
-        """Return buffered type-ahead text typed during execution."""
-        with self._typeahead_lock:
-            if not self._typeahead:
-                return ""
-            try:
-                return b"".join(self._typeahead).decode("utf-8", errors="replace")
-            except Exception:
-                return ""
-
     def _poll(self):
-        """Poll stdin for ESC (0x1b) with 0.2s timeout. Non-ESC chars are buffered."""
+        """Poll stdin for ESC (0x1b) with 0.2s timeout."""
         fd = sys.stdin.fileno()
         while not self._stop_event.is_set():
             try:
@@ -1008,41 +983,7 @@ class InputMonitor:
                 elif ch == b'\x03':  # Ctrl+C
                     self._pressed.set()
                     break
-                elif ch == b'?':  # ? key for command palette
-                    self._show_command_palette = True
-                    self._pressed.set()
-                    break
-                elif ch == b'\n' or ch == b'\r':
-                    # Enter during execution — ignore (don't buffer newlines)
-                    pass
-                elif ch == b'\x7f' or ch == b'\x08':
-                    # Backspace — remove last buffered char
-                    with self._typeahead_lock:
-                        if self._typeahead:
-                            self._typeahead.pop()
-                    self._notify_typeahead()
-                else:
-                    # Buffer for type-ahead
-                    with self._typeahead_lock:
-                        self._typeahead.append(ch)
-                    self._notify_typeahead()
-
-    def _notify_typeahead(self):
-        """Call on_typeahead callback with current buffer text."""
-        if not self._on_typeahead:
-            return
-        with self._typeahead_lock:
-            if not self._typeahead:
-                text = ""
-            else:
-                try:
-                    text = b"".join(self._typeahead).decode("utf-8", errors="replace")
-                except Exception:
-                    text = ""
-        try:
-            self._on_typeahead(text)
-        except Exception:
-            pass
+                # Ignore all other keys - type-ahead capture removed for IME compatibility
 
     def stop(self):
         """Stop monitoring and restore terminal settings."""
@@ -7754,6 +7695,48 @@ class HookManager:
         self._hooks = []  # list of hook dicts
         self._load_hooks()
 
+    def _build_clean_env(self):
+        """Build sanitized environment dict, stripping secrets."""
+        _ALWAYS_ALLOW = {
+            "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG",
+            "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TMPDIR", "TMP", "TEMP",
+            "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "SSH_AUTH_SOCK",
+            "EDITOR", "VISUAL", "PAGER", "HOSTNAME", "PWD", "OLDPWD", "SHLVL",
+            "COLORTERM", "TERM_PROGRAM", "COLUMNS", "LINES", "NO_COLOR",
+            "FORCE_COLOR", "CC", "CXX", "CFLAGS", "LDFLAGS", "PKG_CONFIG_PATH",
+            "GOPATH", "GOROOT", "CARGO_HOME", "RUSTUP_HOME", "JAVA_HOME",
+            "NVM_DIR", "PYENV_ROOT", "VIRTUAL_ENV", "CONDA_DEFAULT_ENV",
+            "OLLAMA_HOST", "PYTHONPATH", "NODE_PATH", "GEM_HOME", "RBENV_ROOT",
+        }
+        _SENSITIVE_PREFIXES = ("CLAUDECODE", "CLAUDE_CODE", "ANTHROPIC",
+                               "OPENAI", "AWS_SECRET", "AWS_SESSION",
+                               "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_",
+                               "HF_TOKEN", "AZURE_")
+        _SENSITIVE_SUBSTRINGS = ("_SECRET", "_TOKEN", "_KEY", "_PASSWORD",
+                                 "_CREDENTIAL", "_API_KEY", "DATABASE_URL",
+                                 "REDIS_URL", "MONGO_URI", "PRIVATE_KEY",
+                                 "_AUTH", "KUBECONFIG")
+        clean_env = {}
+        for k, v in os.environ.items():
+            if k in _ALWAYS_ALLOW:
+                clean_env[k] = v
+                continue
+            k_upper = k.upper()
+            if k_upper.startswith(_SENSITIVE_PREFIXES):
+                continue
+            if any(sub in k_upper for sub in _SENSITIVE_SUBSTRINGS):
+                continue
+            clean_env[k] = v
+        if "PATH" not in clean_env:
+            if os.name == "nt":
+                clean_env["PATH"] = os.environ.get("PATH", "")
+            else:
+                clean_env["PATH"] = "/usr/local/bin:/usr/bin:/bin"
+        if os.name != "nt":
+            clean_env.setdefault("LANG", "en_US.UTF-8")
+        return clean_env
+
     # Allowlisted hook commands (base names only)
     _HOOK_COMMAND_ALLOWLIST = frozenset({
         "echo", "sh", "bash", "zsh", "python3", "python", "node",
@@ -9255,29 +9238,19 @@ class TUI:
         Ctrl+A/E, Japanese IME, etc). Silently strips Shift+Enter escape
         sequence garbage if present. Multiline handling is done by the
         caller (get_multiline_input).
+
+        NOTE: Avoid ANSI codes in input() prompt on macOS - causes IME issues.
         """
         try:
-            if prefill and HAS_READLINE:
-                def _hook():
-                    readline.insert_text(prefill)
-                    readline.redisplay()
-                readline.set_startup_hook(_hook)
-
-            _rl_reset = _rl_ansi(C.RESET if C._enabled else "")
-            plan_tag = f"{_rl_ansi(chr(27)+'[38;5;226m')}[PLAN]{_rl_reset} " if plan_mode else ""
+            # Simple prompt without ANSI codes for IME compatibility
             if session:
                 pct = min(int((session.get_token_estimate() / session.config.context_window) * 100), 100)
-                if pct < 50:
-                    ctx_color = _rl_ansi("\033[38;5;240m")
-                elif pct < 80:
-                    ctx_color = _rl_ansi("\033[38;5;226m")
-                else:
-                    ctx_color = _rl_ansi("\033[38;5;196m")
-                prompt_str = f"{plan_tag}{ctx_color}ctx:{pct}%{_rl_reset} {_rl_ansi(chr(27)+'[38;5;51m')}❯{_rl_reset} "
+                prompt_str = f"ctx:{pct}% > "
             else:
-                prompt_str = f"{plan_tag}{_rl_ansi(chr(27)+'[38;5;51m')}❯{_rl_reset} "
+                prompt_str = "> "
 
             line = input(prompt_str)
+
             # Silently strip Shift+Enter escape sequence garbage
             import re
             line = re.sub(r'(?:\x1b\[)?27;2;13~', '', line)
@@ -9286,9 +9259,6 @@ class TUI:
         except (EOFError, KeyboardInterrupt):
             print()
             return None
-        finally:
-            if HAS_READLINE:
-                readline.set_startup_hook()
 
     def get_multiline_input(self, session=None, plan_mode=False, prefill=""):
         """Get potentially multi-line input.
@@ -10781,13 +10751,8 @@ class Agent:
         if self.tui.scroll_region._active:
             self.tui.scroll_region.update_mode_display(f"Model: {self.config.model}")
 
-        # ESC key monitor for real-time interrupt (with type-ahead → scroll region hint)
-        def _on_typeahead(text):
-            if self.tui.scroll_region._active:
-                self.tui.scroll_region.update_hint(text)
-        _esc_monitor = InputMonitor(
-            on_typeahead=_on_typeahead if _scroll_mode else None
-        )
+        # ESC key monitor for real-time interrupt
+        _esc_monitor = InputMonitor()
         _esc_monitor.start()
 
         for iteration in range(self.max_iterations):
@@ -10796,12 +10761,6 @@ class Agent:
                     _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
                     self._interrupted.set()
                 break
-
-            # ? key command palette
-            if _esc_monitor._show_command_palette:
-                _esc_monitor._show_command_palette = False
-                show_command_palette()
-                continue
 
             # Auto-compact if context is getting full
             if iteration > 0 and iteration % 5 == 0:
@@ -10820,7 +10779,7 @@ class Agent:
 
                 # 1. Call Ollama (with retry for malformed responses)
                 tools = self._get_tool_schemas()
-                _esc_hint = " — ESC: stop  ?: コマンド" if HAS_TERMIOS else ""
+                _esc_hint = " — ESC: 中断" if HAS_TERMIOS else ""
                 if iteration == 0:
                     self.tui.start_spinner(("Planning" if self._plan_mode else "Thinking") + _esc_hint)
                 else:
@@ -11260,14 +11219,12 @@ class Agent:
             self.hook_mgr.fire("Stop", {"model": self.config.model, "cwd": self.config.cwd})
 
         # Stop ESC monitor (scroll region stays active — managed by main loop)
-        self._last_typeahead = _esc_monitor.get_typeahead()
         _esc_monitor.stop()
 
     def get_typeahead(self):
         """Return and clear any type-ahead text captured during last run()."""
-        ta = getattr(self, "_last_typeahead", "")
-        self._last_typeahead = ""
-        return ta
+        # Type-ahead capture was removed due to IME compatibility issues
+        return ""
 
     def interrupt(self):
         self._interrupted.set()
@@ -11971,7 +11928,6 @@ def main():
     _last_ctrl_c = [0.0]  # mutable container for closure
     _session_start_time = time.time()
     _session_start_msgs = len(session.messages)
-    _typeahead_text = ""   # type-ahead buffer from previous agent run
 
     # Scroll region: activate for the entire interactive session
     global _active_scroll_region
@@ -11987,28 +11943,10 @@ def main():
         tui.scroll_region.setup()
 
     while True:
-        # Start ESC monitor for input waiting (detect ? key during input prompt)
-        _input_esc_monitor = InputMonitor()
-        _input_esc_monitor.start()
-        
         try:
             user_input = tui.get_multiline_input(
                 session=session, plan_mode=agent._plan_mode,
-                prefill=_typeahead_text,
             )
-            _typeahead_text = ""  # consumed
-            
-            # Check if ? was pressed during input waiting
-            if _input_esc_monitor._show_command_palette:
-                _input_esc_monitor.stop()
-                show_command_palette()
-                continue
-            
-            if user_input is None:
-                _input_esc_monitor.stop()
-                break
-
-            _input_esc_monitor.stop()
 
             user_input = user_input.strip()
             if not user_input:
@@ -13587,10 +13525,6 @@ Review this code for:
             if hasattr(session, '_custom_command_tools_override'):
                 agent.allowed_tool_names = session._custom_command_tools_override
                 del session._custom_command_tools_override
-            # Capture type-ahead for next prompt (text typed during execution)
-            _typeahead_text = agent.get_typeahead()
-            if _typeahead_text:
-                tui._scroll_print(f"  {_ansi(chr(27)+'[38;5;240m')}(type-ahead: \"{_typeahead_text}\"){C.RESET}")
             # Auto-save after each interaction (user's work is never lost)
             session.save()
             # Update scroll region status back to "Ready"
