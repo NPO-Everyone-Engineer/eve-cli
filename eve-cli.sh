@@ -31,6 +31,7 @@ MODEL=""
 SIDECAR_MODEL=""
 OLLAMA_HOST="http://localhost:11434"
 EVE_CLI_DEBUG=0
+UI_THEME=""
 
 # [C1 fix] source ではなく grep + cut で既知キーのみ安全に読む
 # cut is safer than sed for values containing special characters
@@ -40,12 +41,14 @@ if [ -f "$CONFIG_FILE" ]; then
     _s="$(_val SIDECAR_MODEL)"
     _h="$(_val OLLAMA_HOST)"
     _d="$(_val EVE_CLI_DEBUG)"
+    _t="$(_val UI_THEME)"
     [ -n "$_m" ] && MODEL="$_m"
     [ -n "$_s" ] && SIDECAR_MODEL="$_s"
     [ -n "$_h" ] && OLLAMA_HOST="$_h"
     [ -n "$_d" ] && EVE_CLI_DEBUG="$_d"
+    [ -n "$_t" ] && UI_THEME="$_t"
     unset -f _val
-    unset _m _s _h _d
+    unset _m _s _h _d _t
 fi
 
 # [SEC] Validate OLLAMA_HOST - only allow localhost (SSRF prevention)
@@ -146,6 +149,14 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             MODEL="$2"
+            shift 2
+            ;;
+        --theme)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --theme requires an argument"
+                exit 1
+            fi
+            UI_THEME="$2"
             shift 2
             ;;
         -y|--yes|--dangerously-skip-permissions)
@@ -284,6 +295,11 @@ if [ "$EVE_CLI_DEBUG" = "1" ] || [ "$EVE_CLI_DEBUG" = "true" ]; then
     DEBUG_ARGS+=(--debug)
 fi
 
+THEME_ARGS=()
+if [ -n "$UI_THEME" ]; then
+    THEME_ARGS+=(--theme "$UI_THEME")
+fi
+
 # --- 起動 ---
 echo ""
 echo "============================================"
@@ -306,4 +322,5 @@ exec python3 "$EVE_CODER_SCRIPT" \
     ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} \
     ${PERM_ARGS[@]+"${PERM_ARGS[@]}"} \
     ${DEBUG_ARGS[@]+"${DEBUG_ARGS[@]}"} \
+    ${THEME_ARGS[@]+"${THEME_ARGS[@]}"} \
     ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
