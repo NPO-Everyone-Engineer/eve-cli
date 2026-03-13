@@ -265,6 +265,9 @@ DANGEROUS_COMMANDS = [
     "shutdown", "reboot", "kill", "pkill",
 ]
 
+# ツール実行前の確認プロンプト対象ツール名
+RISKY_TOOL_NAMES = {"Bash", "Write", "Edit", "MultiEdit"}
+
 def is_dangerous_command(command: str) -> bool:
     """Check if a command contains dangerous keywords."""
     if not command:
@@ -1003,6 +1006,8 @@ class Config:
                     elif key == "SHOW_PROGRESS" and val:
                         global _SHOW_PROGRESS
                         _SHOW_PROGRESS = val.lower() in ("true", "1", "yes")
+                    elif key == "UI_THEME" and val:
+                        self.ui_theme = val
         except (OSError, IOError):
             pass  # Config file unreadable — skip silently
 
@@ -1216,6 +1221,9 @@ class Config:
         if args.theme:
             self.ui_theme = args.theme
             C.apply_theme(args.theme)
+        elif self.ui_theme and self.ui_theme != "normal":
+            # Apply theme from config file if not default
+            C.apply_theme(self.ui_theme)
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -4076,7 +4084,12 @@ class WriteTool(Tool):
 
 class EditTool(Tool):
     name = "Edit"
-    description = "Edit a file by replacing old_string with new_string. old_string must be unique in the file."
+    description = """既存ファイルの特定箇所を置換編集する。
+
+重要:
+- 新規ファイル作成には Write ツールを使うこと
+- old_string は一意に特定できる十分なコンテキストを含めること
+- 同じ文字列が複数箇所にある場合は replace_all パラメータを使うこと"""
     parameters = {
         "type": "object",
         "properties": {
@@ -4369,7 +4382,16 @@ class MultiEditTool(Tool):
 
 class GlobTool(Tool):
     name = "Glob"
-    description = "Find files matching a glob pattern. Returns paths sorted by modification time."
+    description = """ファイル名のパターン検索を行う。ワイルドカード（*、?）を使用してファイルを finding。
+
+使い方:
+- '**/*.py': 再帰的に Python ファイルを検索
+- 'src/**/*.ts': src ディレクトリ内の TypeScript ファイルを検索
+- 結果は修正時間順にソートされて返される
+
+制約:
+- .git, node_modules, __pycache__, venv などのディレクトリは自動スキップ
+- 最大 200 件まで"""
     parameters = {
         "type": "object",
         "properties": {
@@ -4479,7 +4501,13 @@ class GlobTool(Tool):
 
 class GrepTool(Tool):
     name = "Grep"
-    description = "Search file contents with regex. Returns matching lines with file paths and line numbers."
+    description = """ファイル内容を正規表現で検索する。一致した行とファイルパスを返す。
+
+重要:
+- 正規表現パターンを使用
+- 大文字小文字区別なし検索は -i フラグ
+- 出力モード：content（行表示）, files_with_matches（ファイル一覧）, count（件数）
+- 文脈行数指定：-A（後）, -B（前）, -C（前後）"""
     parameters = {
         "type": "object",
         "properties": {
