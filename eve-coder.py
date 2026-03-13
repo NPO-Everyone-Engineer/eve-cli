@@ -370,6 +370,167 @@ def is_dangerous_command(command: str) -> bool:
     return any(keyword in command for keyword in DANGEROUS_COMMANDS)
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# Error Auto Fix v2 — エラー自動修復
+# ════════════════════════════════════════════════════════════════════════════════
+
+class ErrorAnalyzer:
+    """Parse error messages and classify error types."""
+
+    ERROR_PATTERNS = {
+        "syntax": [
+            r"SyntaxError",
+            r"IndentationError",
+            r"unexpected EOF",
+            r"invalid syntax",
+        ],
+        "file_not_found": [
+            r"No such file or directory",
+            r"FileNotFoundError",
+            r"cannot access",
+        ],
+        "permission": [
+            r"Permission denied",
+            r"Operation not permitted",
+            r"sudo",
+        ],
+        "command_not_found": [
+            r"command not found",
+            r"is not recognized",
+            r"No module named",
+        ],
+        "import_error": [
+            r"ImportError",
+            r"ModuleNotFoundError",
+        ],
+        "timeout": [
+            r"timeout",
+            r"timed out",
+            r"deadlock",
+        ],
+    }
+
+    SUGGESTED_FIXES = {
+        "syntax": "コードの構文を確認し、コロン、括弧、インデントを修正",
+        "file_not_found": "ファイルパスを確認し、親ディレクトリを作成する",
+        "permission": "ファイル権限を確認し、chmod で修正または sudo を検討",
+        "command_not_found": "コマンドのインストール状態を確認（which コマンド）",
+        "import_error": "モジュールを pip install でインストール",
+        "timeout": "タイムアウト値を増加またはバックグラウンド実行を検討",
+    }
+
+    @classmethod
+    def parse(cls, error_text: str) -> dict:
+        """Parse error text and return error type + suggested fix."""
+        error_type = "unknown"
+        confidence = 0.0
+        suggested_fix = ""
+
+        for etype, patterns in cls.ERROR_PATTERNS.items():
+            for pattern in patterns:
+                if re.search(pattern, error_text, re.IGNORECASE):
+                    error_type = etype
+                    confidence = 0.8
+                    suggested_fix = cls.SUGGESTED_FIXES.get(etype, "エラー内容を確認")
+                    break
+            if error_type != "unknown":
+                break
+
+        return {
+            "type": error_type,
+            "confidence": confidence,
+            "suggested_fix": suggested_fix,
+            "raw_error": error_text,
+        }
+
+
+class ErrorFixStrategy:
+    """Select fix strategy based on error type."""
+
+    @staticmethod
+    def select(error_type: str, context: dict) -> str:
+        """Return AI prompt for fixing the error."""
+
+        strategies = {
+            "syntax": """
+構文エラーが発生しました。
+以下の点を確認してコードを修正してください：
+- コロン（:）の有無
+- 括弧（）{}[] の対応
+- インデントの統一
+- Python 版本の互換性
+""",
+            "file_not_found": """
+ファイルが見つかりません。
+以下の対応を検討してください：
+1. ファイルパスが正しいか確認
+2. 親ディレクトリが存在するか確認
+3. os.makedirs(path, exist_ok=True) で親ディレクトリを作成
+""",
+            "permission": """
+権限エラーが発生しました。
+以下の対応を検討してください：
+1. ファイル権限を確認（ls -l）
+2. chmod で権限付与
+3. ユーザーが所有者か確認
+※ sudo はセキュリティのため推奨しない
+""",
+            "command_not_found": """
+コマンドが見つかりません。
+以下の対応を検討してください：
+1. which コマンドでインストール状態確認
+2. パッケージマネージャーでインストール
+3. PATH が通っているか確認
+""",
+            "import_error": """
+モジュールがインポートできません。
+以下の対応を検討してください：
+1. pip install <module> でインストール
+2. 仮想環境が有効か確認
+3. requirements.txt に記載があるか確認
+""",
+            "timeout": """
+コマンドがタイムアウトしました。
+以下の対応を検討してください：
+1. timeout パラメータを増加（デフォルト 120 秒→300 秒）
+2. バックグラウンド実行（run_in_background=true）
+3. コマンドの最適化
+""",
+        }
+
+        return strategies.get(error_type, "エラー内容を解析して適切に修正してください。")
+
+
+class ErrorLogger:
+    """Log error fixes to ~/.config/eve-cli/error-log.md"""
+
+    LOG_FILE = os.path.join(os.path.expanduser("~"), ".config", "eve-cli", "error-log.md")
+
+    @classmethod
+    def append(cls, error_entry: dict):
+        """Append error log entry."""
+        os.makedirs(os.path.dirname(cls.LOG_FILE), exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"""
+## {timestamp}
+
+- **エラー種別**: {error_entry.get('type', 'unknown')}
+- **信頼度**: {error_entry.get('confidence', 0):.0%}
+- **エラー内容**:
+```
+{error_entry.get('raw_error', '')[:500]}
+```
+- **修正方針**: {error_entry.get('suggested_fix', '')}
+- **結果**: {error_entry.get('result', 'unknown')}
+- **試行回数**: {error_entry.get('attempts', 1)}
+
+---
+"""
+        with open(cls.LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(entry)
+
+
 def _char_display_width(ch):
     """Return terminal display width of a single character (1 or 2)."""
     return 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
@@ -10501,11 +10662,44 @@ class Agent:
             return
         if self._auto_fix_count >= self.MAX_AUTO_FIX:
             return
+
+        # ErrorAnalyzer でエラー解析
+        error_info = ErrorAnalyzer.parse(error_output)
+        fix_strategy = ErrorFixStrategy.select(error_info['type'], {
+            'tool_name': tool_name,
+            'tool_params': tool_params,
+            'attempt': self._auto_fix_count,
+        })
+
         self._auto_fix_count += 1
+
+        # UI にエラー種別と修正方針を表示
+        _p = self.tui._scroll_print
+        if error_info['type'] != 'unknown':
+            _p(f"\n  {C.RED}❌ エラー：{error_info['type']}{C.RESET}")
+            _p(f"  {C.YELLOW}🔧 修正方針：{error_info['suggested_fix']}{C.RESET}")
+            _p(f"  {C.GRAY}再試行します... ({self._auto_fix_count}/{self.MAX_AUTO_FIX}){C.RESET}")
+        else:
+            _p(f"\n  {C.RED}❌ エラー：{error_output[:100]}{C.RESET}")
+
+        # ログ記録
+        ErrorLogger.append({
+            'type': error_info['type'],
+            'confidence': error_info['confidence'],
+            'raw_error': error_output,
+            'suggested_fix': error_info['suggested_fix'],
+            'tool_name': tool_name,
+            'result': 'retrying',
+            'attempts': self._auto_fix_count,
+        })
+
         error_snippet = error_output[:1500]
         hint = (
             f"The previous {tool_name} call failed with this error:\n"
             f"```\n{error_snippet}\n```\n"
+            f"Error type: {error_info['type']} (confidence: {error_info['confidence']:.0%})\n"
+            f"Suggested fix: {error_info['suggested_fix']}\n"
+            f"{fix_strategy}\n"
             f"Please analyze the error, identify the root cause, and fix it. "
             f"Do not ask the user — fix it directly."
         )
