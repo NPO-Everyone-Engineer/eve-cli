@@ -108,7 +108,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.4.7"
+__version__ = "2.4.9"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -2747,7 +2747,26 @@ class OllamaClient:
         
         return repaired
 
-    def chat(self, model, messages, tools=None, stream=True):
+    def _merge_chat_options(self, temperature, options=None):
+        """Build Ollama options, allowing per-call overrides."""
+        merged = {
+            "num_ctx": self.context_window,
+            "num_predict": self.max_tokens,
+            "temperature": temperature,
+        }
+        if not options:
+            return merged
+
+        for key, value in options.items():
+            if key == "max_tokens":
+                merged["num_predict"] = value
+            elif key == "context_window":
+                merged["num_ctx"] = value
+            else:
+                merged[key] = value
+        return merged
+
+    def chat(self, model, messages, tools=None, stream=True, options=None):
         """Send chat request via Ollama native /api/chat.
 
         Uses the native API (not /v1/chat/completions) so that options like
@@ -2756,7 +2775,7 @@ class OllamaClient:
         """
         # Cache lookup for non-streaming, no-tools calls
         _cache_key = None
-        if not stream and not tools:
+        if not stream and not tools and not options:
             _cache_key = self._response_cache._hash_messages(messages, model)
             cached = self._response_cache.get(_cache_key)
             if cached is not None:
@@ -2792,11 +2811,7 @@ class OllamaClient:
             "messages": api_messages,
             "stream": stream,
             "keep_alive": -1,  # Keep model loaded in VRAM for the session
-            "options": {
-                "num_ctx": self.context_window,
-                "num_predict": self.max_tokens,
-                "temperature": temp,
-            },
+            "options": self._merge_chat_options(temp, options),
         }
         if tools:
             payload["tools"] = tools
@@ -2812,7 +2827,7 @@ class OllamaClient:
         if self.debug:
             print(f"{C.DIM}[debug] POST {self.base_url}/api/chat "
                   f"model={model} msgs={len(messages)} tools={len(tools or [])} "
-                  f"stream={stream} num_ctx={self.context_window}{C.RESET}", file=sys.stderr)
+                  f"stream={stream} num_ctx={payload['options'].get('num_ctx')}{C.RESET}", file=sys.stderr)
 
         try:
             resp = urllib.request.urlopen(req, timeout=self.timeout)
@@ -2963,14 +2978,14 @@ class OllamaClient:
             pass
         return len(text) // 4
 
-    def chat_sync(self, model, messages, tools=None):
+    def chat_sync(self, model, messages, tools=None, options=None):
         """Synchronous (non-streaming) chat that returns a simplified dict.
 
         Returns:
             {"content": str, "tool_calls": list[dict]}
             where each tool_call has keys: id, name, arguments (already parsed dict).
         """
-        resp = self.chat(model=model, messages=messages, tools=tools, stream=False)
+        resp = self.chat(model=model, messages=messages, tools=tools, stream=False, options=options)
         choice = resp.get("choices", [{}])[0]
         message = choice.get("message", {})
         content = message.get("content", "") or ""
@@ -11417,8 +11432,9 @@ def _handle_suggest_help(agent, config, client, session):
             agent, config, client, system_prompt, user_prompt
         )
     except Exception as e:
-        print(f"  候補生成に失敗しました：{e}")
-        return None
+        suggestions = _fallback_suggest_help_suggestions(project_type=project_type, last_error=last_error)
+        print("  AI候補を生成できなかったため、一般的な候補を表示します。")
+        print(f"  理由: {e}")
 
     if not suggestions:
         print("  候補を生成できませんでした。")
@@ -11484,24 +11500,72 @@ def _call_sidecar_for_suggestions(agent, config, client, system_prompt, user_pro
         if choices:
             response_text = choices[0].get("message", {}).get("content", "").strip()
 
-    # Clean markdown code fences if present
-    cleaned = response_text
-    if cleaned.startswith('```'):
-        lines = cleaned.split('\n')
-        if len(lines) > 2:
-            cleaned = '\n'.join(lines[1:-1])
-
-    # Parse JSON array
-    try:
-        suggestions = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"JSON パース失敗：{e}")
-
-    if not isinstance(suggestions, list):
-        raise ValueError("JSON 配列が返りませんでした")
+    suggestions = _parse_suggest_help_response(response_text)
 
     # Convert to string list
     return [str(s).strip() for s in suggestions if s]
+
+
+def _fallback_suggest_help_suggestions(project_type="", last_error=None):
+    """Return safe default prompt suggestions when sidecar generation fails."""
+    suggestions = []
+    if last_error:
+        suggestions.append(f"このエラーの原因を初心者向けに説明して: {str(last_error)[:80]}")
+    if project_type:
+        suggestions.append(f"この{project_type}プロジェクトの全体像を初心者向けに説明して")
+    suggestions.extend([
+        "今のリポジトリで最初に読むべきファイルと理由を教えて",
+        "このプロジェクトの主要な処理の流れを初心者向けに説明して",
+        "次に安全に確認できるコマンドを教えて",
+        "今の状態から次に質問すると理解が進む内容を5つ教えて",
+        "変更前に把握しておくべき注意点を教えて",
+    ])
+    deduped = []
+    seen = set()
+    for suggestion in suggestions:
+        if suggestion and suggestion not in seen:
+            deduped.append(suggestion)
+            seen.add(suggestion)
+    return deduped[:5]
+
+
+def _parse_suggest_help_response(response_text):
+    """Parse a JSON array from sidecar suggest-help output with clear errors."""
+    import json
+
+    cleaned = (response_text or "").strip()
+    if not cleaned:
+        raise RuntimeError(
+            "サイドカーモデルから候補が返りませんでした。"
+            " 起動直後で会話履歴・エラー・変更差分が少ないと、空の応答になることがあります。"
+        )
+
+    if cleaned.startswith('```'):
+        lines = cleaned.split('\n')
+        if len(lines) > 2:
+            cleaned = '\n'.join(lines[1:-1]).strip()
+
+    try:
+        suggestions = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find('[')
+        end = cleaned.rfind(']')
+        if start != -1 and end > start:
+            try:
+                suggestions = json.loads(cleaned[start:end + 1])
+            except json.JSONDecodeError:
+                suggestions = None
+        else:
+            suggestions = None
+        if suggestions is None:
+            raise RuntimeError(
+                "サイドカーモデルの応答を候補一覧として読めませんでした。"
+                " 空文字や説明文ではなく、JSON 配列が返る想定です。"
+            )
+
+    if not isinstance(suggestions, list):
+        raise RuntimeError("サイドカーモデルの応答が JSON 配列ではありませんでした。")
+    return suggestions
 
 
 def _exit_plan_mode(agent, session):
