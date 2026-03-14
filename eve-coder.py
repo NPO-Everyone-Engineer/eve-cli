@@ -108,7 +108,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.4.4"
+__version__ = "2.4.5"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -8987,7 +8987,7 @@ class TUI:
                 if os.path.isfile(config.history_file):
                     readline.read_history_file(config.history_file)
                 readline.set_history_length(1000)
-                # Tab-completion for slash commands
+                # Tab-completion for slash commands and @files
                 _slash_commands = [
                     "/help", "/exit", "/quit", "/q", "/clear", "/model", "/models",
                     "/status", "/save", "/compact", "/yes", "/no", "/tokens",
@@ -9034,18 +9034,13 @@ class TUI:
                                             options.append("@" + option_path)
                             except OSError:
                                 pass
-                        else:
-                            # General file/directory completion for any text
+                        elif os.path.sep in text or text.startswith("~"):
+                            # General file/directory completion for paths
                             try:
-                                if os.path.sep in text or text.startswith("~"):
-                                    expanded = os.path.expanduser(text)
-                                    dirn = os.path.dirname(expanded) or "."
-                                    base = os.path.basename(expanded)
-                                    prefix_dir = os.path.dirname(text)
-                                else:
-                                    dirn = "."
-                                    base = text
-                                    prefix_dir = ""
+                                expanded = os.path.expanduser(text)
+                                dirn = os.path.dirname(expanded) or "."
+                                base = os.path.basename(expanded)
+                                prefix_dir = os.path.dirname(text)
                                 entries = os.listdir(dirn)
                                 for e in sorted(entries):
                                     if e.startswith(base) and not e.startswith("."):
@@ -9061,11 +9056,13 @@ class TUI:
                     except Exception:
                         return None
                 readline.set_completer(_completer)
-                readline.set_completer_delims(" \t\n")
-                # Enable tab completion — try both syntaxes for compatibility
-                if _is_libedit:
-                    readline.parse_and_bind("bind ^I rl_complete")
-                readline.parse_and_bind("tab: complete")
+                # Set completer delimiters: only space and newline (tab is completion trigger)
+                # Keep @ as non-delimiter so "@path" is treated as single token
+                readline.set_completer_delims(" \n")
+                # Enable tab completion — libedit requires special syntax
+                # Use vt100-style key binding for Tab (Ctrl+I)
+                readline.parse_and_bind(r'bind ^I complete')
+                readline.parse_and_bind(r'set show-all-if-ambiguous on')
             except Exception:
                 pass
 
