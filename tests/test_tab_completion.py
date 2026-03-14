@@ -1,5 +1,5 @@
 """
-Regression tests for interactive readline tab completion.
+Regression tests for interactive readline behavior.
 """
 
 import importlib.util
@@ -51,6 +51,30 @@ class TestTabCompletion(unittest.TestCase):
     def test_nested_path_completion_still_works(self):
         options = eve_coder._readline_completion_options("docs/tr", [])
         self.assertEqual(options, ["docs/troubleshooting.md"])
+
+
+class TestShiftEnterHandling(unittest.TestCase):
+    """Test Ghostty-specific Shift+Enter binding and cleanup helpers."""
+
+    def test_ghostty_libedit_uses_bind_s(self):
+        binding = eve_coder._ghostty_shift_enter_binding(
+            env={"TERM_PROGRAM": "ghostty"},
+            readline_doc="Importing this module enables command line editing using libedit readline.",
+        )
+        self.assertEqual(binding, r"bind -s '\e[27;2;13~' '\n'")
+
+    def test_non_ghostty_keeps_binding_disabled(self):
+        binding = eve_coder._ghostty_shift_enter_binding(
+            env={"TERM_PROGRAM": "Apple_Terminal"},
+            readline_doc="Importing this module enables command line editing using libedit readline.",
+        )
+        self.assertIsNone(binding)
+
+    def test_strip_shift_enter_garbage_handles_full_and_truncated_sequences(self):
+        self.assertEqual(
+            eve_coder._strip_shift_enter_garbage("ab\x1b[27;2;13~cd7;2;13~ef"),
+            "abcdef",
+        )
 
 
 if __name__ == "__main__":

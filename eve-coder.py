@@ -5622,7 +5622,7 @@ class AskUserQuestionTool(Tool):
                 # Strip terminal escape sequences (same as TUI.get_input)
                 import re as _re
                 answer = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z~]', '', answer)
-                answer = _re.sub(r'(?:\x1b\[)?27;2;13~', '', answer)
+                answer = _strip_shift_enter_garbage(answer)
                 answer = answer.strip()
             except (EOFError, KeyboardInterrupt):
                 return "User cancelled the question."
@@ -9022,6 +9022,32 @@ def _readline_completion_options(text, slash_commands):
     return _complete_general_paths(text)
 
 
+def _ghostty_shift_enter_binding(env=None, readline_doc=None):
+    """Return a targeted Shift+Enter binding for Ghostty terminals."""
+    env = os.environ if env is None else env
+    is_ghostty = (
+        env.get("TERM_PROGRAM") == "ghostty"
+        or "GHOSTTY_RESOURCES_DIR" in env
+        or "GHOSTTY_BIN_DIR" in env
+    )
+    if not is_ghostty:
+        return None
+
+    if readline_doc is None:
+        readline_doc = readline.__doc__ if HAS_READLINE else ""
+    is_libedit = "libedit" in (readline_doc or "")
+    if is_libedit:
+        return r"bind -s '\e[27;2;13~' '\n'"
+    return r'"\e[27;2;13~": "\n"'
+
+
+def _strip_shift_enter_garbage(text):
+    """Remove leaked Shift+Enter escape fragments from input lines."""
+    import re
+    text = re.sub(r'(?:\x1b\[)?27;2;13~', '', text)
+    return re.sub(r'7;2;13~', '', text)
+
+
 class TUI:
     """Terminal UI for input, streaming output, and tool result display."""
 
@@ -9073,6 +9099,9 @@ class TUI:
                 readline.parse_and_bind('bind ^I rl_complete')
                 readline.parse_and_bind('bind ^N ed-next-history')  # Down arrow: history navigation
                 readline.parse_and_bind('bind ^P ed-prev-history')  # Up arrow: history navigation
+                shift_enter_binding = _ghostty_shift_enter_binding()
+                if shift_enter_binding:
+                    readline.parse_and_bind(shift_enter_binding)
             except Exception:
                 pass
 
@@ -9258,11 +9287,7 @@ class TUI:
 
             line = input(prompt_str)
 
-            # Silently strip Shift+Enter escape sequence garbage
-            import re
-            line = re.sub(r'(?:\x1b\[)?27;2;13~', '', line)
-            line = re.sub(r'7;2;13~', '', line)
-            return line
+            return _strip_shift_enter_garbage(line)
         except (EOFError, KeyboardInterrupt):
             print()
             return None
@@ -9313,10 +9338,7 @@ class TUI:
                 while True:
                     try:
                         cont = input(f"{C.DIM}...{C.RESET} ")
-                        # Strip Shift+Enter garbage from continuation lines too
-                        import re
-                        cont = re.sub(r'(?:\x1b\[)?27;2;13~', '', cont)
-                        cont = re.sub(r'7;2;13~', '', cont)
+                        cont = _strip_shift_enter_garbage(cont)
                         if cont.strip() == "":
                             # Empty line = send
                             break
