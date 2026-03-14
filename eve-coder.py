@@ -807,6 +807,9 @@ class ScrollRegion:
         hint_prefix = f" {_dim}ESC: 中断"
         if mode_display:
             hint_prefix += f" {_dim}| {mode_display}"
+        # P2: ツール呼び出し数を表示 (iteration は run() から渡される)
+        if hasattr(self, '_current_iteration'):
+            hint_prefix += f" {_dim}| ツール呼び出し：{self._current_iteration + 1}/{self._max_iterations}"
         if hint:
             buf += f"\033[{hint_row};1H\033[2K{hint_prefix} | type-ahead: \"{hint}\"{_rst}"
         else:
@@ -1013,7 +1016,7 @@ class Config:
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
     DEFAULT_CONTEXT_WINDOW = 32768
-    DEFAULT_MAX_AGENT_STEPS = 50
+    DEFAULT_MAX_AGENT_STEPS = 100
     HARD_MAX_AGENT_STEPS = 200
 
     def __init__(self):
@@ -10851,6 +10854,9 @@ class Agent:
                 # 1. Call Ollama (with retry for malformed responses)
                 tools = self._get_tool_schemas()
                 _esc_hint = " — ESC: 中断" if HAS_TERMIOS else ""
+                # P2: フッターにツール呼び出し数を渡す
+                self.tui._current_iteration = iteration
+                self.tui._max_iterations = self.max_iterations
                 if iteration == 0:
                     self.tui.start_spinner(("Planning" if self._plan_mode else "Thinking") + _esc_hint)
                 else:
@@ -11281,9 +11287,23 @@ class Agent:
                     _p(f"{C.DIM}(Run with --debug for full details){C.RESET}")
                 break
         else:
+            # P1: 制限到達時の UX 改善 — 自動保存＋再開 prompt
+            session_path = self.session.save()
             _p(f"\n{C.YELLOW}The AI took {self.max_iterations} steps without finishing.{C.RESET}")
-            _p(f"{C.DIM}Your work so far is saved. Try breaking the task into smaller steps,{C.RESET}")
+            _p(f"{C.GREEN}✓ Session auto-saved to: {session_path}{C.RESET}")
+            _p(f"{C.DIM}Try breaking the task into smaller steps,{C.RESET}")
             _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
+            _p(f"\n{C.CYAN}Continue this session? [Y/n]: {C.RESET}", end="")
+            try:
+                cont = input().strip().lower()
+                if cont in ("", "y", "yes", "はい"):
+                    _p(f"{C.DIM}Continuing... (reset step counter){C.RESET}")
+                    self.session.add_system_note(f"Session continued after {self.max_iterations} steps")
+                    self.run()  # restart agent loop
+                else:
+                    _p(f"{C.DIM}Session ended. Resume with: eve-coder --resume{C.RESET}")
+            except EOFError:
+                _p(f"{C.DIM}Session ended. Resume with: eve-coder --resume{C.RESET}")
 
         # Fire Stop hook when agent loop ends
         if self.hook_mgr and self.hook_mgr.has_hooks:
