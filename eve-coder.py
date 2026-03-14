@@ -108,7 +108,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.4.9"
+__version__ = "2.5.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -5419,19 +5419,46 @@ class TaskListTool(Tool):
         "properties": {},
     }
 
+    STATUS_ICONS = {
+        "pending": "⬜",
+        "in_progress": "🔄",
+        "completed": "✅",
+        "skipped": "⏭️",
+        "deleted": "❌",
+    }
+
     def execute(self, params):
         with _task_store_lock:
             tasks = _task_store["tasks"]
             if not tasks:
                 return "No tasks."
+            
+            # Count statistics
+            total = len(tasks)
+            completed = sum(1 for t in tasks.values() if t["status"] == "completed")
+            in_progress = sum(1 for t in tasks.values() if t["status"] == "in_progress")
+            pending = sum(1 for t in tasks.values() if t["status"] == "pending")
+            
+            # Build task list with icons
             lines = []
-            for tid, t in tasks.items():
+            for tid, t in sorted(tasks.items(), key=lambda x: int(x[0])):
+                icon = self.STATUS_ICONS.get(t["status"], "⬜")
                 blocked = ""
                 open_blockers = [b for b in t.get("blockedBy", []) if b in tasks and tasks[b]["status"] != "completed"]
                 if open_blockers:
-                    blocked = f"  blockedBy: [{', '.join(open_blockers)}]"
-                lines.append(f"  #{tid}. [{t['status']}] {t['subject']}{blocked}")
-        return "Tasks:\n" + "\n".join(lines)
+                    blocked = f"  {C.DIM}blockedBy: [{', '.join(open_blockers)}]{C.RESET}"
+                lines.append(f"  {icon} {t['subject']}{blocked}")
+            
+            # Build header with progress
+            header = f"{C.BOLD}📋 タスク進捗{C.RESET}\n"
+            progress = f"[進行状況：{completed}/{total} 完了"
+            if in_progress > 0:
+                progress += f", {in_progress} 件中"
+            progress += "]"
+            
+            result = header + "\n" + "\n".join(lines) + "\n\n" + progress
+        
+        return result
 
 
 class TaskGetTool(Tool):
