@@ -108,7 +108,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.4.6"
+__version__ = "2.4.7"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -280,6 +280,7 @@ def show_command_palette():
     _commands = [
         ("/help", "ヘルプを表示"),
         ("/context", "次のプロンプト候補を AI が提案"),
+        ("/suggest-help", "現在のコンテキストから次に聞くべきプロンプト候補を提案"),
         ("/clear", "会話をリセット"),
         ("/commit", "AI がコミットメッセージを生成"),
         ("/diff", "変更差分を表示"),
@@ -11316,6 +11317,171 @@ def _read_latest_plan(agent):
     return ""
 
 
+def _handle_suggest_help(agent, config, client, session):
+    """
+    現在のコンテキストからプロンプト候補を生成して表示する。
+    ユーザーが選択した候補をプロンプト入力欄に返す。
+    """
+    import json
+    import subprocess
+
+    # --- 1. コンテキスト収集 ---
+    suggest_parts = []
+
+    # 直近の会話履歴（最大 5 メッセージ）
+    recent_messages = session.messages[-5:] if session.messages else []
+    if recent_messages:
+        history_text = "\n".join([
+            f"[{m.get('role','?')}]: {str(m.get('content',''))[:300]}"
+            for m in recent_messages
+        ])
+        suggest_parts.append(f"## 直近の会話\n{history_text}")
+
+    # 最新のエラー情報（あれば）
+    last_error = getattr(agent, 'last_error', None)
+    if last_error:
+        suggest_parts.append(f"## 最新のエラー\n{str(last_error)[:500]}")
+
+    # 変更されたファイル（git diff --name-only）
+    try:
+        result = subprocess.run(
+            ['git', 'diff', '--name-only', 'HEAD'],
+            capture_output=True, text=True, timeout=3,
+            cwd=config.cwd
+        )
+        if result.stdout.strip():
+            suggest_parts.append(f"## 変更中のファイル\n{result.stdout.strip()[:300]}")
+    except Exception:
+        pass
+
+    # プロジェクト種別（package.json / requirements.txt 等）
+    project_type = ""
+    if os.path.isfile(os.path.join(config.cwd, "package.json")):
+        project_type = "JavaScript/TypeScript (Node.js)"
+    elif os.path.isfile(os.path.join(config.cwd, "requirements.txt")):
+        project_type = "Python"
+    elif os.path.isfile(os.path.join(config.cwd, "go.mod")):
+        project_type = "Go"
+    elif os.path.isfile(os.path.join(config.cwd, "Cargo.toml")):
+        project_type = "Rust"
+    if project_type:
+        suggest_parts.append(f"## プロジェクト種別\n{project_type}")
+
+    suggest_str = "\n\n".join(suggest_parts) if suggest_parts else "（コンテキストなし）"
+
+    # --- 2. サイドカーモデルへリクエスト ---
+    system_prompt = """あなたはプログラミング学習支援 AI です。
+初心者エンジニアが「次に何を聞けばよいか」を提案してください。
+以下のルールを守ってください：
+- 必ず JSON 配列のみを返す（前置き・後置き不要）
+- 提案は 5〜7 件
+- 日本語で書く
+- 学習に役立つ質問を含める（「なぜ？」「どうすれば？」「比較すると？」）
+- 具体的なファイル名やエラー内容があれば質問に盛り込む
+
+出力形式：
+["質問 1", "質問 2", "質問 3", "質問 4", "質問 5"]
+"""
+
+    user_prompt = f"""以下のコンテキストを踏まえて、ユーザーが次に質問すべき候補を 5〜7 件提案してください。
+
+{suggest_str}
+"""
+
+    print("\n💡 プロンプト候補を生成中...")
+
+    try:
+        suggestions = _call_sidecar_for_suggestions(
+            agent, config, client, system_prompt, user_prompt
+        )
+    except Exception as e:
+        print(f"  候補生成に失敗しました：{e}")
+        return None
+
+    if not suggestions:
+        print("  候補を生成できませんでした。")
+        return None
+
+    # --- 3. 候補を表示 ---
+    print("\n📝 次に聞けること：\n")
+    for i, suggestion in enumerate(suggestions, 1):
+        print(f"  [{i}] {suggestion}")
+    print(f"  [Enter] キャンセル\n")
+
+    # --- 4. ユーザー選択を受け付ける ---
+    try:
+        choice = input("番号を入力してください > ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nキャンセルしました。")
+        return None
+
+    if not choice.isdigit():
+        print("キャンセルしました。")
+        return None
+
+    idx = int(choice) - 1
+    if 0 <= idx < len(suggestions):
+        selected = suggestions[idx]
+        print(f"\n✅ 選択：{selected}\n")
+        return selected
+    else:
+        print("無効な番号です。キャンセルしました。")
+        return None
+
+
+def _call_sidecar_for_suggestions(agent, config, client, system_prompt, user_prompt):
+    """
+    サイドカーモデルを使ってプロンプト候補を生成する。
+    既存の Ollama API 呼び出し機構を流用する。
+    """
+    import json
+
+    sidecar_model = config.sidecar_model or os.environ.get('EVE_CLI_SIDECAR_MODEL', 'qwen3:8b')
+
+    # Build messages
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # Call Ollama API via client
+    try:
+        resp = client.chat(
+            model=sidecar_model,
+            messages=messages,
+            tools=None,
+            stream=False,
+            options={"temperature": 0.7, "max_tokens": 512}
+        )
+    except Exception as e:
+        raise RuntimeError(f"サイドカーモデル呼び出し失敗：{e}")
+
+    response_text = ""
+    if isinstance(resp, dict):
+        choices = resp.get("choices", [])
+        if choices:
+            response_text = choices[0].get("message", {}).get("content", "").strip()
+
+    # Clean markdown code fences if present
+    cleaned = response_text
+    if cleaned.startswith('```'):
+        lines = cleaned.split('\n')
+        if len(lines) > 2:
+            cleaned = '\n'.join(lines[1:-1])
+
+    # Parse JSON array
+    try:
+        suggestions = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"JSON パース失敗：{e}")
+
+    if not isinstance(suggestions, list):
+        raise ValueError("JSON 配列が返りませんでした")
+
+    # Convert to string list
+    return [str(s).strip() for s in suggestions if s]
+
+
 def _exit_plan_mode(agent, session):
     """Switch agent from Plan mode to Act mode, injecting the plan into context."""
     if not agent._plan_mode:
@@ -11999,6 +12165,13 @@ def main():
                     print(f"{C.GREEN}Conversation cleared.{C.RESET}")
                     print(f"{C.DIM}Previous session saved as: {old_sid}{C.RESET}")
                     continue
+                elif cmd == "/suggest-help":
+                    _selected = _handle_suggest_help(agent, config, client, session)
+                    if _selected:
+                        user_input = _selected
+                        # Fall through to normal agent processing
+                    else:
+                        continue
                 elif cmd == "/status":
                     tui.show_status(session, config, agent=agent)
                     continue
