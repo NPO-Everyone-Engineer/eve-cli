@@ -108,7 +108,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.4.5"
+__version__ = "2.4.6"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -8961,6 +8961,66 @@ class Session:
 # TUI — Terminal User Interface
 # ════════════════════════════════════════════════════════════════════════════════
 
+def _complete_at_paths(prefix):
+    """Return readline completion candidates for @file references."""
+    options = []
+    try:
+        if prefix.endswith(os.path.sep):
+            dirn = prefix
+            base = ""
+        elif os.path.sep in prefix:
+            dirn = os.path.dirname(prefix) + os.path.sep
+            base = os.path.basename(prefix)
+        else:
+            dirn = "."
+            base = prefix
+        dirn_for_list = dirn.rstrip(os.path.sep) or "."
+        entries = os.listdir(dirn_for_list)
+        for entry in sorted(entries):
+            if entry.startswith(base) and not entry.startswith("."):
+                full_path = os.path.join(dirn_for_list, entry)
+                option_path = entry if dirn == "." else dirn + entry
+                suffix = os.path.sep if os.path.isdir(full_path) else ""
+                options.append("@" + option_path + suffix)
+    except OSError:
+        pass
+    return options
+
+
+def _complete_general_paths(text):
+    """Return readline completion candidates for plain file paths."""
+    options = []
+    try:
+        if os.path.sep in text or text.startswith("~"):
+            expanded = os.path.expanduser(text)
+            dirn = os.path.dirname(expanded) or "."
+            base = os.path.basename(expanded)
+            prefix_dir = os.path.dirname(text)
+        else:
+            dirn = "."
+            base = text
+            prefix_dir = ""
+        entries = os.listdir(dirn)
+        for entry in sorted(entries):
+            if entry.startswith(base) and not entry.startswith("."):
+                full_path = os.path.join(dirn, entry)
+                display = os.path.join(prefix_dir, entry) if prefix_dir else entry
+                suffix = os.path.sep if os.path.isdir(full_path) else ""
+                options.append(display + suffix)
+    except OSError:
+        pass
+    return options
+
+
+def _readline_completion_options(text, slash_commands):
+    """Build completion candidates for the interactive prompt."""
+    if text.startswith("/"):
+        return [command for command in slash_commands if command.startswith(text)]
+    if text.startswith("@"):
+        return _complete_at_paths(text[1:])
+    return _complete_general_paths(text)
+
+
 class TUI:
     """Terminal UI for input, streaming output, and tool result display."""
 
@@ -8999,59 +9059,7 @@ class TUI:
                 ]
                 def _completer(text, state):
                     try:
-                        options = []
-                        if text.startswith("/"):
-                            options = [c for c in _slash_commands if c.startswith(text)]
-                        elif text.startswith("@"):
-                            # @file completion
-                            prefix = text[1:]
-                            try:
-                                # Handle trailing separator correctly (e.g., "dir/subdir/")
-                                if prefix.endswith(os.path.sep):
-                                    dirn = prefix
-                                    base = ""
-                                elif os.path.sep in prefix:
-                                    dirn = os.path.dirname(prefix) + os.path.sep
-                                    base = os.path.basename(prefix)
-                                else:
-                                    dirn = "."
-                                    base = prefix
-                                # Normalize: remove trailing separator for listdir, but keep for path building
-                                dirn_for_list = dirn.rstrip(os.path.sep) or "."
-                                entries = os.listdir(dirn_for_list)
-                                for e in sorted(entries):
-                                    if e.startswith(base) and not e.startswith("."):
-                                        # Build the full path for isdir check
-                                        full_path = os.path.join(dirn_for_list, e)
-                                        # Build the option string with proper @ prefix and separators
-                                        if dirn == ".":
-                                            option_path = e
-                                        else:
-                                            option_path = dirn + e
-                                        if os.path.isdir(full_path):
-                                            options.append("@" + option_path + os.path.sep)
-                                        else:
-                                            options.append("@" + option_path)
-                            except OSError:
-                                pass
-                        elif os.path.sep in text or text.startswith("~"):
-                            # General file/directory completion for paths
-                            try:
-                                expanded = os.path.expanduser(text)
-                                dirn = os.path.dirname(expanded) or "."
-                                base = os.path.basename(expanded)
-                                prefix_dir = os.path.dirname(text)
-                                entries = os.listdir(dirn)
-                                for e in sorted(entries):
-                                    if e.startswith(base) and not e.startswith("."):
-                                        full_path = os.path.join(dirn, e)
-                                        display = os.path.join(prefix_dir, e) if prefix_dir else e
-                                        if os.path.isdir(full_path):
-                                            options.append(display + os.path.sep)
-                                        else:
-                                            options.append(display)
-                            except OSError:
-                                pass
+                        options = _readline_completion_options(text, _slash_commands)
                         return options[state] if state < len(options) else None
                     except Exception:
                         return None
