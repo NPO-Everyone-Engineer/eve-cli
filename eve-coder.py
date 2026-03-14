@@ -9059,10 +9059,11 @@ class TUI:
                 # Set completer delimiters: only space and newline (tab is completion trigger)
                 # Keep @ as non-delimiter so "@path" is treated as single token
                 readline.set_completer_delims(" \n")
-                # Enable tab completion — libedit requires special syntax
-                # Use vt100-style key binding for Tab (Ctrl+I)
-                readline.parse_and_bind(r'bind ^I complete')
-                readline.parse_and_bind(r'set show-all-if-ambiguous on')
+                # Enable tab completion for libedit (macOS default Python)
+                # libedit uses "bind" command instead of GNU readline syntax
+                readline.parse_and_bind('bind ^I rl_complete')
+                readline.parse_and_bind('bind ^N complete')  # Down arrow completion
+                readline.parse_and_bind('bind ^P complete')  # Up arrow completion
             except Exception:
                 pass
 
