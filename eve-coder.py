@@ -10888,7 +10888,7 @@ class Agent:
                 self.tui.stop_spinner()
 
                 if response is None:
-                    _p(f"\n{C.RED}The AI didn't respond. It may still be loading or ran out of memory.{C.RESET}")
+                    _p(f"\n{C.RED}AI が応答しませんでした。読み込み中か、メモリ不足の可能性があります。(The AI didn't respond - it may still be loading or ran out of memory){C.RESET}")
                     _p(f"{C.DIM}Try again, or restart Ollama if this keeps happening.{C.RESET}")
                     break
 
@@ -10929,7 +10929,7 @@ class Agent:
                 if not text and not tool_calls and iteration < self.max_iterations - 1:
                     _empty_retries += 1
                     if _empty_retries > 3:
-                        _p(f"\n{C.YELLOW}The AI returned empty responses (the model may be overloaded or incompatible).{C.RESET}")
+                        _p(f"\n{C.YELLOW}AI から空のレスポンスが返されました（モデルが過負荷または非互換の可能性があります）。(The AI returned empty responses - the model may be overloaded or incompatible){C.RESET}")
                         _p(f"{C.DIM}Try rephrasing, or switch models with: /model <name>{C.RESET}")
                         break
                     if self.config.debug:
@@ -10969,7 +10969,7 @@ class Agent:
                 if len(_recent_tool_calls) >= self.MAX_SAME_TOOL_REPEAT:
                     recent = _recent_tool_calls[-self.MAX_SAME_TOOL_REPEAT:]
                     if all(r == recent[0] for r in recent):
-                        _p(f"\n{C.YELLOW}The AI got stuck repeating the same action. Stopped.{C.RESET}")
+                        _p(f"\n{C.YELLOW}AI が同じアクションを繰り返して停止しました。(The AI got stuck repeating the same action - Stopped){C.RESET}")
                         _p(f"{C.DIM}Try rephrasing your request or asking for a different approach.{C.RESET}")
                         break
                 if len(_recent_tool_calls) > 10:
@@ -11269,7 +11269,7 @@ class Agent:
                     response.close()
                 if text:
                     self.session.add_assistant_message(text)
-                _p(f"\n{C.RED}Lost connection to Ollama (the local AI engine).{C.RESET}")
+                _p(f"\n{C.RED}Ollama（ローカル AI エンジン）への接続が失われました。(Lost connection to Ollama - the local AI engine){C.RESET}")
                 _p(f"{C.DIM}It may have crashed or been closed. Restart it:  ollama serve{C.RESET}")
                 _p(f"{C.DIM}Your conversation is still here — just try again after restarting.{C.RESET}")
                 break
@@ -11279,7 +11279,7 @@ class Agent:
                     response.close()
                 if text:
                     self.session.add_assistant_message(text)
-                _p(f"\n{C.RED}Something went wrong: {e}{C.RESET}")
+                _p(f"\n{C.RED}問題が発生しました：{e} (Something went wrong: {e}){C.RESET}")
                 _p(f"{C.DIM}Your conversation is still active. Try your request again.{C.RESET}")
                 if self.config.debug:
                     traceback.print_exc()
@@ -11301,9 +11301,9 @@ class Agent:
                     self.session.add_system_note(f"Session continued after {self.max_iterations} steps")
                     self.run()  # restart agent loop
                 else:
-                    _p(f"{C.DIM}Session ended. Resume with: eve-coder --resume{C.RESET}")
+                    _p(f"{C.DIM}セッションが終了しました。再開：eve-coder --resume (Session ended. Resume with: eve-coder --resume){C.RESET}")
             except EOFError:
-                _p(f"{C.DIM}Session ended. Resume with: eve-coder --resume{C.RESET}")
+                _p(f"{C.DIM}セッションが終了しました。再開：eve-coder --resume (Session ended. Resume with: eve-coder --resume){C.RESET}")
 
         # Fire Stop hook when agent loop ends
         if self.hook_mgr and self.hook_mgr.has_hooks:
