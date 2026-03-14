@@ -9062,8 +9062,8 @@ class TUI:
                 # Enable tab completion for libedit (macOS default Python)
                 # libedit uses "bind" command instead of GNU readline syntax
                 readline.parse_and_bind('bind ^I rl_complete')
-                readline.parse_and_bind('bind ^N complete')  # Down arrow completion
-                readline.parse_and_bind('bind ^P complete')  # Up arrow completion
+                readline.parse_and_bind('bind ^N ed-next-history')  # Down arrow: history navigation
+                readline.parse_and_bind('bind ^P ed-prev-history')  # Up arrow: history navigation
             except Exception:
                 pass
 
