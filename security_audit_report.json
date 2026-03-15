@@ -1,0 +1,68 @@
+{
+  "features": {
+    "日本語 UX": true,
+    "エラーメッセージ日本語化": true,
+    "ヘルプメッセージ日本語化": true,
+    "スラッシュコマンド日本語化": true,
+    "セキュリティテスト": true,
+    "TUI 機能強化": true,
+    "ESC 中断": true,
+    "Type-ahead": true,
+    "MCP 連携": true,
+    "Skills": true,
+    "Plan/Act モード": true,
+    "Git チェックポイント": true,
+    "自動テストループ": true,
+    "File Watcher": true,
+    "Parallel Agents": true
+  },
+  "vulnerabilities": [
+    {
+      "severity": "HIGH",
+      "type": "コードインジェクション",
+      "description": "eval() または exec() の使用が検出されました",
+      "recommendation": "ast.literal_eval() または safer な方法を使用"
+    },
+    {
+      "severity": "HIGH",
+      "type": "コマンドインジェクション",
+      "description": "subprocess で shell=True が使用されています",
+      "recommendation": "shell=False でリスト形式のコマンドを使用"
+    },
+    {
+      "severity": "MEDIUM",
+      "type": "ハードコーディされたパスワード",
+      "description": "パスワードがコードにハードコーディングされています",
+      "recommendation": "環境変数またはシークレット管理を使用"
+    },
+    {
+      "severity": "LOW",
+      "type": "シンボリックリンク競合",
+      "description": "symlink チェックが実装されていない可能性があります",
+      "recommendation": "os.path.islink() でチェック"
+    },
+    {
+      "severity": "LOW",
+      "type": "情報漏洩",
+      "description": "スタックトレースが出力される可能性があります",
+      "recommendation": "ユーザー向けエラーメッセージを制限"
+    }
+  ],
+  "security_measures": {
+    "危険コマンドブロック": true,
+    "URL スキーム検証": true,
+    "パストラバーサル防止": true,
+    "SSRF 防止": true,
+    "セッション ID サニタイズ": true,
+    "保護パスブロック": true,
+    "最大イテレーション": true,
+    "シンボリックリンク防止": true
+  },
+  "summary": {
+    "feature_rate": 100.0,
+    "security_rate": 100.0,
+    "high_vulnerabilities": 2,
+    "medium_vulnerabilities": 1,
+    "low_vulnerabilities": 2
+  }
+}
