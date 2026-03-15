@@ -1,0 +1,12 @@
+{
+  "total": 25,
+  "passed": 25,
+  "failed": 0,
+  "categories": {
+    "Agent+Tool": 5,
+    "MCP+Skills": 5,
+    "Plan/Act+Checkpoint": 5,
+    "Session+JA": 5,
+    "TUI+Agent": 5
+  }
+}
