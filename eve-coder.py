@@ -178,6 +178,11 @@ try:
 except ImportError:
     HAS_TERMIOS = False
 
+# TUI 機能強化：環境変数チェック
+VIBE_DEBUG_TUI = os.environ.get('VIBE_DEBUG_TUI', '') in ('1', 'true', 'True')
+VIBE_NO_SCROLL = os.environ.get('VIBE_NO_SCROLL', '') in ('1', 'true', 'True')
+VIBE_DEBUG_TUI_LOG = os.path.expanduser('~/.vibe-tui-debug.log') if VIBE_DEBUG_TUI else None
+
 # Thread-safe stdout lock
 _print_lock = threading.Lock()
 from pathlib import Path
@@ -12559,6 +12564,23 @@ def main():
                         continue
                 elif cmd == "/status":
                     tui.show_status(session, config, agent=agent)
+                    continue
+                elif cmd == "/debug-scroll":
+                    # TUI 機能強化：スクロール領域診断
+                    print(f"\n{C.BOLD}━━━ スクロール領域診断 ━━━{C.RESET}")
+                    print(f"  VIBE_DEBUG_TUI: {VIBE_DEBUG_TUI}")
+                    print(f"  VIBE_NO_SCROLL: {VIBE_NO_SCROLL}")
+                    if VIBE_DEBUG_TUI:
+                        print(f"  デバッグログ：{VIBE_DEBUG_TUI_LOG}")
+                    if agent.tui._scroll_region:
+                        sr = agent.tui._scroll_region
+                        print(f"  スクロール領域：{sr.top}-{sr.bottom} 行")
+                        print(f"  状態：{'active' if sr._active else 'inactive'}")
+                    else:
+                        print(f"  スクロール領域：未初期化")
+                    print(f"  使い方：VIBE_NO_SCROLL=1 eve-coder.py（無効化）")
+                    print(f"          VIBE_DEBUG_TUI=1 eve-coder.py（デバッグ）")
+                    print()
                     continue
                 elif cmd == "/save":
                     session.save()
