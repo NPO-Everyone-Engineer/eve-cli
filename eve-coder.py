@@ -223,7 +223,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1801,7 +1801,8 @@ class Config:
         hostname = parsed.hostname or ""
         allowed = {"localhost", "127.0.0.1", "::1", "[::1]"}
         if hostname not in allowed:
-            print(f"{C.YELLOW}{t('warnings.ollama_host_not_localhost', default=f\"Warning: OLLAMA_HOST '{hostname}' is not localhost. Resetting to localhost for security.\")}{C.RESET}", file=sys.stderr)
+            msg = t('warnings.ollama_host_not_localhost', default=f"Warning: OLLAMA_HOST '{hostname}' is not localhost. Resetting to localhost for security.")
+            print(f"{C.YELLOW}{msg}{C.RESET}", file=sys.stderr)
             self.ollama_host = self.DEFAULT_OLLAMA_HOST
         # Strip credentials from URL to prevent leaking in banner/errors
         if parsed.username or parsed.password:
@@ -1822,7 +1823,8 @@ class Config:
         for attr in ("model", "sidecar_model"):
             val = getattr(self, attr, "")
             if val and not _SAFE_MODEL_RE.match(val):
-                print(f"{C.YELLOW}{t('warnings.invalid_model_name', default=f\"Warning: invalid {attr} name {val!r} — resetting to default.\")}{C.RESET}", file=sys.stderr)
+                msg = t('warnings.invalid_model_name', default=f"Warning: invalid {attr} name {val!r} — resetting to default.")
+                print(f"{C.YELLOW}{msg}{C.RESET}", file=sys.stderr)
                 setattr(self, attr, "" if attr == "sidecar_model" else self.DEFAULT_MODEL)
 
     def _ensure_dirs(self):
@@ -5136,10 +5138,10 @@ class WebFetchTool(Tool):
                 def redirect_request(self, req, fp, code, msg, headers, newurl):
                     parsed = urllib.parse.urlparse(newurl)
                     if parsed.scheme and parsed.scheme.lower() not in ("http", "https"):
-                        raise urllib.error.URLError(f"Redirect to blocked scheme: {parsed.scheme}")
+                        raise urllib.error.URLError(t('errors.url_redirect_blocked_scheme', default=f"Redirect to blocked scheme: {parsed.scheme}"))
                     redir_host = parsed.hostname or ""
                     if _is_private(redir_host):
-                        raise urllib.error.URLError(f"Redirect to private IP blocked: {redir_host}")
+                        raise urllib.error.URLError(t('errors.url_redirect_private_ip', default=f"Redirect to private IP blocked: {redir_host}"))
                     return super().redirect_request(req, fp, code, msg, headers, newurl)
 
             opener = urllib.request.build_opener(_SafeRedirectHandler)
@@ -6525,7 +6527,8 @@ def _ensure_repo_scope_trusted(config, scope, title, warning, paths, preview_pat
     if previous_hashes == hashes:
         return True
     if previous_hashes:
-        print(f"{C.YELLOW}Warning: trusted repo content for scope '{scope}' has changed.{C.RESET}",
+        msg = t('warnings.trusted_repo_changed', default=f"Warning: trusted repo content for scope '{scope}' has changed.")
+        print(f"{C.YELLOW}{msg}{C.RESET}",
               file=sys.stderr)
     return _prompt_repo_trust(config, scope, title, warning, hashes, preview_paths=preview_paths)
 
@@ -6619,7 +6622,7 @@ def _is_mcp_trusted(config, proj_mcp_path):
     if previous_hashes == hashes:
         return True
     if previous_hashes:
-        print(f"{C.YELLOW}Warning: trusted MCP config or referenced assets have changed.{C.RESET}",
+        print(f"{C.YELLOW}{t('warnings.trusted_mcp_changed', default='Warning: trusted MCP config or referenced assets have changed.')}{C.RESET}",
               file=sys.stderr)
     return _prompt_repo_trust(
         config,
@@ -6645,7 +6648,7 @@ def _load_mcp_servers(config):
                     if isinstance(srv, dict) and "command" in srv:
                         servers[name] = srv
         except (OSError, json.JSONDecodeError) as e:
-            print(f"{C.YELLOW}Warning: Could not load mcp.json: {e}{C.RESET}", file=sys.stderr)
+            print(f"{C.YELLOW}{t('warnings.mcp_json_load_failed', default=f'Warning: Could not load mcp.json: {e}')}{C.RESET}", file=sys.stderr)
     # Project-level MCP requires explicit trust
     proj_mcp = os.path.join(config.cwd, ".eve-cli", "mcp.json")
     if os.path.isfile(proj_mcp) and not os.path.islink(proj_mcp):
@@ -6660,8 +6663,8 @@ def _load_mcp_servers(config):
                             if _is_allowed_mcp_command(cmd):
                                 servers[name] = srv
                             else:
-                                print(f"{C.YELLOW}Warning: MCP server '{name}' blocked \u2014 "
-                                      f"command '{cmd}' is not in allowlist{C.RESET}",
+                                msg = t('warnings.mcp_server_blocked', default=f"MCP server '{name}' blocked — command '{cmd}' is not in allowlist")
+                                print(f"{C.YELLOW}{msg}{C.RESET}",
                                       file=sys.stderr)
             except (OSError, json.JSONDecodeError):
                 pass
@@ -8128,12 +8131,12 @@ class HookManager:
                     elif isinstance(command, str):
                         base_cmd = os.path.basename(command.split()[0]) if command.strip() else ""
                     if base_cmd not in self._HOOK_COMMAND_ALLOWLIST:
-                        print(f"{C.YELLOW}Warning: Hook command '{base_cmd}' blocked "
-                              f"(not in allowlist){C.RESET}", file=sys.stderr)
+                        msg = t('warnings.hook_command_blocked', default=f"Hook command '{base_cmd}' blocked (not in allowlist)")
+                        print(f"{C.YELLOW}{msg}{C.RESET}", file=sys.stderr)
                         continue
                     assets, asset_error = self._get_project_hook_assets(command)
                     if asset_error:
-                        print(f"{C.YELLOW}Warning: Hook blocked ({asset_error}){C.RESET}",
+                        print(f"{C.YELLOW}{t('warnings.hook_blocked', default=f'Warning: Hook blocked ({asset_error})')}{C.RESET}",
                               file=sys.stderr)
                         continue
                 timeout = min(
@@ -8187,7 +8190,7 @@ class HookManager:
                 if legacy_hash and entry.get("hooks_hash") == legacy_hash and len(current_hashes) == 1:
                     return True
             if entry.get("trusted"):
-                print(f"{C.YELLOW}Warning: project hook files changed since trust was granted.{C.RESET}",
+                print(f"{C.YELLOW}{t('warnings.project_hooks_changed', default='Warning: project hook files changed since trust was granted.')}{C.RESET}",
                       file=sys.stderr)
         return False
 
@@ -8202,7 +8205,7 @@ class HookManager:
             for line in content.split("\n")[:10]:
                 print(f"{C.YELLOW}│{C.RESET} {C.DIM}{line}{C.RESET}")
             print(f"{C.YELLOW}│{C.RESET}")
-            print(f"{C.YELLOW}│{C.RESET} {_ansi(chr(27)+'[38;5;196m')}Warning: repo hooks can run arbitrary commands{C.RESET}")
+            print(f"{C.YELLOW}│{C.RESET} {_ansi(chr(27)+'[38;5;196m')}{t('warnings.repo_hooks_arbitrary', default='Warning: repo hooks can run arbitrary commands')}{C.RESET}")
             print(f"{C.YELLOW}│{C.RESET}  [y] Trust  [n] Skip (default)")
             print(f"{C.YELLOW}╰──────────────────────────────────────────{C.RESET}")
             ans = input(f"  {C.YELLOW}? {C.RESET}").strip().lower()
@@ -9113,12 +9116,12 @@ class Session:
         real_path = os.path.realpath(path)
         real_dir = os.path.realpath(self.config.sessions_dir)
         if not real_path.startswith(real_dir + os.sep):
-            print(f"{C.RED}Warning: session path escapes sessions directory — refusing to write.{C.RESET}",
+            print(f"{C.RED}{t('warnings.session_path_escape', default='Warning: session path escapes sessions directory — refusing to write.')}{C.RESET}",
                   file=sys.stderr)
             return
         # Guard against symlink attacks on session file
         if os.path.islink(path):
-            print(f"{C.RED}Warning: session file is a symlink — refusing to write for safety.{C.RESET}",
+            print(f"{C.RED}{t('warnings.session_symlink_write', default='Warning: session file is a symlink — refusing to write for safety.')}{C.RESET}",
                   file=sys.stderr)
             return
         try:
@@ -9137,7 +9140,7 @@ class Session:
                     pass
                 raise  # propagate to outer handler for user warning
         except Exception as e:
-            print(f"\n{C.YELLOW}Warning: Session save failed: {e}{C.RESET}", file=sys.stderr)
+            print(f"\n{C.YELLOW}{t('warnings.session_save_failed', default=f'Warning: Session save failed: {e}')}{C.RESET}", file=sys.stderr)
             if self.config.debug:
                 traceback.print_exc()
             return  # Don't update project index if session save failed
@@ -9191,7 +9194,7 @@ class Session:
             pass
         # Reject symlinked session files
         if os.path.islink(path):
-            print(f"{C.RED}Warning: session file is a symlink — refusing to read for safety.{C.RESET}",
+            print(f"{C.RED}{t('warnings.session_symlink_read', default='Warning: session file is a symlink — refusing to read for safety.')}{C.RESET}",
                   file=sys.stderr)
             return False
         try:
@@ -9217,13 +9220,13 @@ class Session:
                                   file=sys.stderr)
                         continue
             if skipped > 0:
-                print(f"{C.YELLOW}Warning: Skipped {skipped} corrupt line(s) in session.{C.RESET}",
+                print(f"{C.YELLOW}{t('warnings.session_corrupt_lines', default=f'Warning: Skipped {skipped} corrupt line(s) in session.')}{C.RESET}",
                       file=sys.stderr)
             self.session_id = sid
             self._recalculate_tokens()
             return True
         except OSError as e:
-            print(f"{C.RED}Error loading session: {e}{C.RESET}", file=sys.stderr)
+            print(f"{C.RED}{t('errors.session_load_failed', default=f'Error loading session: {e}')}{C.RESET}", file=sys.stderr)
             return False
 
     @staticmethod
@@ -12851,7 +12854,7 @@ def main():
                             capture_output=True, text=True, timeout=10
                         )
                         if result.returncode != 0:
-                            print(f"{C.RED}Not a git repository or git error.{C.RESET}")
+                            print(f"{C.RED}{t('errors.git_diff_failed', default='Not a git repository or git error.')}{C.RESET}")
                         elif result.stdout.strip():
                             print(result.stdout)
                         else:
@@ -12868,7 +12871,7 @@ def main():
                     except FileNotFoundError:
                         print(f"{C.RED}git not found. Is git installed?{C.RESET}")
                     except Exception as e:
-                        print(f"{C.RED}Error: {e}{C.RESET}")
+                        print(f"{C.RED}{t('errors.git_command_failed', default=f'Error: {e}')}{C.RESET}")
                     continue
 
                 elif cmd == "/git":
@@ -12905,7 +12908,7 @@ def main():
                     except FileNotFoundError:
                         print(f"{C.RED}git not found. Is git installed?{C.RESET}")
                     except Exception as e:
-                        print(f"{C.RED}Error: {e}{C.RESET}")
+                        print(f"{C.RED}{t('errors.git_command_failed', default=f'Error: {e}')}{C.RESET}")
                     continue
 
                 # ── GitHub commands ───────────────────────────────────
@@ -13361,7 +13364,7 @@ def main():
                             capture_output=True, text=True, timeout=10
                         )
                         if result.returncode != 0:
-                            print(f"{C.YELLOW}Warning: Generated test has syntax errors:{C.RESET}")
+                            print(f"{C.YELLOW}{t('warnings.test_syntax_error', default='Warning: Generated test has syntax errors:')}{C.RESET}")
                             print(f"{C.DIM}{result.stderr}{C.RESET}")
                     except (subprocess.TimeoutExpired, OSError):
                         pass

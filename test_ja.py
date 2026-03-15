@@ -109,10 +109,17 @@ test_cases = [
     ('errors.max_loop_hours_capped', {}),
     ('errors.mcp_server_start_failed', {'name': 'test-server', 'e': 'file not found'}),
     ('errors.sidecar_call_failed', {'e': 'timeout'}),
+    ('errors.session_load_failed', {'error': 'permission denied'}),
+    ('errors.url_redirect_blocked_scheme', {'scheme': 'ftp'}),
+    ('errors.git_diff_failed', {}),
     
     # 警告メッセージ
     ('warnings.ollama_host_not_localhost', {'hostname': '192.168.1.100'}),
     ('warnings.file_read_failed', {'fname': 'test.txt', 'error': 'permission denied'}),
+    ('warnings.session_path_escape', {}),
+    ('warnings.hook_command_blocked', {'base_cmd': 'rm -rf /'}),
+    ('warnings.trusted_repo_changed', {'scope': 'global'}),
+    ('warnings.test_syntax_error', {}),
     
     # 情報メッセージ
     ('info.session_resumed', {}),
@@ -129,7 +136,7 @@ for key, kwargs in test_cases:
     result = t(key, default=f"[EN] {key}")
     
     # 日本語チェック：キーワードが含まれていれば OK
-    ja_keywords = ['エラー', '警告', 'デバッグ', 'セッション', 'ファイル', 'サーバー', 'モデル', 'コマンド', 'パス', '許可', '読め', '返し', '起動', '呼び出し']
+    ja_keywords = ['エラー', '警告', 'デバッグ', 'セッション', 'ファイル', 'サーバー', 'モデル', 'コマンド', 'パス', '許可', '読め', '返し', '起動', '呼び出し', 'ブロック', 'リダイレクト', 'Git', 'リポジトリ', '構文', 'テスト', 'MCP', 'サイドカー', 'OLLAMA_HOST', 'localhost', 'スキーム', 'プライベート', 'IP', 'フック', '信頼', '逸脱', 'シンボリック', 'ディレクトリ', '権限', 'プロンプト', 'レスポンス', '候補', '配列', 'JSON', 'タイムアウト', 'ループ', 'ステップ', '時間', '制限']
     is_ja = any(kw in result for kw in ja_keywords)
     
     if get_language() == 'ja' and is_ja:

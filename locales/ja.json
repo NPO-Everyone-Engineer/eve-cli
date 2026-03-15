@@ -37,7 +37,13 @@
     "sidecar_call_failed": "サイドカーモデル呼び出し失敗：{e}",
     "sidecar_no_suggestions": "サイドカーモデルから候補が返りませんでした。起動直後で会話履歴・エラー・変更差分が少ないと、空の応答になることがあります。",
     "sidecar_invalid_json": "サイドカーモデルの応答を候補一覧として読めませんでした。空文字や説明文ではなく、JSON 配列が返る想定です。",
-    "sidecar_not_array": "サイドカーモデルの応答が JSON 配列ではありませんでした"
+    "sidecar_not_array": "サイドカーモデルの応答が JSON 配列ではありませんでした",
+    "session_load_failed": "セッションの読み込みに失敗しました：{error}",
+    "url_redirect_blocked_scheme": "ブロックされたスキームへのリダイレクト：{scheme}",
+    "url_redirect_private_ip": "プライベート IP へのリダイレクトがブロックされました：{host}",
+    "git_diff_failed": "Git リポジトリではないか、Git エラーが発生しました。",
+    "git_command_failed": "エラー：{error}",
+    "test_syntax_error": "警告：生成されたテストに構文エラーがあります："
   },
   "warnings": {
     "debug_stream_error": "[デバッグ] NDJSON ストリーム読み込みエラー：{error}",
@@ -52,7 +58,25 @@
     "dir_create_failed": "警告：ディレクトリ {d} を作成できません：{error}",
     "file_permission_denied": "警告：{fname} が見つかりましたが読み取れません（権限がありません）。",
     "file_read_failed": "警告：{fname} を読み取れませんでした：{error}",
-    "system_prompt_read_failed": "警告：システムプロンプトファイルを読み取れませんでした：{error}"
+    "system_prompt_read_failed": "警告：システムプロンプトファイルを読み取れませんでした：{error}",
+    "session_path_escape": "警告：セッションパスがセッションディレクトリから逸脱しています — 書き込みを拒否します。",
+    "session_symlink_write": "警告：セッションファイルはシンボリックリンクです — 安全性のため書き込みを拒否します。",
+    "session_save_failed": "警告：セッション保存に失敗しました：{error}",
+    "session_symlink_read": "警告：セッションファイルはシンボリックリンクです — 安全性のため読み取りを拒否します。",
+    "session_corrupt_lines": "警告：セッション内の破損した {skipped} 行をスキップしました。",
+    "hook_command_blocked": "警告：フックコマンド '{base_cmd}' がブロックされました（allowlist にありません）。",
+    "hook_blocked": "警告：フックがブロックされました（{error}）",
+    "project_hooks_changed": "警告：プロジェクトフックファイルが信頼付与後に変更されました。",
+    "repo_hooks_arbitrary": "警告：リポジトリフックは任意のコマンドを実行できます",
+    "trusted_repo_changed": "警告：信頼されたリポジトリのコンテンツ（スコープ：'{scope}'）が変更されました。",
+    "trusted_mcp_changed": "警告：信頼された MCP 設定または参照アセットが変更されました。",
+    "mcp_json_load_failed": "警告：mcp.json を読み込めませんでした：{error}",
+    "mcp_server_blocked": "警告：MCP サーバー '{name}' がブロックされました — コマンド '{cmd}' が allowlist にありません",
+    "url_redirect_blocked_scheme": "ブロックされたスキームへのリダイレクト：{scheme}",
+    "url_redirect_private_ip": "プライベート IP へのリダイレクトがブロックされました：{host}",
+    "git_diff_failed": "Git リポジトリではないか、Git エラーが発生しました。",
+    "git_command_failed": "エラー：{error}",
+    "test_syntax_error": "警告：生成されたテストに構文エラーがあります："
   },
   "info": {
     "model_pulling": "モデル '{model}' を取得中...",
