@@ -12,6 +12,10 @@ Usage:
     python3 eve-coder.py --resume               # resume last session
 """
 
+# ============================================================================
+# 日本語 UX 強化 - 言語設定と翻訳システム
+# ============================================================================
+
 import html as html_module
 import json
 import os
@@ -44,6 +48,117 @@ from datetime import datetime
 import collections
 import concurrent.futures
 import shlex
+
+# 言語設定グローバル変数
+_LANG = None  # 'ja' or 'en' (None = auto-detect)
+_LOCALES = {}  # 翻訳辞書
+
+def _detect_language():
+    """
+    OS の言語設定から自動検出
+    
+    優先順位:
+    1. 環境変数 EVE_CLI_LANG (明示的な設定)
+    2. LC_ALL, LC_MESSAGES, LANG
+    3. locale.getdefaultlocale()
+    4. デフォルト：en
+    """
+    import locale
+    
+    # 1. 環境変数で明示設定
+    env_lang = os.environ.get('EVE_CLI_LANG')
+    if env_lang:
+        return 'ja' if env_lang.lower().startswith('ja') else 'en'
+    
+    # 2. 標準的な環境変数をチェック
+    for var in ['LC_ALL', 'LC_MESSAGES', 'LANG']:
+        lang = os.environ.get(var, '')
+        if lang:
+            if lang.startswith('ja') or 'JP' in lang:
+                return 'ja'
+            elif lang.startswith('en') or lang.startswith('C'):
+                return 'en'
+    
+    # 3. locale モジュールで検出
+    try:
+        lang = locale.getdefaultlocale()[0] or ''
+        if lang.startswith('ja'):
+            return 'ja'
+        return 'en'
+    except Exception:
+        return 'en'
+
+def _load_locales(lang='ja'):
+    """翻訳辞書を読み込み"""
+    global _LOCALES
+    if _LOCALES:
+        return _LOCALES
+    
+    # locales ディレクトリのパスを特定
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    locales_dir = os.path.join(script_dir, 'locales')
+    locale_file = os.path.join(locales_dir, f'{lang}.json')
+    
+    try:
+        if os.path.exists(locale_file):
+            with open(locale_file, 'r', encoding='utf-8') as f:
+                _LOCALES = json.load(f)
+        else:
+            _LOCALES = {}
+    except Exception:
+        _LOCALES = {}
+    
+    return _LOCALES
+
+def set_language(lang):
+    """言語を設定（'ja' or 'en'）"""
+    global _LANG
+    _LANG = lang
+    _LOCALES.clear()  # キャッシュクリア
+    if lang == 'ja':
+        _load_locales('ja')
+
+def get_language():
+    """現在の言語設定を取得"""
+    global _LANG
+    if _LANG is None:
+        _LANG = _detect_language()
+    return _LANG
+
+def t(key, default=None, **kwargs):
+    """
+    翻訳キーからメッセージを取得
+    
+    例:
+        t('errors.file_not_found', path='/tmp/test.txt')
+        → "エラー：ファイルが見つかりません：/tmp/test.txt"
+    """
+    lang = get_language()
+    if lang != 'ja':
+        return default or key
+    
+    locales = _load_locales('ja')
+    
+    # キーをドットで分割してネストを辿る
+    parts = key.split('.')
+    value = locales
+    for part in parts:
+        if isinstance(value, dict) and part in value:
+            value = value[part]
+        else:
+            return default or key
+    
+    # プレースホルダーを置換
+    if isinstance(value, str) and kwargs:
+        try:
+            value = value.format(**kwargs)
+        except KeyError:
+            pass
+    
+    return value
+
+# 言語設定を初期化
+set_language(get_language())
 
 # readline is not available on Windows
 try:
@@ -1100,14 +1215,13 @@ class Config:
             return None
         if steps < 1:
             if emit_errors:
-                print(f"{C.RED}Error: --max-agent-steps must be >= 1{C.RESET}")
+                print(f"{C.RED}{t('errors.invalid_max_steps', default='Error: --max-agent-steps must be >= 1')}{C.RESET}")
                 sys.exit(1)
             return None
         if steps > self.HARD_MAX_AGENT_STEPS:
             if emit_errors:
                 print(
-                    f"{C.YELLOW}Warning: --max-agent-steps capped at "
-                    f"{self.HARD_MAX_AGENT_STEPS}{C.RESET}"
+                    f"{C.YELLOW}{t('warnings.max_steps_capped', default=f'Warning: --max-agent-steps capped at {self.HARD_MAX_AGENT_STEPS}')}{C.RESET}"
                 )
             return self.HARD_MAX_AGENT_STEPS
         return steps
@@ -1405,10 +1519,10 @@ class Config:
         if args.max_loop_hours is not None:
             # Validate and cap at 72 hours (3 days)
             if args.max_loop_hours > 72:
-                print(f"{C.YELLOW}Warning: --max-loop-hours capped at 72 hours (3 days){C.RESET}")
+                print(f"{C.YELLOW}{t('warnings.max_loop_hours_capped', default='Warning: --max-loop-hours capped at 72 hours (3 days)')}{C.RESET}")
                 self.max_loop_hours = 72.0
             elif args.max_loop_hours < 0:
-                print(f"{C.RED}Error: --max-loop-hours must be positive{C.RESET}")
+                print(f"{C.RED}{t('errors.invalid_loop_hours', default='Error: --max-loop-hours must be positive')}{C.RESET}")
                 sys.exit(1)
             else:
                 self.max_loop_hours = args.max_loop_hours
@@ -2846,22 +2960,20 @@ class OllamaClient:
             finally:
                 e.close()
             if e.code == 404:
-                raise RuntimeError(f"Model '{model}' not found. Run: ollama pull {model}") from e
+                raise RuntimeError(t('errors.model_not_found', default=f"Model '{model}' not found. Run: ollama pull {model}")) from e
             elif e.code == 400:
                 if "tool" in error_body.lower() or "function" in error_body.lower():
-                    raise RuntimeError(
-                        f"Model '{model}' does not support tool/function calling. "
-                        f"Try: qwen3:8b, llama3.1:8b. Error: {error_body[:200]}"
-                    ) from e
+                    msg = t('errors.model_no_tool_support', default=f"Model '{model}' does not support tool/function calling.")
+                    msg += " " + t('errors.model_suggest_alternative', default='Try: qwen3:8b, llama3.1:8b.')
+                    raise RuntimeError(f"{msg} Error: {error_body[:200]}") from e
                 elif "context" in error_body.lower() or "token" in error_body.lower():
-                    raise RuntimeError(
-                        f"Context window exceeded for '{model}'. "
-                        f"Use /compact or /clear. Error: {error_body[:200]}"
-                    ) from e
+                    msg = t('errors.context_window_exceeded', default=f"Context window exceeded for '{model}'.")
+                    msg += " " + t('errors.suggest_compact', default='Use /compact or /clear.')
+                    raise RuntimeError(f"{msg} Error: {error_body[:200]}") from e
                 else:
-                    raise RuntimeError(f"Bad request to Ollama (400): {error_body}") from e
+                    raise RuntimeError(t('errors.model_bad_request', default=f"Bad request to Ollama (400): {error_body}")) from e
             else:
-                raise RuntimeError(f"Ollama HTTP error {e.code}: {error_body}") from e
+                raise RuntimeError(t('errors.ollama_http_error', default=f"Ollama HTTP error {e.code}: {error_body}")) from e
 
         if stream:
             return self._iter_ndjson(resp)
@@ -2873,7 +2985,7 @@ class OllamaClient:
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError as e:
-                raise RuntimeError(f"Invalid JSON from Ollama: {raw[:200]}") from e
+                raise RuntimeError(t('errors.invalid_json_ollama', default=f"Invalid JSON from Ollama: {raw[:200]}")) from e
             openai_resp = self._native_to_openai_response(data)
             if self.debug:
                 usage = openai_resp.get("usage", {})
@@ -2897,7 +3009,7 @@ class OllamaClient:
                     chunk = resp.read(4096)
                 except (ConnectionError, OSError, urllib.error.URLError) as e:
                     if self.debug:
-                        print(f"\n{C.YELLOW}[debug] NDJSON stream read error: {e}{C.RESET}",
+                        print(f"\n{C.DIM}{t('warnings.debug_stream_error', default=f'[debug] NDJSON stream read error: {e}')}{C.RESET}",
                               file=sys.stderr)
                     break
                 except Exception:
@@ -3202,7 +3314,8 @@ class RAGEngine:
         target = os.path.abspath(target_path)
         if not os.path.exists(target):
             if verbose:
-                print(f"{C.RED}Error: path '{target_path}' does not exist{C.RESET}")
+                msg = t('errors.path_not_exist', default=f"Error: path '{target_path}' does not exist")
+                print(f"{C.RED}{msg}{C.RESET}")
             return 0, 0, 1
 
         files = self._collect_files(target)
@@ -3823,7 +3936,7 @@ class BashTool(Tool):
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-                return f"Error: command took too long (over {int(timeout_s)}s) and was stopped. Try a faster approach or increase --timeout."
+                return t('errors.command_timeout', default=f"Error: command took too long (over {int(timeout_s)}s) and was stopped. Try a faster approach or increase --timeout.")
             output = ""
             if stdout:
                 output += stdout
@@ -3910,7 +4023,8 @@ def _read_image_as_base64(file_path):
             data = base64.b64encode(f.read()).decode("ascii")
         return (data, media_type), None
     except Exception as e:
-        return None, f"Error reading image: {e}"
+        err_msg = t('errors.image_read_error', default=f"Error reading image: {e}")
+        return None, err_msg
 
 
 def _clipboard_image_to_file():
@@ -11996,10 +12110,10 @@ def main():
 
     # Validate loop mode arguments
     if config.loop_mode and not config.prompt:
-        print(f"{C.RED}Error: --loop can only be used with -p/--prompt{C.RESET}")
+        print(f"{C.RED}{t('errors.loop_requires_prompt', default='Error: --loop can only be used with -p/--prompt')}{C.RESET}")
         sys.exit(1)
     if config.max_loop_iterations < 1:
-        print(f"{C.RED}Error: --max-loop-iterations must be >= 1{C.RESET}")
+        print(f"{C.RED}{t('errors.invalid_max_loop_iterations', default='Error: --max-loop-iterations must be >= 1')}{C.RESET}")
         sys.exit(1)
 
     # Handle --list-sessions

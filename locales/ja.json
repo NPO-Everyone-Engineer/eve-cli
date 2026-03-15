@@ -1,0 +1,61 @@
+{
+  "errors": {
+    "file_not_found": "エラー：ファイルが見つかりません：{path}",
+    "permission_denied": "エラー：権限がありません",
+    "model_not_found": "エラー：モデル '{model}' が見つかりません。次を実行してください：ollama pull {model}",
+    "model_not_available": "エラー：モデルが利用できません",
+    "invalid_argument": "エラー：無効な引数です",
+    "timeout": "エラー：コマンドがタイムアウトしました（{seconds}秒）",
+    "http_error": "エラー：HTTP エラー {code}: {message}",
+    "invalid_json": "エラー：無効な JSON 形式です",
+    "network_error": "エラー：ネットワークエラーが発生しました",
+    "task_not_found": "エラー：バックグラウンドタスク '{task_id}' が見つかりません",
+    "too_many_tasks": "エラー：バックグラウンドタスクが多すぎます（最大 {max} 個）",
+    "write_blocked": "エラー：セキュリティのため、シェル経由での {path} への書き込みはブロックされています",
+    "path_not_exist": "エラー：パス '{path}' が存在しません",
+    "invalid_max_steps": "エラー：--max-agent-steps は 1 以上である必要があります",
+    "invalid_loop_hours": "エラー：--max-loop-hours は正の数である必要があります",
+    "pull_failed": "エラー：プルに失敗しました：{error}",
+    "image_read_error": "エラー：画像の読み込みに失敗しました：{error}",
+    "unknown_error": "エラー：不明なエラーが発生しました：{error}",
+    "model_no_tool_support": "モデル '{model}' はツール/関数呼び出しをサポートしていません",
+    "model_suggest_alternative": "代替案：qwen3:8b, llama3.1:8b をお試しください",
+    "context_window_exceeded": "モデル '{model}' のコンテキストウィンドウを超過しました",
+    "suggest_compact": "/compact または /clear を使用してください",
+    "model_bad_request": "Ollama リクエストが不正です（400）：{message}",
+    "ollama_http_error": "Ollama HTTP エラー {code}: {message}",
+    "invalid_json_ollama": "Ollama から無効な JSON が返されました：{data}",
+    "command_timeout": "エラー：コマンドがタイムアウトしました（{timeout_s}秒）。より高速なアプローチを試すか、--timeout を増やしてください",
+    "max_steps_capped": "警告：--max-agent-steps は {max} に制限されました",
+    "max_loop_hours_capped": "警告：--max-loop-hours は 72 時間（3 日）に制限されました",
+    "loop_requires_prompt": "エラー：--loop は -p/--prompt と一緒に使用する必要があります",
+    "invalid_max_loop_iterations": "エラー：--max-loop-iterations は 1 以上である必要があります"
+  },
+  "warnings": {
+    "debug_stream_error": "[デバッグ] NDJSON ストリーム読み込みエラー：{error}",
+    "model_not_in_local": "警告：モデル '{model}' がローカルに見つかりません。クラウドモデルとして試行します。",
+    "model_cloud_only": "警告：モデル '{model}' はクラウドモデルです。ネットワーク接続が必要です。",
+    "model_bad_request": "エラー：Ollama リクエストが不正です（400）：{message}",
+    "low_memory": "警告：メモリ不足の可能性があります。軽量モデルの使用を検討してください。"
+  },
+  "info": {
+    "model_pulling": "モデル '{model}' を取得中...",
+    "model_loaded": "モデル '{model}' を読み込みました",
+    "session_resumed": "セッションを再開しました",
+    "session_saved": "セッションを保存しました",
+    "task_started": "バックグラウンドタスクを開始しました：{task_id}",
+    "task_completed": "バックグラウンドタスクが完了しました：{task_id}",
+    "git_checkpoint_created": "Git チェックポイントを作成しました",
+    "undo_successful": "元に戻しました",
+    "file_written": "ファイルを書き込みました：{path}",
+    "file_deleted": "ファイルを削除しました：{path}",
+    "command_executed": "コマンドを実行しました：{command}"
+  },
+  "prompts": {
+    "confirm_write": "ファイル '{path}' に書き込みますか？",
+    "confirm_command": "コマンド '{command}' を実行しますか？",
+    "confirm_delete": "ファイル '{path}' を削除しますか？",
+    "select_model": "使用するモデルを選択してください:",
+    "enter_message": "メッセージを入力してください（終了: /quit）:"
+  }
+}
