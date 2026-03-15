@@ -1388,73 +1388,70 @@ class Config:
                 argv.append(a)
         parser = argparse.ArgumentParser(
             prog="eve-coder",
-            description="EvE CLI — Everyone.Engineer coding agent (Local + Cloud via Ollama)",
+            description=t('help.description', default="EvE CLI — Everyone.Engineer coding agent (Local + Cloud via Ollama)"),
         )
-        parser.add_argument("-p", "--prompt", help="One-shot prompt (non-interactive)")
-        parser.add_argument("-m", "--model", help="Ollama model name")
-        parser.add_argument("-y", "--yes", action="store_true", help="Auto-approve all tool calls")
-        parser.add_argument("--debug", action="store_true", help="Debug mode")
-        parser.add_argument("--resume", action="store_true", help="Resume last session")
-        parser.add_argument("--session-id", help="Resume specific session")
-        parser.add_argument("--list-sessions", action="store_true", help="List saved sessions")
-        parser.add_argument("--ollama-host", help="Ollama host URL")
-        parser.add_argument("--max-tokens", type=int, help="Max output tokens")
-        parser.add_argument("--temperature", type=float, help="Sampling temperature")
-        parser.add_argument("--context-window", type=int, help="Context window size")
+        parser.add_argument("-p", "--prompt", help=t('help.prompt', default="One-shot prompt (non-interactive)"))
+        parser.add_argument("-m", "--model", help=t('help.model', default="Ollama model name"))
+        parser.add_argument("-y", "--yes", action="store_true", help=t('help.yes', default="Auto-approve all tool calls"))
+        parser.add_argument("--debug", action="store_true", help=t('help.debug', default="Debug mode"))
+        parser.add_argument("--resume", action="store_true", help=t('help.resume', default="Resume last session"))
+        parser.add_argument("--session-id", help=t('help.session_id', default="Resume specific session"))
+        parser.add_argument("--list-sessions", action="store_true", help=t('help.list_sessions', default="List saved sessions"))
+        parser.add_argument("--ollama-host", help=t('help.ollama_host', default="Ollama host URL"))
+        parser.add_argument("--max-tokens", type=int, help=t('help.max_tokens', default="Max output tokens"))
+        parser.add_argument("--temperature", type=float, help=t('help.temperature', default="Sampling temperature"))
+        parser.add_argument("--context-window", type=int, help=t('help.context_window', default="Context window size"))
         parser.add_argument(
             "--max-agent-steps",
             type=int,
-            help=(
-                f"Max internal AI steps per request "
-                f"(default: {self.DEFAULT_MAX_AGENT_STEPS}, max: {self.HARD_MAX_AGENT_STEPS})"
-            ),
+            help=f"リクエストあたりの最大 AI 内部ステップ数（デフォルト：{self.DEFAULT_MAX_AGENT_STEPS}, 最大：{self.HARD_MAX_AGENT_STEPS}）",
         )
         parser.add_argument("--version", action="version", version=f"eve-coder {__version__}")
-        parser.add_argument("--profile", help="Connection profile: auto, online, offline, or custom name")
+        parser.add_argument("--profile", help=t('help.profile', default="Connection profile: auto, online, offline, or custom name"))
         parser.add_argument("--dangerously-skip-permissions", action="store_true",
-                            help="Alias for -y (compatibility)")
+                            help=t('help.dangerously_skip_permissions', default="Alias for -y (compatibility)"))
         # Output format
         parser.add_argument("--output-format", choices=["text", "json", "stream-json"],
-                            default="text", help="Output format for one-shot mode")
+                            default="text", help=t('help.output_format', default="Output format for one-shot mode"))
         # Markdown rendering
         parser.add_argument("--markdown-renderer", choices=["glow", "simple"],
-                            help="Markdown renderer: glow (beautiful tables) or simple")
+                            help=t('help.markdown_renderer', default="Markdown renderer: glow (beautiful tables) or simple"))
         # System prompt customization
         parser.add_argument("--system-prompt-file", metavar="PATH",
-                            help="Append system prompt from file")
+                            help=t('help.system_prompt_file', default="Append system prompt from file"))
         # Loop mode for one-shot execution
         parser.add_argument("--loop", action="store_true",
-                            help="Loop mode: re-run the prompt until --done-string is output")
+                            help=t('help.loop', default="Loop mode: re-run the prompt until --done-string is output"))
         parser.add_argument("--max-loop-iterations", type=int, default=5,
-                            help="Max re-runs in loop mode (default: 5)")
+                            help=t('help.max_loop_iterations', default="Max re-runs in loop mode (default: 5)"))
         parser.add_argument("--done-string", default="DONE",
-                            help="Completion signal string that stops the loop (default: DONE)")
+                            help=t('help.done_string', default="Completion signal string that stops the loop (default: DONE)"))
         parser.add_argument("--max-loop-hours", type=float, default=None,
-                            help="Max execution time in hours for loop mode (default: no limit, max: 72)")
+                            help=t('help.max_loop_hours', default="Max execution time in hours for loop mode (default: no limit, max: 72)"))
         # RAG options
-        parser.add_argument("--rag", action="store_true", help="Enable RAG mode")
+        parser.add_argument("--rag", action="store_true", help=t('help.rag', default="Enable RAG mode"))
         parser.add_argument("--rag-mode", choices=["query"], default="query",
-                            help="RAG mode (default: query)")
-        parser.add_argument("--rag-path", help="Path to use for RAG context")
+                            help=t('help.rag_mode', default="RAG mode (default: query)"))
+        parser.add_argument("--rag-path", help=t('help.rag_path', default="Path to use for RAG context"))
         parser.add_argument("--rag-topk", type=int, default=None,
-                            help="Number of top results for RAG (default: 5 when not specified)")
+                            help=t('help.rag_topk', default="Number of top results for RAG (default: 5 when not specified)"))
         parser.add_argument("--rag-model", default="nomic-embed-text",
-                            help="Ollama embedding model (default: nomic-embed-text)")
+                            help=t('help.rag_model', default="Ollama embedding model (default: nomic-embed-text)"))
         parser.add_argument("--rag-index", metavar="PATH",
-                            help="Index files at PATH for RAG and exit")
+                            help=t('help.rag_index', default="Index files at PATH for RAG and exit"))
         # Parallel file operations
         parser.add_argument("--max-parallel-files", type=int, metavar="N",
-                            help="Max parallel file edits (1-10, default: 5)")
+                            help=t('help.max_parallel_files', default="Max parallel file edits (1-10, default: 5)"))
         parser.add_argument("--no-progress", action="store_true",
-                            help="Disable progress indicators for file operations")
+                            help=t('help.no_progress', default="Disable progress indicators for file operations"))
         # Learn mode
         parser.add_argument("--learn", action="store_true",
                             help="Enable learn mode: interactive explanations for code and errors")
         parser.add_argument("--level", type=int, choices=[1, 2, 3, 4, 5], default=3,
-                            help="Learn mode level: 1=concise, 5=very detailed (default: 3)")
+                            help=t('help.level', default="Learn mode level: 1=concise, 5=very detailed (default: 3)"))
         # UI Theme
         parser.add_argument("--theme", choices=["normal", "gal", "dandy", "bushi"], default=None,
-                            help="UI theme: normal, gal, dandy, bushi (default: normal)")
+                            help=t('help.theme', default="UI theme: normal, gal, dandy, bushi (default: normal)"))
         args = parser.parse_args(argv)
 
         if args.prompt:
