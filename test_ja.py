@@ -100,13 +100,24 @@ print()
 
 # テストケース
 test_cases = [
+    # エラーメッセージ
     ('errors.invalid_max_steps', {}),
     ('errors.invalid_loop_hours', {}),
     ('errors.path_not_exist', {'path': '/tmp/nonexistent'}),
     ('errors.model_not_found', {'model': 'qwen3:8b'}),
     ('errors.command_timeout', {'timeout_s': 30}),
-    ('errors.max_loop_hours_capped', {}),  # errors セクションに追加
+    ('errors.max_loop_hours_capped', {}),
+    ('errors.mcp_server_start_failed', {'name': 'test-server', 'e': 'file not found'}),
+    ('errors.sidecar_call_failed', {'e': 'timeout'}),
+    
+    # 警告メッセージ
+    ('warnings.ollama_host_not_localhost', {'hostname': '192.168.1.100'}),
+    ('warnings.file_read_failed', {'fname': 'test.txt', 'error': 'permission denied'}),
+    
+    # 情報メッセージ
     ('info.session_resumed', {}),
+    
+    # プロンプト
     ('prompts.confirm_write', {'path': './test.txt'}),
 ]
 
@@ -116,9 +127,12 @@ print("-" * 60)
 all_passed = True
 for key, kwargs in test_cases:
     result = t(key, default=f"[EN] {key}")
-    expected_ja = key.startswith('errors.') or key.startswith('warnings.') or key.startswith('info.') or key.startswith('prompts.')
     
-    if get_language() == 'ja' and 'エラー' in result or '警告' in result or 'デバッグ' in result or 'セッション' in result or 'ファイル' in result:
+    # 日本語チェック：キーワードが含まれていれば OK
+    ja_keywords = ['エラー', '警告', 'デバッグ', 'セッション', 'ファイル', 'サーバー', 'モデル', 'コマンド', 'パス', '許可', '読め', '返し', '起動', '呼び出し']
+    is_ja = any(kw in result for kw in ja_keywords)
+    
+    if get_language() == 'ja' and is_ja:
         status = "✅ PASS"
     else:
         status = "❌ FAIL"

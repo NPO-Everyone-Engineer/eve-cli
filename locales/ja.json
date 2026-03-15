@@ -29,14 +29,30 @@
     "max_steps_capped": "警告：--max-agent-steps は {max} に制限されました",
     "max_loop_hours_capped": "警告：--max-loop-hours は 72 時間（3 日）に制限されました",
     "loop_requires_prompt": "エラー：--loop は -p/--prompt と一緒に使用する必要があります",
-    "invalid_max_loop_iterations": "エラー：--max-loop-iterations は 1 以上である必要があります"
+    "invalid_max_loop_iterations": "エラー：--max-loop-iterations は 1 以上である必要があります",
+    "mcp_server_start_failed": "MCP サーバー '{name}' の起動に失敗しました：{e}",
+    "mcp_server_not_running": "MCP サーバー '{name}' が実行されていません",
+    "mcp_server_closed_unexpectedly": "MCP サーバー '{name}' が予期せず閉じられました",
+    "mcp_communication_failed": "MCP サーバー '{name}' との通信に失敗しました：{e}",
+    "sidecar_call_failed": "サイドカーモデル呼び出し失敗：{e}",
+    "sidecar_no_suggestions": "サイドカーモデルから候補が返りませんでした。起動直後で会話履歴・エラー・変更差分が少ないと、空の応答になることがあります。",
+    "sidecar_invalid_json": "サイドカーモデルの応答を候補一覧として読めませんでした。空文字や説明文ではなく、JSON 配列が返る想定です。",
+    "sidecar_not_array": "サイドカーモデルの応答が JSON 配列ではありませんでした"
   },
   "warnings": {
     "debug_stream_error": "[デバッグ] NDJSON ストリーム読み込みエラー：{error}",
     "model_not_in_local": "警告：モデル '{model}' がローカルに見つかりません。クラウドモデルとして試行します。",
     "model_cloud_only": "警告：モデル '{model}' はクラウドモデルです。ネットワーク接続が必要です。",
     "model_bad_request": "エラー：Ollama リクエストが不正です（400）：{message}",
-    "low_memory": "警告：メモリ不足の可能性があります。軽量モデルの使用を検討してください。"
+    "low_memory": "警告：メモリ不足の可能性があります。軽量モデルの使用を検討してください。",
+    "ollama_host_not_localhost": "警告：OLLAMA_HOST '{hostname}' が localhost ではありません。セキュリティのため localhost にリセットします。",
+    "invalid_model_name": "警告：無効な {attr} 名 {val!r} — デフォルトにリセットします。",
+    "dir_permission_denied": "警告：ディレクトリ {d} を作成できません（権限がありません）。",
+    "dir_permission_denied_suggestion": "次のコマンドを試してください：sudo mkdir -p {d} && sudo chown $USER {d}",
+    "dir_create_failed": "警告：ディレクトリ {d} を作成できません：{error}",
+    "file_permission_denied": "警告：{fname} が見つかりましたが読み取れません（権限がありません）。",
+    "file_read_failed": "警告：{fname} を読み取れませんでした：{error}",
+    "system_prompt_read_failed": "警告：システムプロンプトファイルを読み取れませんでした：{error}"
   },
   "info": {
     "model_pulling": "モデル '{model}' を取得中...",

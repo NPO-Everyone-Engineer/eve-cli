@@ -1801,8 +1801,7 @@ class Config:
         hostname = parsed.hostname or ""
         allowed = {"localhost", "127.0.0.1", "::1", "[::1]"}
         if hostname not in allowed:
-            print(f"{C.YELLOW}Warning: OLLAMA_HOST '{hostname}' is not localhost. "
-                  f"Resetting to localhost for security.{C.RESET}", file=sys.stderr)
+            print(f"{C.YELLOW}{t('warnings.ollama_host_not_localhost', default=f\"Warning: OLLAMA_HOST '{hostname}' is not localhost. Resetting to localhost for security.\")}{C.RESET}", file=sys.stderr)
             self.ollama_host = self.DEFAULT_OLLAMA_HOST
         # Strip credentials from URL to prevent leaking in banner/errors
         if parsed.username or parsed.password:
@@ -1823,8 +1822,7 @@ class Config:
         for attr in ("model", "sidecar_model"):
             val = getattr(self, attr, "")
             if val and not _SAFE_MODEL_RE.match(val):
-                print(f"{C.YELLOW}Warning: invalid {attr} name {val!r} — "
-                      f"resetting to default.{C.RESET}", file=sys.stderr)
+                print(f"{C.YELLOW}{t('warnings.invalid_model_name', default=f\"Warning: invalid {attr} name {val!r} — resetting to default.\")}{C.RESET}", file=sys.stderr)
                 setattr(self, attr, "" if attr == "sidecar_model" else self.DEFAULT_MODEL)
 
     def _ensure_dirs(self):
@@ -1832,10 +1830,10 @@ class Config:
             try:
                 os.makedirs(d, mode=0o700, exist_ok=True)
             except PermissionError:
-                print(f"Warning: Cannot create directory {d} (permission denied).", file=sys.stderr)
-                print(f"  Try: sudo mkdir -p {d} && sudo chown $USER {d}", file=sys.stderr)
+                print(f"{t('warnings.dir_permission_denied', default=f'Warning: Cannot create directory {d} (permission denied).')}", file=sys.stderr)
+                print(f"  {t('warnings.dir_permission_denied_suggestion', default=f'Try: sudo mkdir -p {d} && sudo chown $USER {d}')}", file=sys.stderr)
             except OSError as e:
-                print(f"Warning: Cannot create directory {d}: {e}", file=sys.stderr)
+                print(f"{t('warnings.dir_create_failed', default=f'Warning: Cannot create directory {d}: {e}')}", file=sys.stderr)
         # Migrate old eve-coder sessions to new eve-cli location (once only)
         old_sessions = os.path.join(self._old_state_dir, "sessions")
         migration_marker = os.path.join(self.sessions_dir, ".migrated")
@@ -2425,10 +2423,10 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
             prompt += f"\n# Project Instructions (from {rel}/{fname})\n{safe_content}{trunc_note}\n"
             total_loaded += len(content)
         except PermissionError:
-            print(f"{C.YELLOW}Warning: {fname} found but not readable (permission denied).{C.RESET}",
+            print(f"{C.YELLOW}{t('warnings.file_permission_denied', default=f'Warning: {fname} found but not readable (permission denied).')}{C.RESET}",
                   file=sys.stderr)
         except Exception as e:
-            print(f"{C.YELLOW}Warning: Could not read {fname}: {e}{C.RESET}",
+            print(f"{C.YELLOW}{t('warnings.file_read_failed', default=f'Warning: Could not read {fname}: {e}')}{C.RESET}",
                   file=sys.stderr)
 
     prompt += _collect_project_context(cwd)
@@ -2449,7 +2447,7 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
                 trunc_note = "\n[Note: file truncated, only first 4000 bytes loaded]" if truncated else ""
                 prompt += f"\n# User System Prompt File\n{content}{trunc_note}\n"
         except Exception as e:
-            print(f"{C.YELLOW}Warning: Could not read system prompt file: {e}{C.RESET}",
+            print(f"{C.YELLOW}{t('warnings.system_prompt_read_failed', default=f'Warning: Could not read system prompt file: {e}')}{C.RESET}",
                   file=sys.stderr)
 
     # Learn mode instructions
@@ -6298,7 +6296,7 @@ class MCPClient:
                 start_new_session=True,
             )
         except (FileNotFoundError, PermissionError) as e:
-            raise RuntimeError(f"MCP server '{self.name}' failed to start: {e}")
+            raise RuntimeError(t('errors.mcp_server_start_failed', default=f"MCP server '{self.name}' failed to start: {e}"))
 
     def stop(self):
         """Stop the MCP server subprocess."""
@@ -6315,7 +6313,7 @@ class MCPClient:
     def _send(self, method, params=None):
         """Send a JSON-RPC 2.0 request and return the result."""
         if not self._proc or self._proc.poll() is not None:
-            raise RuntimeError(f"MCP server '{self.name}' is not running")
+            raise RuntimeError(t('errors.mcp_server_not_running', default=f"MCP server '{self.name}' is not running"))
         self._request_id += 1
         request = {
             "jsonrpc": "2.0",
@@ -6330,14 +6328,14 @@ class MCPClient:
             self._proc.stdin.flush()
             line = self._proc.stdout.readline()
             if not line:
-                raise RuntimeError(f"MCP server '{self.name}' closed unexpectedly")
+                raise RuntimeError(t('errors.mcp_server_closed_unexpectedly', default=f"MCP server '{self.name}' closed unexpectedly"))
             response = json.loads(line.decode("utf-8"))
             if "error" in response:
                 err = response["error"]
                 raise RuntimeError(f"MCP error ({err.get('code', '?')}): {err.get('message', '?')}")
             return response.get("result", {})
         except (BrokenPipeError, OSError) as e:
-            raise RuntimeError(f"MCP server '{self.name}' communication failed: {e}")
+            raise RuntimeError(t('errors.mcp_communication_failed', default=f"MCP server '{self.name}' communication failed: {e}"))
 
     def initialize(self):
         """Initialize the MCP connection and discover tools."""
@@ -11793,7 +11791,7 @@ def _call_sidecar_for_suggestions(agent, config, client, system_prompt, user_pro
             options={"temperature": 0.7, "max_tokens": 512}
         )
     except Exception as e:
-        raise RuntimeError(f"サイドカーモデル呼び出し失敗：{e}")
+        raise RuntimeError(t('errors.sidecar_call_failed', default=f"サイドカーモデル呼び出し失敗：{e}"))
 
     response_text = ""
     if isinstance(resp, dict):
@@ -11837,8 +11835,8 @@ def _parse_suggest_help_response(response_text):
     cleaned = (response_text or "").strip()
     if not cleaned:
         raise RuntimeError(
-            "サイドカーモデルから候補が返りませんでした。"
-            " 起動直後で会話履歴・エラー・変更差分が少ないと、空の応答になることがあります。"
+            t('errors.sidecar_no_suggestions', default="サイドカーモデルから候補が返りませんでした。"
+            " 起動直後で会話履歴・エラー・変更差分が少ないと、空の応答になることがあります。")
         )
 
     if cleaned.startswith('```'):
@@ -11860,12 +11858,12 @@ def _parse_suggest_help_response(response_text):
             suggestions = None
         if suggestions is None:
             raise RuntimeError(
-                "サイドカーモデルの応答を候補一覧として読めませんでした。"
-                " 空文字や説明文ではなく、JSON 配列が返る想定です。"
+                t('errors.sidecar_invalid_json', default="サイドカーモデルの応答を候補一覧として読めませんでした。"
+                " 空文字や説明文ではなく、JSON 配列が返る想定です。")
             )
 
     if not isinstance(suggestions, list):
-        raise RuntimeError("サイドカーモデルの応答が JSON 配列ではありませんでした。")
+        raise RuntimeError(t('errors.sidecar_not_array', default="サイドカーモデルの応答が JSON 配列ではありませんでした。"))
     return suggestions
 
 
