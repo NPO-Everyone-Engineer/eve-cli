@@ -131,5 +131,21 @@
     "no_progress": "ファイル操作のプログレスインジケーターを無効化",
     "level": "学習モードレベル：1=簡潔，5=非常に詳細（デフォルト：3）",
     "theme": "UI テーマ：normal, gal, dandy, bushi（デフォルト：normal）"
+  },
+  "slash": {
+    "cleared": "会話をクリアしました",
+    "session_saved": "以前のセッションを保存しました：{old_sid}",
+    "git_usage": "使用例：/git <コマンド>（例：/git log --oneline -10）",
+    "pr_usage": "使用例：/pr [list|create|view|checks|diff|merge] [番号]",
+    "learn_usage": "使用例：/learn [on|off|level <1-5>|auto on|off]",
+    "gentest_usage": "使用例：/gentest <file.py>",
+    "image_usage": "使用例：/image <path> またはクリップボードに画像をコピー",
+    "index_search_usage": "使用例：/index search <クエリ>",
+    "index_def_usage": "使用例：/index def <シンボル>",
+    "index_refs_usage": "使用例：/index refs <シンボル>",
+    "memory_add_usage": "使用例：/memory add <テキスト>",
+    "memory_remove_usage": "使用例：/memory remove <インデックス>",
+    "custom_usage": "使用例：/custom <名前> [引数]",
+    "team_usage": "使用例：/team <目標>"
   }
 }

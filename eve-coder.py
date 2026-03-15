@@ -12547,8 +12547,8 @@ def main():
                     session.session_id = (
                         datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
                     )
-                    print(f"{C.GREEN}Conversation cleared.{C.RESET}")
-                    print(f"{C.DIM}Previous session saved as: {old_sid}{C.RESET}")
+                    print(f"{C.GREEN}{t('slash.cleared', default='Conversation cleared.')}{C.RESET}")
+                    print(f"{C.DIM}{t('slash.session_saved', default=f'Previous session saved as: {old_sid}')}{C.RESET}")
                     continue
                 elif cmd == "/suggest-help":
                     _selected = _handle_suggest_help(agent, config, client, session)
@@ -12874,7 +12874,7 @@ def main():
                 elif cmd == "/git":
                     git_args = user_input.split(maxsplit=1)
                     if len(git_args) < 2:
-                        print(f"{C.YELLOW}Usage: /git <command> (e.g. /git log --oneline -10){C.RESET}")
+                        print(f"{C.YELLOW}{t('slash.git_usage', default='Usage: /git <command> (e.g. /git log --oneline -10)')}{C.RESET}")
                         continue
                     try:
                         # Split the git arguments properly
@@ -13039,7 +13039,7 @@ def main():
                             print(f"\n{C.DIM}Cancelled.{C.RESET}")
 
                     else:
-                        print(f"{C.YELLOW}Usage: /pr [list|create|view|checks|diff|merge] [number]{C.RESET}")
+                        print(f"{C.YELLOW}{t('slash.pr_usage', default='Usage: /pr [list|create|view|checks|diff|merge] [number]')}{C.RESET}")
                     continue
 
                 elif cmd == "/gh":
@@ -13161,7 +13161,7 @@ def main():
                                 status = "ON" if config.learn_auto_explain else "OFF"
                                 print(f"{C.DIM}Auto-explain: {status}{C.RESET}")
                         else:
-                            print(f"{C.DIM}Usage: /learn [on|off|level <1-5>|auto on|off]{C.RESET}")
+                            print(f"{C.DIM}{t('slash.learn_usage', default='Usage: /learn [on|off|level <1-5>|auto on|off]')}{C.RESET}")
                     continue
                 # ── UI Theme ────────────────────────────────────────
                 elif cmd == "/theme":
@@ -13275,7 +13275,7 @@ def main():
                 # ── Generate tests ───────────────────────────────────
                 elif cmd == "/gentest":
                     if not args:
-                        print(f"{C.YELLOW}Usage: /gentest <file.py>{C.RESET}")
+                        print(f"{C.YELLOW}{t('slash.gentest_usage', default='Usage: /gentest <file.py>')}{C.RESET}")
                         continue
                     target_file = args.strip()
                     if not os.path.isabs(target_file):
@@ -13490,7 +13490,7 @@ def main():
                                 pass
                         else:
                             print(f"{C.YELLOW}No image found in clipboard.{C.RESET}")
-                            print(f"{C.DIM}Usage: /image <path>  or  copy an image to clipboard first{C.RESET}")
+                            print(f"{C.DIM}{t('slash.image_usage', default='Usage: /image <path>  or  copy an image to clipboard first')}{C.RESET}")
                     continue
 
                 elif cmd == "/init":
@@ -13719,7 +13719,7 @@ def main():
                     elif sub == "search":
                         _query = parts[2] if len(parts) > 2 else ""
                         if not _query:
-                            print(f"  {C.YELLOW}Usage: /index search <query>{C.RESET}")
+                            print(f"  {C.YELLOW}{t('slash.index_search_usage', default='Usage: /index search <query>')}{C.RESET}")
                         else:
                             if _code_intel.symbol_count == 0:
                                 print(f"  {_c240b}Index empty. Building...{C.RESET}")
@@ -13738,7 +13738,7 @@ def main():
                     elif sub == "def":
                         _sym = parts[2] if len(parts) > 2 else ""
                         if not _sym:
-                            print(f"  {C.YELLOW}Usage: /index def <symbol>{C.RESET}")
+                            print(f"  {C.YELLOW}{t('slash.index_def_usage', default='Usage: /index def <symbol>')}{C.RESET}")
                         else:
                             if _code_intel.symbol_count == 0:
                                 print(f"  {_c240b}Index empty. Building...{C.RESET}")
@@ -13756,7 +13756,7 @@ def main():
                     elif sub == "refs":
                         _sym = parts[2] if len(parts) > 2 else ""
                         if not _sym:
-                            print(f"  {C.YELLOW}Usage: /index refs <symbol>{C.RESET}")
+                            print(f"  {C.YELLOW}{t('slash.index_refs_usage', default='Usage: /index refs <symbol>')}{C.RESET}")
                         else:
                             print(f"  {_c240b}Searching references...{C.RESET}")
                             _refs = _code_intel.find_references(_sym)
@@ -13820,7 +13820,7 @@ def main():
                                 memory.add(text)
                             print(f"{C.GREEN}Memory added.{C.RESET}")
                         else:
-                            print(f"{C.YELLOW}Usage: /memory add <text>{C.RESET}")
+                            print(f"{C.YELLOW}{t('slash.memory_add_usage', default='Usage: /memory add <text>')}{C.RESET}")
                     elif args.startswith("remove ") or args.startswith("rm "):
                         idx_str = args.split(None, 1)[1] if len(args.split()) > 1 else ""
                         try:
@@ -13830,7 +13830,7 @@ def main():
                             else:
                                 print(f"{C.RED}Invalid index.{C.RESET}")
                         except ValueError:
-                            print(f"{C.YELLOW}Usage: /memory remove <index>{C.RESET}")
+                            print(f"{C.YELLOW}{t('slash.memory_remove_usage', default='Usage: /memory remove <index>')}{C.RESET}")
                     elif args.startswith("search "):
                         query = args[7:].strip()
                         results = memory.search(query)
@@ -13850,7 +13850,7 @@ def main():
                     config.load_custom_commands(prompt_if_needed=True)
                     parts = user_input.split(None, 1)
                     if len(parts) < 2:
-                        print(f"{C.YELLOW}Usage: /custom <name> [args]{C.RESET}")
+                        print(f"{C.YELLOW}{t('slash.custom_usage', default='Usage: /custom <name> [args]')}{C.RESET}")
                         print(f"{C.DIM}  Lists available custom commands if no name given.{C.RESET}")
                         continue
                     cmd_name = parts[1].split()[0].lower() if parts[1] else ""
@@ -13935,7 +13935,7 @@ Review this code for:
 
                     if not team_args:
                         max_agents = _get_team_max_agents()
-                        print(f"  {C.CYAN}Usage: /team <goal>{C.RESET}")
+                        print(f"  {C.CYAN}{t('slash.team_usage', default='Usage: /team <goal>')}{C.RESET}")
                         print(f"  {C.DIM}Decomposes a goal into tasks and runs multiple agents in parallel.{C.RESET}")
                         print(f"  {C.DIM}Options: /team -n <N> <goal>  (set number of agents, default 2, max {max_agents}){C.RESET}")
                         print(f"  {C.DIM}         /team -w <goal>     (allow write operations){C.RESET}")
