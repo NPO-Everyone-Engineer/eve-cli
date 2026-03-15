@@ -1,0 +1,17 @@
+{
+  "total": 30,
+  "passed": 30,
+  "failed": 0,
+  "categories": {
+    "MultiEditTool": 3,
+    "WebSearchTool": 3,
+    "NotebookEditTool": 3,
+    "TaskListTool": 3,
+    "TaskGetTool": 3,
+    "TaskUpdateTool": 3,
+    "AskUserQuestionBatchTool": 3,
+    "SubAgentTool": 3,
+    "MCPTool": 3,
+    "ParallelAgentTool": 3
+  }
+}
