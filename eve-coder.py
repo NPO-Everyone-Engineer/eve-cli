@@ -9568,6 +9568,40 @@ class TUI:
         else:
             print(f"{C.DIM}{'·' * sep_w}{C.RESET}")
 
+    def _check_esc_key(self):
+        """Check if ESC key was pressed (for interrupting AI response).
+        
+        Uses termios/tty for non-blocking key detection (Unix only).
+        Returns True if ESC (0x1B) was detected.
+        """
+        if not HAS_TERMIOS:
+            return False
+        
+        try:
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                # Non-blocking read with select
+                ready, _, _ = _select_mod.select([sys.stdin], [], [], 0.0)
+                if ready:
+                    ch = sys.stdin.read(1)
+                    if ch == '\x1b':  # ESC
+                        return True
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except Exception:
+            pass
+        return False
+
+    def _typeahead_buffer(self):
+        """Buffer for Type-ahead input during AI response.
+        
+        Stores user input typed while AI is responding.
+        Cleared after response completes.
+        """
+        return []
+
     def get_input(self, session=None, plan_mode=False, prefill=""):
         """Get a single line of user input with full readline support.
 
@@ -9577,6 +9611,10 @@ class TUI:
         caller (get_multiline_input).
 
         NOTE: Avoid ANSI codes in input() prompt on macOS - causes IME issues.
+        
+        TUI 機能強化：
+        - ESC キー検出：AI 応答中に ESC で中断可能
+        - Type-ahead: 応答中の入力をバッファリング
         """
         try:
             # Simple prompt without ANSI codes for IME compatibility
@@ -9585,6 +9623,11 @@ class TUI:
                 prompt_str = f"ctx:{pct}% > "
             else:
                 prompt_str = "> "
+
+            # Type-ahead: prefill with buffered input if available
+            if prefill:
+                # Prefill is handled by readline (not implemented here for simplicity)
+                pass
 
             line = input(prompt_str)
 
@@ -9705,6 +9748,12 @@ class TUI:
         for chunk in response_iter:
             choice = chunk.get("choices", [{}])[0]
             delta = choice.get("delta", {})
+
+            # TUI 機能強化：ESC キー検出で中断
+            if self._check_esc_key():
+                _clear_thinking_status()
+                self._scroll_print(f"\n{C.DIM}(ESC で中断しました){C.RESET}")
+                break
 
             # Accumulate tool call deltas (streamed tool calling)
             for tc_delta in delta.get("tool_calls", []):

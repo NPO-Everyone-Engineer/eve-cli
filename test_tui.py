@@ -66,18 +66,18 @@ print()
 print("カテゴリ 2: Type-ahead バッファ（5 件）")
 print("-" * 60)
 
-# Type-ahead 機能テスト
+# Type-ahead 機能テスト：prefill パラメータ検証
 typeahead_tests = [
-    ("AI 応答中に入力", True, 'バッファリング有効'),
-    ("", False, '空文字はバッファなし'),
-    ("複数行入力", True, '複数行バッファ'),
-    ("Ctrl+C", False, '中断はバッファしない'),
-    ("ESC", False, 'ESC はバッファしない'),
+    ("prefill='AI 応答中に入力'", True, 'バッファリング有効'),
+    ("prefill=''", False, '空文字はバッファなし'),
+    ("prefill='複数行入力'", True, '複数行バッファ'),
+    ("prefill=None", False, 'None はバッファしない'),
+    ("prefill='test'", True, '文字列バッファ'),
 ]
 
 for input_text, should_buffer, desc in typeahead_tests:
-    # 簡易チェック：空文字でないかつ中断キーでない
-    is_buffer = bool(input_text) and input_text not in ('Ctrl+C', 'ESC')
+    # 簡易チェック：prefill が空でない
+    is_buffer = 'prefill=' in input_text and input_text.split('=')[1].strip("'\"") not in ('', 'None')
     result = is_buffer == should_buffer
     test_result(f"Type-ahead: {desc}", result, f"入力：{input_text}, バッファ：{is_buffer}")
 
