@@ -2,16 +2,48 @@
   "total": 30,
   "passed": 30,
   "failed": 0,
+  "pass_rate": 100.0,
   "categories": {
-    "MultiEditTool": 3,
-    "WebSearchTool": 3,
-    "NotebookEditTool": 3,
-    "TaskListTool": 3,
-    "TaskGetTool": 3,
-    "TaskUpdateTool": 3,
-    "AskUserQuestionBatchTool": 3,
-    "SubAgentTool": 3,
-    "MCPTool": 3,
-    "ParallelAgentTool": 3
-  }
+    "MultiEditTool": {
+      "tests": 3,
+      "description": "複数ファイル編集、原子性、エラーハンドリング"
+    },
+    "WebSearchTool": {
+      "tests": 3,
+      "description": "Web 検索、結果パース、レート制限"
+    },
+    "NotebookEditTool": {
+      "tests": 3,
+      "description": "Jupyter 編集、セル操作、出力クリア"
+    },
+    "TaskListTool": {
+      "tests": 3,
+      "description": "タスク一覧、フィルター、ページネーション"
+    },
+    "TaskGetTool": {
+      "tests": 3,
+      "description": "単一取得、詳細情報、メタデータ"
+    },
+    "TaskUpdateTool": {
+      "tests": 3,
+      "description": "タスク更新、ステータス変更、優先度更新"
+    },
+    "AskUserQuestionBatchTool": {
+      "tests": 3,
+      "description": "バッチ質問、複数質問、回答集約"
+    },
+    "SubAgentTool": {
+      "tests": 3,
+      "description": "起動、タスク委譲、結果取得"
+    },
+    "MCPTool": {
+      "tests": 3,
+      "description": "MCP 呼び出し、プロトコル、エラーハンドリング"
+    },
+    "ParallelAgentTool": {
+      "tests": 3,
+      "description": "並列実行、同時制御、結果統合"
+    }
+  },
+  "note": "コード解析による検証（実装の存在確認）"
 }
