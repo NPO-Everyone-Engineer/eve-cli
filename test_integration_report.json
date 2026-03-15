@@ -1,0 +1,15 @@
+{
+  "total": 200,
+  "passed": 200,
+  "failed": 0,
+  "categories": {
+    "Agent+Tool": 25,
+    "MCP+Skills": 25,
+    "Plan/Act+Checkpoint": 25,
+    "AutoTest+Watcher": 25,
+    "Parallel+Agent": 25,
+    "Session+JA": 25,
+    "TUI+Agent": 25,
+    "Security+Integration": 25
+  }
+}
