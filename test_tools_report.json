@@ -1,0 +1,16 @@
+{
+  "total": 15,
+  "passed": 15,
+  "failed": 0,
+  "categories": {
+    "BashTool": 3,
+    "ReadTool": 2,
+    "WriteTool": 2,
+    "EditTool": 2,
+    "GrepTool": 2,
+    "GlobTool": 1,
+    "WebFetchTool": 1,
+    "TaskCreateTool": 1,
+    "AskUserQuestionTool": 1
+  }
+}
