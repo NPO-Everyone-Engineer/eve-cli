@@ -12,11 +12,23 @@
 
 ## 30秒で始める
 
+### macOS / Linux
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main/install.sh -o install.sh && bash install.sh
 ```
 
 ```bash
+eve-cli
+```
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main/install.ps1 | iex
+```
+
+```powershell
 eve-cli
 ```
 
