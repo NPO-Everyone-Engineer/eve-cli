@@ -12564,7 +12564,7 @@ def main():
                     session.save()
                     sessions_dir = os.path.join(config.state_dir, "sessions")
                     filepath = os.path.join(sessions_dir, f"{session.session_id}.jsonl")
-                    print(f"{C.GREEN}Session saved: {session.session_id}{C.RESET}")
+                    print(f"{C.GREEN}{t('slash.session_saved', default=f'Session saved: {session.session_id}')}{C.RESET}")
                     print(f"{C.DIM}  {filepath}{C.RESET}")
                     continue
                 elif cmd == "/fork":
@@ -12586,20 +12586,20 @@ def main():
 
                         old_id = session.session_id
                         session.session_id = fork_id
-                        print(f"{C.GREEN}Session forked: {old_id} → {fork_id}{C.RESET}")
-                        print(f"{C.DIM}Original session preserved. You're now on the fork.{C.RESET}")
-                        print(f"{C.DIM}Switch back: /resume {old_id}{C.RESET}")
+                        print(f"{C.GREEN}{t('slash.session_forked', default=f'Session forked: {old_id} → {fork_id}')}{C.RESET}")
+                        print(f"{C.DIM}{t('slash.fork_preserved', default='Original session preserved. You are now on the fork.')}{C.RESET}")
+                        print(f"{C.DIM}{t('slash.fork_switch_back', default=f'Switch back: /resume {old_id}')}{C.RESET}")
                     else:
-                        print(f"{C.RED}Failed to fork session.{C.RESET}")
+                        print(f"{C.RED}{t('slash.fork_failed', default='Failed to fork session.')}{C.RESET}")
                     continue
                 elif cmd == "/compact":
                     before = session.get_token_estimate()
                     session.compact_if_needed(force=True)
                     after = session.get_token_estimate()
                     if after < before:
-                        print(f"{C.GREEN}Compacted: {before} -> {after} tokens{C.RESET}")
+                        print(f"{C.GREEN}{t('slash.compacted', default=f'Compacted: {before} -> {after} tokens')}{C.RESET}")
                     else:
-                        print(f"{C.DIM}Already compact ({after} tokens, {len(session.messages)} messages){C.RESET}")
+                        print(f"{C.DIM}{t('slash.already_compact', default=f'Already compact ({after} tokens, {len(session.messages)} messages)')}{C.RESET}")
                     continue
                 elif cmd == "/model" or cmd == "/models":
                     parts = user_input.split(maxsplit=1)
@@ -12650,12 +12650,12 @@ def main():
                 elif cmd == "/yes":
                     config.yes_mode = True
                     permissions.yes_mode = True
-                    print(f"{C.GREEN}Auto-approve enabled for this session.{C.RESET}")
+                    print(f"{C.GREEN}{t('slash.yes_enabled', default='Auto-approve enabled for this session.')}{C.RESET}")
                     continue
                 elif cmd == "/no":
                     config.yes_mode = False
                     permissions.yes_mode = False
-                    print(f"{C.GREEN}Auto-approve disabled. Tool calls will require confirmation.{C.RESET}")
+                    print(f"{C.GREEN}{t('slash.no_disabled', default='Auto-approve disabled. Tool calls will require confirmation.')}{C.RESET}")
                     continue
                 elif cmd == "/tokens":
                     tokens = session.get_token_estimate()
@@ -12668,12 +12668,12 @@ def main():
                     _c240 = _ansi("\033[38;5;240m")
                     bar_color = _ansi("\033[38;5;46m") if pct < 50 else _ansi("\033[38;5;226m") if pct < 80 else _ansi("\033[38;5;196m")
                     bar = bar_color + "█" * filled + _c240 + "░" * (bar_len - filled) + C.RESET
-                    print(f"\n  {_c51}━━ Token Usage ━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+                    print(f"\n  {_c51}━━ トークン使用量 ━━━━━━━━━━━━━━━━━━━━{C.RESET}")
                     print(f"  [{bar}] {pct}%")
                     print(f"  {_c87}~{tokens:,}{C.RESET} / {_c240}{config.context_window:,} tokens{C.RESET}")
-                    print(f"  {_c87}{msgs}{C.RESET} {_c240}messages in session{C.RESET}")
+                    print(f"  {_c87}{msgs}{C.RESET} {_c240}{t('slash.tokens_messages', default='messages in session')}{C.RESET}")
                     if pct >= 80:
-                        print(f"  {_ansi(chr(27)+'[38;5;196m')}⚠ Context almost full! Use /compact or /clear{C.RESET}")
+                        print(f"  {_ansi(chr(27)+'[38;5;196m')}⚠ {t('slash.tokens_warning', default='Context almost full! Use /compact or /clear')}{C.RESET}")
                     print(f"  {_c51}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
                     continue
                 # ── Git commands ──────────────────────────────────────
@@ -12698,18 +12698,18 @@ def main():
                         if not has_staged:
                             # Nothing staged — offer to stage everything
                             if not st.stdout.strip():
-                                print(f"{C.GREEN}Nothing to commit, working tree clean.{C.RESET}")
+                                print(f"{C.GREEN}{t('slash.commit_clean', default='Nothing to commit, working tree clean.')}{C.RESET}")
                                 continue
                             if config.yes_mode:
                                 do_add = True
                             else:
-                                print(f"{C.YELLOW}Nothing staged. Stage tracked file changes with git add -u?{C.RESET}")
+                                print(f"{C.YELLOW}{t('slash.commit_stage_prompt', default='Nothing staged. Stage tracked file changes with git add -u?')}{C.RESET}")
                                 print(f"{C.DIM}{st.stdout.strip()}{C.RESET}")
                                 ans = input(f"{C.CYAN}[y/N]{C.RESET} ").strip().lower()
                                 do_add = ans in ("y", "yes")
                             if do_add:
                                 subprocess.run(["git", "add", "-u"], timeout=10)
-                                print(f"{C.GREEN}Staged tracked file changes.{C.RESET}")
+                                print(f"{C.GREEN}{t('slash.commit_staged', default='Staged tracked file changes.')}{C.RESET}")
                                 # M8: Check for untracked files and inform user
                                 untracked = subprocess.run(
                                     ["git", "ls-files", "--others", "--exclude-standard"],
@@ -12717,13 +12717,13 @@ def main():
                                 )
                                 if untracked.stdout.strip():
                                     files = untracked.stdout.strip().split("\n")
-                                    print(f"{C.YELLOW}{len(files)} untracked file(s) not staged:{C.RESET}")
+                                    print(f"{C.YELLOW}{t('slash.commit_untracked', default='{len} untracked file(s) not staged:')}{C.RESET}")
                                     for f in files[:10]:
                                         print(f"  {C.DIM}{f}{C.RESET}")
                                     if len(files) > 10:
                                         print(f"  {C.DIM}... and {len(files)-10} more{C.RESET}")
                             else:
-                                print(f"{C.YELLOW}Aborted. Stage files manually and retry.{C.RESET}")
+                                print(f"{C.YELLOW}{t('slash.commit_aborted', default='Aborted. Stage files manually and retry.')}{C.RESET}")
                                 continue
 
                         # 3. Get diff for commit message generation
@@ -12794,15 +12794,15 @@ def main():
                             if file_list:
                                 commit_msg = f"chore: update {', '.join(file_list)}"
                             else:
-                                print(f"{C.RED}Failed to generate commit message.{C.RESET}")
+                                print(f"{C.RED}{t('slash.commit_gen_failed', default='Failed to generate commit message.')}{C.RESET}")
                                 continue
 
                         # 6. Show message and confirm
-                        print(f"\n{C.CYAN}Proposed commit message:{C.RESET}")
+                        print(f"\n{C.CYAN}{t('slash.commit_proposed', default='Proposed commit message:')}{C.RESET}")
                         print(f"{C.BOLD}{commit_msg}{C.RESET}\n")
 
                         if not config.yes_mode:
-                            ans = input(f"{C.CYAN}Commit with this message? [Y/n/e(dit)]{C.RESET} ").strip().lower()
+                            ans = input(f"{C.CYAN}{t('slash.commit_confirm', default='Commit with this message? [Y/n/e(dit)]')}{C.RESET} ").strip().lower()
                             if ans == "e":
                                 print(f"{C.DIM}Enter new message (end with empty line):{C.RESET}")
                                 lines = []
@@ -12861,12 +12861,12 @@ def main():
                                 capture_output=True, text=True, timeout=10
                             )
                             if staged.stdout.strip():
-                                print(f"{C.CYAN}(staged changes){C.RESET}")
+                                print(f"{C.CYAN}{t('slash.diff_staged', default='(staged changes)')}{C.RESET}")
                                 print(staged.stdout)
                             else:
-                                print(f"{C.GREEN}No changes.{C.RESET}")
+                                print(f"{C.GREEN}{t('slash.diff_no_changes', default='No changes.')}{C.RESET}")
                     except FileNotFoundError:
-                        print(f"{C.RED}git not found. Is git installed?{C.RESET}")
+                        print(f"{C.RED}{t('slash.git_not_found', default='git not found. Is git installed?')}{C.RESET}")
                     except Exception as e:
                         print(f"{C.RED}{t('errors.git_command_failed', default=f'Error: {e}')}{C.RESET}")
                     continue
@@ -13086,11 +13086,11 @@ def main():
                                 reverse=True,
                             )[:10]
                             if not md_files:
-                                print(f"{C.DIM}  No plans yet.{C.RESET}")
+                                print(f"{C.DIM}  {t('slash.plan_none', default='No plans yet.')}{C.RESET}")
                             else:
                                 _c226 = _ansi(chr(27) + '[38;5;226m')
                                 _c240 = _ansi(chr(27) + '[38;5;240m')
-                                print(f"\n  {_c226}━━ Plans (newest first) ━━{C.RESET}")
+                                print(f"\n  {_c226}━━ {t('slash.plan_list_title', default='Plans (newest first)')} ━━{C.RESET}")
                                 for pf in md_files:
                                     fp = os.path.join(plans_dir, pf)
                                     try:
@@ -13246,22 +13246,22 @@ def main():
                     if subcmd == "list":
                         checkpoints = agent.git_checkpoint.list_checkpoints()
                         if not checkpoints:
-                            print(f"{C.DIM}No checkpoints available.{C.RESET}")
+                            print(f"{C.DIM}{t('slash.checkpoint_none', default='No checkpoints available.')}{C.RESET}")
                         else:
                             _c226 = _ansi(chr(27) + '[38;5;226m')
                             _c240 = _ansi(chr(27) + '[38;5;240m')
-                            print(f"\n  {_c226}━━ Checkpoints ━━━━━━━━━━━━━━━━━━━{C.RESET}")
+                            print(f"\n  {_c226}━━ {t('slash.checkpoint_list_title', default='Checkpoints')} ━━━━━━━━━━━━━━━━━━━{C.RESET}")
                             for cp in checkpoints:
                                 ts = datetime.fromtimestamp(cp["timestamp"]).strftime("%H:%M:%S")
                                 print(f"  {cp['label']}  {_c240}({ts}) {cp['summary']}{C.RESET}")
                             print(f"  {_c226}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
                     elif not agent.git_checkpoint._is_git_repo:
-                        print(f"{C.YELLOW}Not a git repository. Initialize with: git init{C.RESET}")
+                        print(f"{C.YELLOW}{t('slash.checkpoint_not_git', default='Not a git repository. Initialize with: git init')}{C.RESET}")
                     else:
                         if agent.git_checkpoint.create("manual"):
-                            print(f"{C.GREEN}Checkpoint saved. Use /rollback to restore.{C.RESET}")
+                            print(f"{C.GREEN}{t('slash.checkpoint_saved', default='Checkpoint saved. Use /rollback to restore.')}{C.RESET}")
                         else:
-                            print(f"{C.YELLOW}No changes to checkpoint.{C.RESET}")
+                            print(f"{C.YELLOW}{t('slash.checkpoint_no_changes', default='No changes to checkpoint.')}{C.RESET}")
                     continue
 
                 elif cmd == "/rollback":
