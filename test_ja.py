@@ -100,7 +100,7 @@ print()
 
 # テストケース
 test_cases = [
-    # エラーメッセージ
+    # エラーメッセージ（11 件）
     ('errors.invalid_max_steps', {}),
     ('errors.invalid_loop_hours', {}),
     ('errors.path_not_exist', {'path': '/tmp/nonexistent'}),
@@ -113,7 +113,7 @@ test_cases = [
     ('errors.url_redirect_blocked_scheme', {'scheme': 'ftp'}),
     ('errors.git_diff_failed', {}),
     
-    # 警告メッセージ
+    # 警告メッセージ（6 件）
     ('warnings.ollama_host_not_localhost', {'hostname': '192.168.1.100'}),
     ('warnings.file_read_failed', {'fname': 'test.txt', 'error': 'permission denied'}),
     ('warnings.session_path_escape', {}),
@@ -121,11 +121,52 @@ test_cases = [
     ('warnings.trusted_repo_changed', {'scope': 'global'}),
     ('warnings.test_syntax_error', {}),
     
-    # 情報メッセージ
+    # 情報メッセージ（1 件）
     ('info.session_resumed', {}),
     
-    # プロンプト
+    # プロンプト（1 件）
     ('prompts.confirm_write', {'path': './test.txt'}),
+    
+    # ヘルプメッセージ（10 件）
+    ('help.description', {}),
+    ('help.prompt', {}),
+    ('help.model', {}),
+    ('help.max_agent_steps', {'default': 100, 'max': 200}),
+    ('help.loop', {}),
+    ('help.rag', {}),
+    ('help.rag_model', {}),
+    ('help.max_parallel_files', {}),
+    ('help.level', {}),
+    ('help.theme', {}),
+    
+    # スラッシュコマンド - Usage（10 件）
+    ('slash.cleared', {}),
+    ('slash.git_usage', {}),
+    ('slash.pr_usage', {}),
+    ('slash.learn_usage', {}),
+    ('slash.gentest_usage', {}),
+    ('slash.image_usage', {}),
+    ('slash.index_search_usage', {}),
+    ('slash.memory_add_usage', {}),
+    ('slash.custom_usage', {}),
+    ('slash.team_usage', {}),
+    
+    # スラッシュコマンド - 出力メッセージ（15 件）
+    ('slash.session_saved', {'session_id': '20260315_200000_abc123'}),
+    ('slash.session_forked', {'old_id': 'orig', 'fork_id': 'fork'}),
+    ('slash.fork_preserved', {}),
+    ('slash.compacted', {'before': 1000, 'after': 500}),
+    ('slash.already_compact', {'after': 500, 'msgs': 10}),
+    ('slash.yes_enabled', {}),
+    ('slash.no_disabled', {}),
+    ('slash.tokens_messages', {}),
+    ('slash.diff_staged', {}),
+    ('slash.commit_clean', {}),
+    ('slash.commit_stage_prompt', {}),
+    ('slash.commit_staged', {}),
+    ('slash.checkpoint_none', {}),
+    ('slash.checkpoint_list_title', {}),
+    ('slash.checkpoint_saved', {}),
 ]
 
 print("テスト結果:")
@@ -135,9 +176,19 @@ all_passed = True
 for key, kwargs in test_cases:
     result = t(key, default=f"[EN] {key}")
     
-    # 日本語チェック：キーワードが含まれていれば OK
-    ja_keywords = ['エラー', '警告', 'デバッグ', 'セッション', 'ファイル', 'サーバー', 'モデル', 'コマンド', 'パス', '許可', '読め', '返し', '起動', '呼び出し', 'ブロック', 'リダイレクト', 'Git', 'リポジトリ', '構文', 'テスト', 'MCP', 'サイドカー', 'OLLAMA_HOST', 'localhost', 'スキーム', 'プライベート', 'IP', 'フック', '信頼', '逸脱', 'シンボリック', 'ディレクトリ', '権限', 'プロンプト', 'レスポンス', '候補', '配列', 'JSON', 'タイムアウト', 'ループ', 'ステップ', '時間', '制限']
-    is_ja = any(kw in result for kw in ja_keywords)
+    # プレースホルダーを除去してチェック
+    result_clean = result.replace('{before}', '').replace('{after}', '').replace('{msgs}', '')
+    result_clean = result_clean.replace('{session_id}', '').replace('{old_id}', '').replace('{fork_id}', '')
+    result_clean = result_clean.replace('{len}', '').replace('{path}', '').replace('{model}', '')
+    result_clean = result_clean.replace('{error}', '').replace('{e}', '').replace('{timeout_s}', '')
+    result_clean = result_clean.replace('{name}', '').replace('{hostname}', '').replace('{fname}', '')
+    result_clean = result_clean.replace('{base_cmd}', '').replace('{scope}', '').replace('{default}', '')
+    result_clean = result_clean.replace('{max}', '')
+    
+    # 日本語チェック：日本語文字（ひらがな・カタカナ・漢字）が含まれていれば OK
+    import re
+    ja_pattern = re.compile(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]')
+    is_ja = bool(ja_pattern.search(result_clean))
     
     if get_language() == 'ja' and is_ja:
         status = "✅ PASS"
