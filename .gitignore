@@ -48,6 +48,11 @@ node_modules/
 tests/*.log
 tests/__pycache__/
 
+# Generated reports (output files, not source)
+*_report.json
+security_audit_report.json
+test_coverage_report.json
+
 # Dev notes
 make.md
 
