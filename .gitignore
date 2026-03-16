@@ -41,17 +41,18 @@ node_modules/
 # vibe-local RAG index (local, user-specific — not for version control)
 .vibe/rag/
 
-# EvE CLI local config (project-specific commands, skills, hooks — user-defined)
+# EvE CLI local config (project-specific commands, hooks, memory — user-defined, never commit)
 .eve-cli/
+# Default template skills are distributed with the project (exception to above)
+!.eve-cli/skills/
+!.eve-cli/skills/*.md
 
 # Local test artifacts
 tests/*.log
 tests/__pycache__/
 
-# Generated reports (output files, not source)
-*_report.json
-security_audit_report.json
-test_coverage_report.json
+# Generated reports (output of dev/ scripts — never commit)
+dev/reports/
 
 # Dev notes
 make.md
