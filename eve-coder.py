@@ -3938,7 +3938,7 @@ class BashTool(Tool):
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-                return t('errors.command_timeout', default=f"Error: command took too long (over {int(timeout_s)}s) and was stopped. Try a faster approach or increase --timeout.")
+                return f"Error: command took too long (over {int(timeout_s)}s) and was stopped. Try a faster approach or increase --timeout."
             output = ""
             if stdout:
                 output += stdout

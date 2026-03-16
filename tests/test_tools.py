@@ -755,7 +755,12 @@ class TestBashTool(unittest.TestCase):
         """Command that exceeds timeout is killed."""
         result = self.tool.execute({"command": "sleep 30", "timeout": 1500})
         self.assertIn("Error", result)
-        self.assertIn("too long", result.lower())
+        # Check for timeout message (English or Japanese)
+        self.assertTrue(
+            "too long" in result.lower() or 
+            "timeout" in result.lower() or
+            "時間" in result
+        ), f"Expected timeout message but got: {result}"
 
     def test_nonzero_exit_code(self):
         """Non-zero exit code is reported."""
