@@ -1,5 +1,5 @@
 ---
-description: Interactive learning mode with code explanations
+description: "ユーザーが学習モードの起動・設定変更を依頼したとき、または /learn コマンドを使用したとき（例: 「学習モードにして」「レベル変えて」）"
 allowed-tools: [Read, Bash]
 ---
 # 学習モード (Learn Mode)
@@ -73,5 +73,11 @@ eve-cli --learn --level 2
 # エラー解説だけオフにする
 > /learn auto off
 ```
+
+## Gotchas（よくある落とし穴）
+
+- **モデル依存の解説品質**: 小さいローカルモデル（例: 7B パラメータ未満）ではレベル4-5の詳細解説が質的に不十分になることがある。モデルサイズに応じてレベルを推奨すること
+- **learn_mode 設定の永続化**: セッション間で学習モード設定が保持されない場合がある。`config` オブジェクトへの保存と `.eve-cli/config` への書き出しが正しく行われているか確認
+- **Bash ツールの許可範囲**: このスキルは `allowed-tools` に Bash を含むが、学習モードの文脈で実行すべきでないコマンド（destructive 操作等）まで許可してしまわないよう注意
 
 > **ヒント**: 学習モードは教育現場やコードレビュー、新しい言語を学ぶ際に特に役立ちます。

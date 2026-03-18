@@ -1,5 +1,5 @@
 ---
-description: Code review checklist
+description: "ユーザーがコードレビュー・品質チェックを依頼したとき、または /review コマンドを使用したとき（例: 「レビューして」「セキュリティチェックして」「PR前に確認して」）"
 allowed-tools: [Read, Glob, Grep]
 ---
 # コードレビュー (Code Review)
@@ -67,6 +67,13 @@ allowed-tools: [Read, Glob, Grep]
 - 最近変更されたファイル（git diff）
 - 重要なコアファイル
 - 指定されたファイル/ディレクトリ
+
+## Gotchas（よくある落とし穴）
+
+- **eve-coder.py 固有のセキュリティ要件を見落とす**: 一般的な OWASP チェックだけでなく、このプロジェクト固有の要件（symlink チェック必須、OLLAMA_HOST の localhost 制限、環境変数からのシークレット漏洩防止）を必ず確認
+- **`encoding="utf-8", errors="replace"` の漏れ**: ファイル操作で encoding 指定が抜けている箇所は必ず指摘する。日本語環境ユーザーが多いため、これは高優先度
+- **Python 3.8+ 互換性の違反**: `match/case`（3.10+）、`|` 型ヒント構文（3.10+）、`tomllib`（3.11+）等が混入していないか確認。walrus 演算子（`:=`、3.8+）は OK
+- **外部依存の混入**: `import` 文に標準ライブラリ以外のモジュールが追加されていないか確認。ゼロ依存は最重要の設計制約
 
 ## ヒント
 
