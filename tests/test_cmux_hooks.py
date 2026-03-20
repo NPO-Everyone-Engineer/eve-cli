@@ -20,11 +20,13 @@ spec = importlib.util.spec_from_file_location("eve_coder", os.path.join(SCRIPT_D
 eve_coder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(eve_coder)
 
+from tests.hook_fixtures import HookFixtureMixin
+
 Config = eve_coder.Config
 HookManager = eve_coder.HookManager
 
 
-class TestCmuxHooksConfig(unittest.TestCase):
+class TestCmuxHooksConfig(HookFixtureMixin, unittest.TestCase):
     """Test cmux hooks configuration."""
 
     def setUp(self):
@@ -113,7 +115,7 @@ class TestCmuxHooksConfig(unittest.TestCase):
         self.assertIn("global", data)
 
 
-class TestHookManagerCmux(unittest.TestCase):
+class TestHookManagerCmux(HookFixtureMixin, unittest.TestCase):
     """Test HookManager with cmux hooks."""
 
     def setUp(self):

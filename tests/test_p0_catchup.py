@@ -20,6 +20,8 @@ spec = importlib.util.spec_from_file_location("eve_coder", os.path.join(SCRIPT_D
 eve_coder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(eve_coder)
 
+from tests.hook_fixtures import HookFixtureMixin
+
 Config = eve_coder.Config
 
 
@@ -115,7 +117,7 @@ class TestP0_4_ResumeReplay(unittest.TestCase):
         self.assertTrue(hasattr(config, 'list_sessions'))
 
 
-class TestP0_2_NotificationHooks(unittest.TestCase):
+class TestP0_2_NotificationHooks(HookFixtureMixin, unittest.TestCase):
     """Test P0-2: Notification hooks for better UX."""
 
     def test_hooks_config_exists(self):
