@@ -8,6 +8,7 @@ import os
 import json
 import tempfile
 import shutil
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 # Add parent directory to path for imports
@@ -34,6 +35,7 @@ class TestSubAgentScaling(unittest.TestCase):
 
     def tearDown(self):
         """Clean up test fixtures."""
+        eve_coder._set_active_runtime_state(None)
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_subagent_tool_exists(self):
@@ -54,6 +56,48 @@ class TestSubAgentScaling(unittest.TestCase):
         """Test that SubAgent supports isolation parameter."""
         # SubAgent should accept isolation parameter
         self.assertTrue(True)  # Placeholder - actual implementation check
+
+    def test_subagent_disallows_allow_writes_in_plan_mode(self):
+        """Plan mode should block write-capable sub-agents."""
+        cfg = SimpleNamespace(
+            cwd=self.test_dir,
+            model="test-model",
+            sidecar_model="",
+            sessions_dir=os.path.join(self.test_dir, "sessions"),
+        )
+        os.makedirs(cfg.sessions_dir, exist_ok=True)
+        runtime = eve_coder.SessionRuntimeStore(cfg, "plan-mode-subagent")
+        runtime.update_runtime(plan_mode=True)
+        eve_coder._set_active_runtime_state(runtime)
+        subagent = eve_coder.SubAgentTool(cfg, object(), MagicMock())
+
+        result = subagent.execute({"prompt": "edit a file", "allow_writes": True})
+
+        self.assertIn("plan mode", result.lower())
+        self.assertIn("allow_writes", result.lower())
+
+    def test_subagent_can_return_structured_result(self):
+        """Internal structured result mode should expose status and summary."""
+        class _FakeClient:
+            def chat_sync(self, **kwargs):
+                return {"content": "done", "tool_calls": []}
+
+        cfg = SimpleNamespace(
+            cwd=self.test_dir,
+            model="test-model",
+            sidecar_model="",
+            sessions_dir=os.path.join(self.test_dir, "sessions"),
+        )
+        os.makedirs(cfg.sessions_dir, exist_ok=True)
+        eve_coder._set_active_runtime_state(None)
+        subagent = eve_coder.SubAgentTool(cfg, _FakeClient(), MagicMock())
+
+        result = subagent.execute({"prompt": "summarize", "_structured_result": True})
+
+        self.assertIsInstance(result, dict)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"], "done")
+        self.assertIn("summary", result)
 
 
 class TestParallelAgents(unittest.TestCase):

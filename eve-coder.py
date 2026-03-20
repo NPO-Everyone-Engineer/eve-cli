@@ -199,6 +199,41 @@ _active_scroll_region = None
 # Custom commands cache: command_name -> {"description": str, "path": str, "frontmatter": dict}
 _custom_commands = {}
 _custom_commands_lock = threading.Lock()
+_active_runtime_state = None
+_active_runtime_state_lock = threading.Lock()
+
+
+def _set_active_runtime_state(store):
+    global _active_runtime_state
+    with _active_runtime_state_lock:
+        _active_runtime_state = store
+
+
+def _get_active_runtime_state():
+    with _active_runtime_state_lock:
+        return _active_runtime_state
+
+
+def _summarize_output_text(text, limit=500):
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _classify_verifier_failure(text):
+    text = (text or "").lower()
+    if not text:
+        return "unknown"
+    if "syntaxerror" in text or "py_compile" in text or "parse error" in text:
+        return "syntax"
+    if "assert" in text or "failed" in text or "traceback" in text or "error:" in text:
+        return "test"
+    if "lint" in text or "flake8" in text or "eslint" in text or "ruff" in text:
+        return "lint"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    return "unknown"
 
 def _scroll_aware_print(*args, **kwargs):
     """Print within scroll region or normal print.
@@ -3784,6 +3819,18 @@ class BashTool(Tool):
             with _bg_tasks_lock:
                 entry = _bg_tasks.get(tid)
             if not entry:
+                runtime_state = _get_active_runtime_state()
+                if runtime_state is not None:
+                    job = runtime_state.get_job(tid)
+                    if job:
+                        state = job.get("state", "unknown")
+                        if state in ("finished", "failed"):
+                            summary = job.get("result_summary") or job.get("error_summary") or "(no output)"
+                            return f"Task {tid} {state}:\n{summary}"
+                        return (
+                            f"Task {tid} is {state}. "
+                            f"Command: {job.get('command_or_prompt', '') or '(unknown)'}"
+                        )
                 return f"Error: unknown background task '{tid}'"
             if entry["result"] is None:
                 elapsed = int(time.time() - entry["start"])
@@ -3850,6 +3897,7 @@ class BashTool(Tool):
             # Build sanitized env for background commands (same as foreground)
             bg_clean_env = self._build_clean_env()
             def _run_bg(tid, cmd, t_s):
+                state = "finished"
                 try:
                     _bg_pgroup = platform.system() != "Windows"
                     proc = subprocess.Popen(
@@ -3862,10 +3910,12 @@ class BashTool(Tool):
                     stdout, stderr = proc.communicate(timeout=t_s)
                     out = (stdout or "") + ("\n" + stderr if stderr else "")
                     if proc.returncode != 0:
+                        state = "failed"
                         out += f"\n(exit code: {proc.returncode})"
                     if len(out) > 30000:
                         out = out[:15000] + "\n...(truncated)...\n" + out[-15000:]
                 except subprocess.TimeoutExpired:
+                    state = "failed"
                     # Kill entire process group on Unix, then the process itself
                     if hasattr(os, "killpg"):
                         try:
@@ -3879,9 +3929,20 @@ class BashTool(Tool):
                         pass  # Process may be truly stuck — OS will reap eventually
                     out = f"Error: background command timed out after {int(t_s)}s"
                 except Exception as e:
+                    state = "failed"
                     out = f"Error: {e}"
                 with _bg_tasks_lock:
                     _bg_tasks[tid]["result"] = out.strip() or "(no output)"
+                runtime_state = _get_active_runtime_state()
+                if runtime_state is not None:
+                    runtime_state.upsert_job(
+                        tid,
+                        "bash",
+                        state,
+                        command_or_prompt=cmd,
+                        result_summary=out if state == "finished" else "",
+                        error_summary=out if state != "finished" else "",
+                    )
             with _bg_tasks_lock:
                 # Evict completed tasks older than 1 hour, then enforce cap
                 now = time.time()
@@ -3902,6 +3963,14 @@ class BashTool(Tool):
             t = threading.Thread(target=_run_bg, args=(task_id, command, timeout_s), daemon=True)
             with _bg_tasks_lock:
                 _bg_tasks[task_id]["thread"] = t
+            runtime_state = _get_active_runtime_state()
+            if runtime_state is not None:
+                runtime_state.upsert_job(
+                    task_id,
+                    "bash",
+                    "running",
+                    command_or_prompt=command,
+                )
             t.start()
             return f"Background task started: {task_id}\nUse Bash(command='bg_status {task_id}') to check result."
 
@@ -5471,6 +5540,378 @@ class NotebookEditTool(Tool):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Durable Session Runtime State
+# ════════════════════════════════════════════════════════════════════════════════
+
+
+class SessionRuntimeStore:
+    """Persist execution state alongside the JSONL transcript."""
+
+    DB_SUFFIX = ".state.sqlite3"
+
+    def __init__(self, config, session_id):
+        self.config = config
+        self.session_id = re.sub(r'[^A-Za-z0-9_\-]', '', session_id or "")[:64] or "session"
+        self.path = os.path.join(config.sessions_dir, f"{self.session_id}{self.DB_SUFFIX}")
+        self._lock = threading.Lock()
+        os.makedirs(config.sessions_dir, exist_ok=True)
+        self._init_db()
+
+    def _connect(self):
+        conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @staticmethod
+    def _encode_meta(value):
+        return json.dumps(value, ensure_ascii=False)
+
+    @staticmethod
+    def _decode_meta(value):
+        if value is None:
+            return None
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return value
+
+    def _init_db(self):
+        with self._lock, self._connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tasks (
+                    task_id TEXT PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    active_form TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS task_deps (
+                    task_id TEXT NOT NULL,
+                    dep_kind TEXT NOT NULL,
+                    dep_task_id TEXT NOT NULL,
+                    PRIMARY KEY (task_id, dep_kind, dep_task_id)
+                );
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    position INTEGER NOT NULL,
+                    label TEXT NOT NULL,
+                    git_ref TEXT,
+                    created_at REAL NOT NULL,
+                    snapshot_dir TEXT,
+                    status_lines_json TEXT NOT NULL,
+                    untracked_files_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY,
+                    job_type TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    command_or_prompt TEXT,
+                    started_at REAL,
+                    finished_at REAL,
+                    last_heartbeat_at REAL,
+                    result_summary TEXT,
+                    error_summary TEXT,
+                    external_ref TEXT
+                );
+                CREATE TABLE IF NOT EXISTS verifier_runs (
+                    verifier_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    verifier_type TEXT NOT NULL,
+                    command TEXT,
+                    status TEXT NOT NULL,
+                    started_at REAL NOT NULL,
+                    finished_at REAL NOT NULL,
+                    summary TEXT,
+                    output_path TEXT
+                );
+                CREATE TABLE IF NOT EXISTS resume_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+            """)
+            conn.execute(
+                "INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)",
+                ("schema_version", self._encode_meta(1)),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)",
+                ("session_id", self._encode_meta(self.session_id)),
+            )
+
+    def ensure_defaults(self, **defaults):
+        now = time.time()
+        existing_created = self.get_meta("created_at")
+        payload = {}
+        if existing_created is None:
+            payload["created_at"] = now
+        payload["updated_at"] = now
+        for key, value in defaults.items():
+            if value is not None and self.get_meta(key) is None:
+                payload[key] = value
+        if payload:
+            self.update_runtime(**payload)
+
+    def get_meta(self, key, default=None):
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return default
+        value = self._decode_meta(row["value"])
+        return default if value is None else value
+
+    def update_runtime(self, **fields):
+        if not fields:
+            return
+        with self._lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                [(key, self._encode_meta(value)) for key, value in fields.items()],
+            )
+
+    def load_runtime(self):
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT key, value FROM metadata").fetchall()
+        return {row["key"]: self._decode_meta(row["value"]) for row in rows}
+
+    def save_task_store(self, store):
+        store = copy.deepcopy(store or {"next_id": 1, "tasks": {}})
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM task_deps")
+            conn.execute("DELETE FROM tasks")
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                ("next_task_id", self._encode_meta(int(store.get("next_id", 1)))),
+            )
+            for tid, task in sorted(store.get("tasks", {}).items(), key=lambda item: int(item[0])):
+                conn.execute(
+                    "INSERT INTO tasks (task_id, subject, description, active_form, status) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        str(tid),
+                        task.get("subject", ""),
+                        task.get("description", ""),
+                        task.get("activeForm", ""),
+                        task.get("status", "pending"),
+                    ),
+                )
+                for dep_kind in ("blocks", "blockedBy"):
+                    for dep_task_id in task.get(dep_kind, []):
+                        conn.execute(
+                            "INSERT INTO task_deps (task_id, dep_kind, dep_task_id) VALUES (?, ?, ?)",
+                            (str(tid), dep_kind, str(dep_task_id)),
+                        )
+
+    def load_task_store(self):
+        store = {"next_id": int(self.get_meta("next_task_id", 1) or 1), "tasks": {}}
+        with self._lock, self._connect() as conn:
+            task_rows = conn.execute(
+                "SELECT task_id, subject, description, active_form, status FROM tasks ORDER BY CAST(task_id AS INTEGER)"
+            ).fetchall()
+            dep_rows = conn.execute(
+                "SELECT task_id, dep_kind, dep_task_id FROM task_deps ORDER BY task_id, dep_kind, dep_task_id"
+            ).fetchall()
+        for row in task_rows:
+            store["tasks"][row["task_id"]] = {
+                "id": row["task_id"],
+                "subject": row["subject"],
+                "description": row["description"],
+                "activeForm": row["active_form"],
+                "status": row["status"],
+                "blocks": [],
+                "blockedBy": [],
+            }
+        for row in dep_rows:
+            task = store["tasks"].get(row["task_id"])
+            if task:
+                task.setdefault(row["dep_kind"], []).append(row["dep_task_id"])
+        return store
+
+    def save_checkpoints(self, checkpoints):
+        checkpoints = copy.deepcopy(checkpoints or [])
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM checkpoints")
+            for position, cp in enumerate(checkpoints):
+                conn.execute(
+                    """
+                    INSERT INTO checkpoints
+                    (position, label, git_ref, created_at, snapshot_dir, status_lines_json, untracked_files_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        position,
+                        cp.get("label", ""),
+                        cp.get("git_ref", ""),
+                        float(cp.get("timestamp", time.time())),
+                        cp.get("snapshot_dir"),
+                        self._encode_meta(cp.get("status_lines", [])),
+                        self._encode_meta(cp.get("untracked_files", [])),
+                    ),
+                )
+
+    def load_checkpoints(self):
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT position, label, git_ref, created_at, snapshot_dir, status_lines_json, untracked_files_json
+                FROM checkpoints
+                ORDER BY position ASC
+                """
+            ).fetchall()
+        checkpoints = []
+        for row in rows:
+            checkpoints.append({
+                "git_ref": row["git_ref"],
+                "label": row["label"],
+                "timestamp": row["created_at"],
+                "status_lines": self._decode_meta(row["status_lines_json"]) or [],
+                "snapshot_dir": row["snapshot_dir"],
+                "untracked_files": self._decode_meta(row["untracked_files_json"]) or [],
+            })
+        return checkpoints
+
+    def upsert_job(self, job_id, job_type, state, command_or_prompt="", result_summary="", error_summary="", external_ref=""):
+        now = time.time()
+        existing = self.get_job(job_id)
+        started_at = existing.get("started_at", now) if existing else now
+        finished_at = now if state in ("finished", "failed", "orphaned", "unknown") else None
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO jobs
+                (job_id, job_type, state, command_or_prompt, started_at, finished_at, last_heartbeat_at,
+                 result_summary, error_summary, external_ref)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    job_type,
+                    state,
+                    command_or_prompt,
+                    started_at,
+                    finished_at,
+                    now,
+                    _summarize_output_text(result_summary, 2000),
+                    _summarize_output_text(error_summary, 2000),
+                    external_ref,
+                ),
+            )
+
+    def get_job(self, job_id):
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_jobs(self):
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT * FROM jobs ORDER BY started_at DESC, job_id DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def reconcile_running_jobs(self):
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET state = 'orphaned', finished_at = ?, last_heartbeat_at = ?
+                WHERE state = 'running'
+                """,
+                (now, now),
+            )
+            changed = cur.rowcount or 0
+        if changed:
+            self.record_resume_event("job_reconciled", f"Marked {changed} running job(s) as orphaned during resume.")
+        return changed
+
+    def record_verifier_run(self, verifier_type, command, status, summary="", output_path=None):
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO verifier_runs (verifier_type, command, status, started_at, finished_at, summary, output_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    verifier_type,
+                    command,
+                    status,
+                    now,
+                    now,
+                    _summarize_output_text(summary, 2000),
+                    output_path,
+                ),
+            )
+
+    def latest_verifier_run(self):
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT verifier_type, command, status, finished_at, summary, output_path
+                FROM verifier_runs
+                ORDER BY verifier_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_resume_events(self, limit=5):
+        limit = max(1, int(limit or 1))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT event_type, message, created_at
+                FROM resume_events
+                ORDER BY event_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        events = [dict(row) for row in rows]
+        events.reverse()
+        return events
+
+    def record_resume_event(self, event_type, message):
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO resume_events (event_type, message, created_at) VALUES (?, ?, ?)",
+                (event_type, message, time.time()),
+            )
+
+    def get_resume_summary(self):
+        runtime = self.load_runtime()
+        with self._lock, self._connect() as conn:
+            pending_tasks = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status IN ('pending', 'in_progress')"
+            ).fetchone()[0]
+            running_jobs = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE state = 'running'"
+            ).fetchone()[0]
+            orphaned_jobs = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE state = 'orphaned'"
+            ).fetchone()[0]
+            latest_checkpoint = conn.execute(
+                "SELECT label FROM checkpoints ORDER BY position DESC LIMIT 1"
+            ).fetchone()
+        return {
+            "last_known_phase": runtime.get("last_known_phase"),
+            "plan_mode": bool(runtime.get("plan_mode", False)),
+            "active_plan_path": runtime.get("active_plan_path"),
+            "autotest_enabled": bool(runtime.get("autotest_enabled", False)),
+            "watcher_enabled": bool(runtime.get("watcher_enabled", False)),
+            "resume_hint": runtime.get("resume_hint"),
+            "pending_tasks": pending_tasks,
+            "running_jobs": running_jobs,
+            "orphaned_jobs": orphaned_jobs,
+            "latest_checkpoint": latest_checkpoint["label"] if latest_checkpoint else None,
+            "latest_verifier": self.latest_verifier_run(),
+            "recent_events": self.list_resume_events(limit=3),
+        }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Task Management (in-memory store)
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -5479,6 +5920,37 @@ _task_store_lock = threading.Lock()  # Thread safety for parallel tool execution
 
 # Undo stack for file modifications (max 20)
 _undo_stack = collections.deque(maxlen=20)  # deque of (filepath, original_content)
+
+
+def _snapshot_task_store_locked():
+    return copy.deepcopy({
+        "next_id": _task_store["next_id"],
+        "tasks": _task_store["tasks"],
+    })
+
+
+def _replace_task_store(snapshot):
+    snapshot = snapshot or {"next_id": 1, "tasks": {}}
+    with _task_store_lock:
+        _task_store["next_id"] = int(snapshot.get("next_id", 1) or 1)
+        _task_store["tasks"] = copy.deepcopy(snapshot.get("tasks", {}))
+
+
+def _persist_task_store(snapshot=None):
+    runtime_state = _get_active_runtime_state()
+    if runtime_state is None:
+        return
+    if snapshot is None:
+        with _task_store_lock:
+            snapshot = _snapshot_task_store_locked()
+    runtime_state.save_task_store(snapshot)
+
+
+def _restore_task_store(runtime_state):
+    if runtime_state is None:
+        _replace_task_store({"next_id": 1, "tasks": {}})
+        return
+    _replace_task_store(runtime_state.load_task_store())
 
 
 class TaskCreateTool(Tool):
@@ -5530,6 +6002,8 @@ class TaskCreateTool(Tool):
                 "blocks": [],
                 "blockedBy": [],
             }
+            snapshot = _snapshot_task_store_locked()
+        _persist_task_store(snapshot)
         return f"Created task #{tid}: {subject}"
 
 
@@ -5601,6 +6075,7 @@ class TaskGetTool(Tool):
         tid = str(params.get("taskId", "")).strip()
         if not tid:
             return "Error: taskId is required"
+        snapshot = None
         with _task_store_lock:
             task = _task_store["tasks"].get(tid)
             if not task:
@@ -5681,6 +6156,8 @@ class TaskUpdateTool(Tool):
                             other_task["blocks"].remove(tid)
                         if tid in other_task.get("blockedBy", []):
                             other_task["blockedBy"].remove(tid)
+                    snapshot = _snapshot_task_store_locked()
+                    _persist_task_store(snapshot)
                     return f"Deleted task #{tid}"
                 task["status"] = status
 
@@ -5722,7 +6199,8 @@ class TaskUpdateTool(Tool):
                 other = _task_store["tasks"].get(blocker_id)
                 if other and tid not in other["blocks"]:
                     other["blocks"].append(tid)
-
+            snapshot = _snapshot_task_store_locked()
+        _persist_task_store(snapshot)
         return f"Updated task #{tid}: [{task['status']}] {task['subject']}"
 
 
@@ -6039,6 +6517,19 @@ class SubAgentTool(Tool):
             f"Platform: {platform.system().lower()}\n"
         )
 
+    @staticmethod
+    def _format_result_payload(result_text, *, ok, duration, error=None,
+                               worktree_path=None, worktree_branch=None):
+        return {
+            "ok": bool(ok),
+            "result": result_text,
+            "summary": _summarize_output_text(result_text, 240),
+            "error": error,
+            "duration": duration,
+            "worktree_path": worktree_path,
+            "worktree_branch": worktree_branch,
+        }
+
     def execute(self, params):
         prompt = params.get("prompt", "")
         if not prompt:
@@ -6052,6 +6543,16 @@ class SubAgentTool(Tool):
         max_turns = max(1, min(max_turns, self.HARD_MAX_TURNS))
 
         allow_writes = params.get("allow_writes", False)
+        structured_result = bool(params.get("_structured_result", False))
+        runtime_state = _get_active_runtime_state()
+        if allow_writes and runtime_state is not None and runtime_state.get_meta("plan_mode", False):
+            error_text = (
+                "Error: allow_writes is not permitted while plan mode is active. "
+                "Use /approve to switch to Act mode before delegating write-capable sub-agents."
+            )
+            if structured_result:
+                return self._format_result_payload(error_text, ok=False, duration=0.0, error=error_text)
+            return error_text
 
         # Worktree isolation setup
         isolation = params.get("isolation", "none")
@@ -6102,6 +6603,7 @@ class SubAgentTool(Tool):
 
         result_text = ""
         last_text = ""
+        error_text = None
 
         for turn in range(max_turns):
             try:
@@ -6112,6 +6614,7 @@ class SubAgentTool(Tool):
                 )
             except Exception as e:
                 result_text = f"Sub-agent error on turn {turn + 1}: {e}"
+                error_text = result_text
                 break
 
             text = resp.get("content", "")
@@ -6230,6 +6733,7 @@ class SubAgentTool(Tool):
                 f"Sub-agent reached max turns ({max_turns}). "
                 f"Last response: {last_text[:2000]}"
             )
+            error_text = result_text
 
         # Worktree cleanup
         if worktree_path and wt_manager:
@@ -6267,6 +6771,15 @@ class SubAgentTool(Tool):
         if len(result_text) > 20000:
             result_text = result_text[:20000] + "\n...(truncated)"
 
+        if structured_result:
+            return self._format_result_payload(
+                result_text,
+                ok=error_text is None,
+                duration=_sub_elapsed,
+                error=error_text,
+                worktree_path=worktree_path,
+                worktree_branch=worktree_branch,
+            )
         return result_text
 
 
@@ -6864,10 +7377,13 @@ class GitCheckpoint:
 
     MAX_CHECKPOINTS = 20
 
-    def __init__(self, cwd):
+    def __init__(self, cwd, runtime_state=None):
         self.cwd = cwd
+        self.runtime_state = runtime_state
         self._checkpoints = []  # list of dicts with stash snapshot metadata
         self._is_git_repo = self._check_git()
+        if self.runtime_state is not None:
+            self._checkpoints = self.runtime_state.load_checkpoints()
 
     def _check_git(self):
         """Check if cwd is inside a git repo."""
@@ -6939,6 +7455,10 @@ class GitCheckpoint:
         if snap_dir:
             shutil.rmtree(snap_dir, ignore_errors=True)
 
+    def _persist(self):
+        if self.runtime_state is not None:
+            self.runtime_state.save_checkpoints(self._checkpoints)
+
     def _drop_stash_entry(self, git_ref):
         if not git_ref:
             return
@@ -6985,6 +7505,7 @@ class GitCheckpoint:
             return False
         self._checkpoints.append(checkpoint)
         self._trim_checkpoints()
+        self._persist()
         return True
 
     def _restore_untracked(self, checkpoint):
@@ -7038,6 +7559,7 @@ class GitCheckpoint:
                 snap_dir = backup.get("snapshot_dir")
                 if snap_dir:
                     shutil.rmtree(snap_dir, ignore_errors=True)
+            self._persist()
             return True, message
         if backup is not None:
             restore_ok, restore_msg = self._apply_checkpoint(backup)
@@ -7047,6 +7569,7 @@ class GitCheckpoint:
             snap_dir = backup.get("snapshot_dir")
             if snap_dir:
                 shutil.rmtree(snap_dir, ignore_errors=True)
+        self._persist()
         return False, message
 
     def summary(self):
@@ -7162,6 +7685,9 @@ class GitWorktree:
 class AutoTestRunner:
     """Runs configured test/lint commands after file modifications."""
 
+    MAX_RETRY_ATTEMPTS = 2
+    RETRYABLE_FAILURE_KINDS = frozenset({"timeout", "tool-missing", "unknown"})
+
     def __init__(self, cwd):
         self.cwd = cwd
         self.enabled = False
@@ -7224,42 +7750,178 @@ class AutoTestRunner:
         elif not self.test_cmd and os.path.isfile(os.path.join(self.cwd, "package.json")):
             self.test_cmd = ["npm", "test"]
 
-    def run_after_edit(self, file_path):
-        """Run tests/lint after a file was modified. Returns error output or None."""
+    def _run_verifier_step(self, name, command, timeout, file_path=None):
+        invoked = list(command) + ([file_path] if file_path else [])
+        command_text = self._cmd_to_text(invoked)
+        try:
+            result = subprocess.run(
+                invoked,
+                cwd=self.cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except FileNotFoundError as e:
+            output = str(e)
+            return {
+                "name": name,
+                "command": command_text,
+                "status": "failed:tool-missing",
+                "failure_kind": "tool-missing",
+                "retryable": True,
+                "output": output,
+            }
+        except subprocess.TimeoutExpired as e:
+            output = str(e)
+            return {
+                "name": name,
+                "command": command_text,
+                "status": "failed:timeout",
+                "failure_kind": "timeout",
+                "retryable": True,
+                "output": output,
+            }
+        output = (result.stdout + "\n" + result.stderr).strip()
+        if result.returncode == 0:
+            return {
+                "name": name,
+                "command": command_text,
+                "status": "passed",
+                "failure_kind": None,
+                "retryable": False,
+                "output": "",
+            }
+        if len(output) > 3000:
+            output = output[:3000] + "\n...(truncated)"
+        failure_kind = _classify_verifier_failure(f"{name} failure:\n{output}")
+        return {
+            "name": name,
+            "command": command_text,
+            "status": f"failed:{failure_kind}",
+            "failure_kind": failure_kind,
+            "retryable": failure_kind in self.RETRYABLE_FAILURE_KINDS,
+            "output": output,
+        }
+
+    @staticmethod
+    def _latest_failures(step_results):
+        latest = {}
+        for step in step_results:
+            latest[step["name"]] = step
+        return [step for step in latest.values() if step["status"] != "passed"]
+
+    @staticmethod
+    def _format_failure_output(pipeline):
+        failed_steps = [step for step in pipeline.get("steps", []) if step["status"] != "passed"]
+        if not failed_steps:
+            return None
+        lines = []
+        if pipeline.get("retry_attempted"):
+            lines.append(f"Retry policy: reran failed verifier because {pipeline.get('retry_reason', 'the failure looked retryable')}.")
+            lines.append("")
+        for step in failed_steps:
+            lines.append(f"{step['name']} [{step['status']}]")
+            lines.append(f"Command: {step['command']}")
+            if step.get("output"):
+                lines.append(step["output"])
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _build_pipeline_summary(self, pipeline):
+        if pipeline.get("ok"):
+            if pipeline.get("retry_attempted"):
+                return f"Verifier recovered after retry ({pipeline.get('retry_reason', 'retry policy')})."
+            return "Verifier pipeline passed."
+        failed_steps = self._latest_failures(pipeline.get("steps", []))
+        if not failed_steps:
+            return "Verifier pipeline failed."
+        labels = ", ".join(f"{step['name']}={step['failure_kind'] or 'unknown'}" for step in failed_steps)
+        suffix = ""
+        if pipeline.get("retry_attempted"):
+            suffix = f" after retry ({pipeline.get('retry_reason', 'retry policy')})"
+        return f"Verifier failed: {labels}{suffix}."
+
+    def run_pipeline(self, file_path):
+        """Run compile/lint/test verification with light retry policy."""
         if not self.enabled:
             return None
-
-        results = []
-
-        # Run lint on the specific file (Python only)
+        step_defs = []
         if file_path.endswith(".py") and self.lint_cmd:
-            try:
-                result = subprocess.run(
-                    self.lint_cmd + [file_path],
-                    cwd=self.cwd, capture_output=True, text=True, timeout=30
-                )
-                if result.returncode != 0:
-                    results.append(f"Lint error:\n{result.stderr or result.stdout}")
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
-
-        # Run test suite
+            step_defs.append(("lint", self.lint_cmd, 30, file_path))
         if self.test_cmd:
-            try:
-                result = subprocess.run(
-                    self.test_cmd,
-                    cwd=self.cwd, capture_output=True, text=True, timeout=120
-                )
-                if result.returncode != 0:
-                    output = (result.stdout + "\n" + result.stderr).strip()
-                    # Truncate long test output
-                    if len(output) > 3000:
-                        output = output[:3000] + "\n...(truncated)"
-                    results.append(f"Test failure:\n{output}")
-            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-                results.append(f"Test runner error: {e}")
+            step_defs.append(("test", self.test_cmd, 120, None))
+        if not step_defs:
+            return {
+                "ok": True,
+                "status": "passed",
+                "failure_kind": None,
+                "retry_attempted": False,
+                "retry_reason": None,
+                "attempts": 0,
+                "steps": [],
+                "summary": "Verifier pipeline has no configured steps.",
+                "error_output": None,
+            }
 
-        return "\n\n".join(results) if results else None
+        attempts = 0
+        retry_attempted = False
+        retry_reason = None
+        all_steps = []
+        current_steps = list(step_defs)
+        final_failures = []
+        while current_steps and attempts < self.MAX_RETRY_ATTEMPTS:
+            attempts += 1
+            failed_step_defs = []
+            attempt_failures = []
+            for name, command, timeout, target_path in current_steps:
+                step = self._run_verifier_step(name, command, timeout, target_path)
+                step["attempt"] = attempts
+                all_steps.append(step)
+                if step["status"] != "passed":
+                    attempt_failures.append(step)
+                    failed_step_defs.append((name, command, timeout, target_path))
+            if not attempt_failures:
+                pipeline = {
+                    "ok": True,
+                    "status": "passed",
+                    "failure_kind": None,
+                    "retry_attempted": retry_attempted,
+                    "retry_reason": retry_reason,
+                    "attempts": attempts,
+                    "steps": all_steps,
+                }
+                pipeline["summary"] = self._build_pipeline_summary(pipeline)
+                pipeline["error_output"] = None
+                return pipeline
+            final_failures = attempt_failures
+            retryable = all(step.get("retryable") for step in attempt_failures)
+            if retryable and attempts < self.MAX_RETRY_ATTEMPTS:
+                retry_attempted = True
+                retry_reason = ", ".join(sorted(set(step.get("failure_kind") or "unknown" for step in attempt_failures)))
+                current_steps = failed_step_defs
+                continue
+            break
+
+        failure_kind = final_failures[0].get("failure_kind") if final_failures else "unknown"
+        pipeline = {
+            "ok": False,
+            "status": f"failed:{failure_kind}",
+            "failure_kind": failure_kind,
+            "retry_attempted": retry_attempted,
+            "retry_reason": retry_reason,
+            "attempts": attempts,
+            "steps": all_steps,
+        }
+        pipeline["summary"] = self._build_pipeline_summary(pipeline)
+        pipeline["error_output"] = self._format_failure_output(pipeline)
+        return pipeline
+
+    def run_after_edit(self, file_path):
+        """Run tests/lint after a file was modified. Returns error output or None."""
+        pipeline = self.run_pipeline(file_path)
+        if not pipeline or pipeline.get("ok"):
+            return None
+        return pipeline.get("error_output")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -7428,13 +8090,21 @@ class MultiAgentCoordinator:
                 # Inject agent label for UI display
                 labeled_task = dict(task)
                 labeled_task["_agent_label"] = f"Agent {idx + 1}/{total}"
+                labeled_task["_structured_result"] = True
                 sub = SubAgentTool(self._config, self._client, self._registry, self._permissions, self._tui)
                 result = sub.execute(labeled_task)
+                if isinstance(result, dict):
+                    result_text = result.get("result", "")
+                    error_text = result.get("error")
+                else:
+                    result_text = result
+                    error_text = None
                 results[idx] = {
                     "prompt": task.get("prompt", "")[:100],
-                    "result": result,
+                    "result": result_text,
                     "duration": time.time() - start,
-                    "error": None,
+                    "error": error_text,
+                    "structured": result if isinstance(result, dict) else None,
                 }
             except Exception as e:
                 results[idx] = {
@@ -7442,6 +8112,7 @@ class MultiAgentCoordinator:
                     "result": "",
                     "duration": time.time() - start,
                     "error": str(e),
+                    "structured": None,
                 }
             _done_count[0] += 1
 
@@ -7488,6 +8159,7 @@ class MultiAgentCoordinator:
                     "result": "",
                     "duration": 300.0,
                     "error": "Agent timed out (300s limit)",
+                    "structured": None,
                 }
 
         return results
@@ -7676,6 +8348,8 @@ class AgentTeam:
                     "blockedBy": [],
                 }
                 task_ids.append(tid)
+            snapshot = _snapshot_task_store_locked()
+        _persist_task_store(snapshot)
 
         if not task_ids:
             return "No tasks created from goal decomposition."
@@ -7707,7 +8381,12 @@ class AgentTeam:
                             if not open_blockers:
                                 t["status"] = "in_progress"
                                 task_to_work = dict(t)
+                                snapshot = _snapshot_task_store_locked()
                                 break
+                    else:
+                        snapshot = None
+                if snapshot is not None:
+                    _persist_task_store(snapshot)
 
                 if not task_to_work:
                     # Check if all done
@@ -7739,19 +8418,22 @@ class AgentTeam:
                     "max_turns": 15,
                     "allow_writes": allow_writes,
                     "_agent_label": name,
+                    "_structured_result": True,
                 })
 
                 # Mark task complete
                 with _task_store_lock:
                     t = _task_store["tasks"].get(_tid)
                     if t:
-                        t["status"] = "completed"
+                        t["status"] = "completed" if isinstance(result, dict) and result.get("ok", False) else "pending"
+                    snapshot = _snapshot_task_store_locked()
+                _persist_task_store(snapshot)
 
                 self._results[f"{name}:#{_tid}"] = result
                 with _print_lock:
                     _scroll_aware_print(
                         f"  {_ansi(chr(27)+'[38;5;46m')}[{name}] "
-                        f"Completed task #{_tid}{C.RESET}")
+                        f"{'Completed' if isinstance(result, dict) and result.get('ok', False) else 'Needs retry'} task #{_tid}{C.RESET}")
 
         threads = []
         for i in range(num_teammates):
@@ -7795,7 +8477,16 @@ class AgentTeam:
         output_parts.append("")
         for key, result in self._results.items():
             output_parts.append(f"--- {key} ---")
-            result_text = str(result)
+            if isinstance(result, dict):
+                result_text = result.get("result", "")
+                if result.get("error"):
+                    output_parts.append(f"| status: FAIL")
+                    output_parts.append(f"| error: {result['error']}")
+                else:
+                    output_parts.append(f"| status: OK")
+                    output_parts.append(f"| summary: {result.get('summary', '')}")
+            else:
+                result_text = str(result)
             if len(result_text) > 2000:
                 result_text = result_text[:2000] + "\n...(truncated)"
             for line in result_text.split("\n"):
@@ -7854,14 +8545,50 @@ class PermissionMgr:
     NETWORK_TOOLS = {"WebFetch", "WebSearch"}
 
     _NO_PERSIST_ALLOW = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"}
+    _VALID_RULE_VALUES = {"allow", "deny"}
+    _TOOL_CATEGORIES = {
+        "Bash": "shell",
+        "Write": "write",
+        "Edit": "write",
+        "MultiEdit": "write",
+        "NotebookEdit": "write",
+        "WebFetch": "network",
+        "WebSearch": "network",
+        "Read": "read",
+        "Glob": "read",
+        "Grep": "read",
+        "SubAgent": "agent",
+        "AskUserQuestion": "interaction",
+        "AskUserQuestionBatch": "interaction",
+        "TaskCreate": "task",
+        "TaskList": "task",
+        "TaskGet": "task",
+        "TaskUpdate": "task",
+    }
+    _PATH_PARAM_KEYS = ("file_path", "notebook_path", "path")
 
     def __init__(self, config):
         self.yes_mode = config.yes_mode
         self.rules = {}  # tool_name -> "allow" | "deny"
         self._session_allows = set()  # remembered "allow" decisions this session
         self._session_denies = set()  # remembered "deny" decisions this session
+        self._global_rules = {}
+        self._project_rules = {}
+        self._global_category_rules = {}
+        self._project_category_rules = {}
+        self._global_path_rules = []
+        self._project_path_rules = []
         self._permissions_path = config.permissions_file
-        self._load_rules(self._permissions_path)
+        self._project_permissions_path = os.path.join(
+            os.path.abspath(getattr(config, "cwd", os.getcwd())),
+            ".eve-cli",
+            "permissions.json",
+        )
+        self._cwd = os.path.realpath(os.path.abspath(getattr(config, "cwd", os.getcwd())))
+        self._last_decision = None
+        self._load_rules(self._permissions_path, scope="global")
+        if os.path.abspath(self._project_permissions_path) != os.path.abspath(self._permissions_path):
+            self._load_rules(self._project_permissions_path, scope="project")
 
     # Dangerous commands that require confirmation even in -y mode
     _ALWAYS_CONFIRM_PATTERNS = [
@@ -7871,7 +8598,87 @@ class PermissionMgr:
         r'\bdd\b.*\bof=/dev/',   # dd to device
     ]
 
-    def _load_rules(self, path):
+    @classmethod
+    def _tool_category(cls, tool_name):
+        return cls._TOOL_CATEGORIES.get(tool_name, "other")
+
+    def _set_last_decision(self, allowed, source, reason, scope="runtime", rule=None, record_event=False):
+        self._last_decision = {
+            "allowed": bool(allowed),
+            "source": source,
+            "scope": scope,
+            "reason": reason,
+            "rule": rule,
+        }
+        if record_event:
+            runtime_state = _get_active_runtime_state()
+            if runtime_state:
+                action = "allowed" if allowed else "denied"
+                runtime_state.record_resume_event(
+                    f"approval_{action}",
+                    f"{source}/{scope}: {reason}",
+                )
+
+    def describe_last_decision(self):
+        if not self._last_decision:
+            return "No permission decision has been made yet."
+        return self._last_decision.get("reason", "Permission check completed.")
+
+    def policy_summary(self):
+        return {
+            "global_tool_rules": len(self._global_rules),
+            "project_tool_rules": len(self._project_rules),
+            "global_category_rules": len(self._global_category_rules),
+            "project_category_rules": len(self._project_category_rules),
+            "global_path_rules": len(self._global_path_rules),
+            "project_path_rules": len(self._project_path_rules),
+        }
+
+    def _merge_visible_rules(self):
+        merged = dict(self._global_rules)
+        merged.update(self._project_rules)
+        self.rules = merged
+
+    def _store_tool_rule(self, scope, tool_name, decision):
+        if decision not in self._VALID_RULE_VALUES:
+            return
+        if tool_name == "Bash" and decision == "allow":
+            return
+        target = self._global_rules if scope == "global" else self._project_rules
+        target[tool_name] = decision
+
+    def _store_category_rule(self, scope, category, decision):
+        if decision not in self._VALID_RULE_VALUES:
+            return
+        if category == "shell" and decision == "allow":
+            return
+        target = self._global_category_rules if scope == "global" else self._project_category_rules
+        target[category] = decision
+
+    def _store_path_rule(self, scope, rule):
+        if not isinstance(rule, dict):
+            return
+        decision = rule.get("decision")
+        pattern = rule.get("path")
+        if decision not in self._VALID_RULE_VALUES or not isinstance(pattern, str) or not pattern.strip():
+            return
+        category = rule.get("category")
+        if category == "shell" and decision == "allow":
+            return
+        tool_name = rule.get("tool")
+        if tool_name == "Bash" and decision == "allow":
+            return
+        normalized = {
+            "path": pattern.replace("\\", "/"),
+            "decision": decision,
+            "tool": tool_name if isinstance(tool_name, str) and tool_name else None,
+            "category": category if isinstance(category, str) and category else None,
+            "scope": scope,
+        }
+        target = self._global_path_rules if scope == "global" else self._project_path_rules
+        target.append(normalized)
+
+    def _load_rules(self, path, scope):
         if not os.path.isfile(path):
             return
         # Skip symlinks for security
@@ -7882,21 +8689,95 @@ class PermissionMgr:
                 data = json.load(f)
             if not isinstance(data, dict):
                 return
-            valid_values = {"allow", "deny"}
-            for k, v in data.items():
-                if not isinstance(k, str) or v not in valid_values:
-                    continue
-                # Never persistently allow Bash (too dangerous)
-                if k == "Bash" and v == "allow":
-                    continue
-                self.rules[k] = v
+            if any(key in data for key in ("tools", "categories", "paths", "path_rules")):
+                tools = data.get("tools", {})
+                if isinstance(tools, dict):
+                    for k, v in tools.items():
+                        if isinstance(k, str):
+                            self._store_tool_rule(scope, k, v)
+                categories = data.get("categories", {})
+                if isinstance(categories, dict):
+                    for k, v in categories.items():
+                        if isinstance(k, str):
+                            self._store_category_rule(scope, k, v)
+                path_rules = data.get("paths", data.get("path_rules", []))
+                if isinstance(path_rules, list):
+                    for rule in path_rules:
+                        self._store_path_rule(scope, rule)
+            else:
+                for k, v in data.items():
+                    if isinstance(k, str):
+                        self._store_tool_rule(scope, k, v)
+            self._merge_visible_rules()
         except (OSError, json.JSONDecodeError) as e:
             print(f"Warning: Could not load permissions: {e}", file=sys.stderr)
+
+    def _extract_candidate_path(self, params):
+        if not isinstance(params, dict):
+            return None
+        for key in self._PATH_PARAM_KEYS:
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                try:
+                    real = os.path.realpath(value)
+                    return real.replace("\\", "/")
+                except OSError:
+                    return os.path.abspath(value).replace("\\", "/")
+        return None
+
+    def _match_path_rule(self, tool_name, params):
+        candidate_path = self._extract_candidate_path(params)
+        if not candidate_path:
+            return None
+        category = self._tool_category(tool_name)
+        rel_path = None
+        try:
+            rel_path = os.path.relpath(candidate_path, self._cwd).replace("\\", "/")
+        except ValueError:
+            rel_path = None
+        search_values = [candidate_path]
+        if rel_path and not rel_path.startswith(".."):
+            search_values.append(rel_path)
+        for rule in self._project_path_rules + self._global_path_rules:
+            if rule.get("tool") and rule["tool"] != tool_name:
+                continue
+            if rule.get("category") and rule["category"] != category:
+                continue
+            pattern = rule["path"]
+            if any(fnmatch.fnmatch(value, pattern) for value in search_values):
+                return rule
+        return None
+
+    def _match_category_rule(self, tool_name):
+        category = self._tool_category(tool_name)
+        if category in self._project_category_rules:
+            return {
+                "decision": self._project_category_rules[category],
+                "scope": "project",
+                "category": category,
+            }
+        if category in self._global_category_rules:
+            return {
+                "decision": self._global_category_rules[category],
+                "scope": "global",
+                "category": category,
+            }
+        return None
+
+    def _match_tool_rule(self, tool_name):
+        if tool_name in self._project_rules:
+            return {"decision": self._project_rules[tool_name], "scope": "project", "tool": tool_name}
+        if tool_name in self._global_rules:
+            return {"decision": self._global_rules[tool_name], "scope": "global", "tool": tool_name}
+        if tool_name in self.rules:
+            return {"decision": self.rules[tool_name], "scope": "legacy", "tool": tool_name}
+        return None
 
     def check(self, tool_name, params, tui=None):
         """Check if tool execution is allowed. Returns True to proceed."""
         # Session-level deny takes priority
         if tool_name in self._session_denies:
+            self._set_last_decision(False, "session", f"{tool_name} is denied for the rest of this session.", "session")
             return False
 
         # Even in -y mode, confirm truly dangerous Bash commands
@@ -7910,33 +8791,54 @@ class PermissionMgr:
                             self.yes_mode = True
                             return True
                         if result == "allow_all":
+                            self._set_last_decision(True, "prompt", f"User approved dangerous Bash command: {cmd[:120]}", "session", record_event=True)
                             return True
                         if result == "deny_all":
                             self._session_denies.add(tool_name)
-                            self.rules[tool_name] = "deny"
+                            self._global_rules[tool_name] = "deny"
+                            self._merge_visible_rules()
                             self._save_rules()
+                            self._set_last_decision(False, "prompt", f"User denied dangerous Bash command: {cmd[:120]}", "persistent", record_event=True)
                             return False
+                        self._set_last_decision(bool(result), "prompt", f"Dangerous Bash command requires confirmation: {cmd[:120]}", "session", record_event=not result)
                         return result
+                    self._set_last_decision(False, "dangerous-bash", f"Dangerous Bash command blocked without TUI: {cmd[:120]}", "runtime", record_event=True)
                     return False
+        path_rule = self._match_path_rule(tool_name, params)
+        if path_rule:
+            allowed = path_rule["decision"] == "allow"
+            message = f"Matched {path_rule['scope']} path rule {path_rule['decision']} for {path_rule['path']}"
+            self._set_last_decision(allowed, "path-policy", message, path_rule["scope"], rule=path_rule, record_event=not allowed)
+            return allowed
+        category_rule = self._match_category_rule(tool_name)
+        if category_rule:
+            allowed = category_rule["decision"] == "allow"
+            message = f"Matched {category_rule['scope']} category rule {category_rule['decision']} for {category_rule['category']}"
+            self._set_last_decision(allowed, "category-policy", message, category_rule["scope"], rule=category_rule, record_event=not allowed)
+            return allowed
+        tool_rule = self._match_tool_rule(tool_name)
+        if tool_rule:
+            allowed = tool_rule["decision"] == "allow"
+            message = f"Matched {tool_rule['scope']} tool rule {tool_rule['decision']} for {tool_name}"
+            self._set_last_decision(allowed, "tool-policy", message, tool_rule["scope"], rule=tool_rule, record_event=not allowed)
+            return allowed
         if self.yes_mode:
+            self._set_last_decision(True, "yes-mode", f"yes_mode enabled for {tool_name}.", "session")
             return True
         if tool_name in self.SAFE_TOOLS:
+            self._set_last_decision(True, "safe-tool", f"{tool_name} is always allowed.", "runtime")
             return True
 
         # Check persistent rules
-        rule = self.rules.get(tool_name)
-        if rule == "allow":
-            return True
-        if rule == "deny":
-            return False
-
         # Check session-level blanket allow
         if tool_name in self._session_allows:
+            self._set_last_decision(True, "session", f"{tool_name} is allowed for the rest of this session.", "session")
             return True
 
         # Unknown tools denied without TUI
         if tool_name not in self.SAFE_TOOLS and tool_name not in self.ASK_TOOLS and tool_name not in getattr(self, 'NETWORK_TOOLS', set()):
             if not tui:
+                self._set_last_decision(False, "default-deny", f"Unknown tool '{tool_name}' is denied without TUI.", "runtime")
                 return False  # Unknown tools denied without TUI
 
         # Ask user (network tools shown with extra context)
@@ -7944,23 +8846,30 @@ class PermissionMgr:
             result = tui.ask_permission(tool_name, params)
             if result == "yes_mode":
                 self.yes_mode = True
+                self._set_last_decision(True, "prompt", f"User enabled yes_mode while approving {tool_name}.", "session", record_event=True)
                 return True
             if result == "allow_all":
                 self.session_allow(tool_name)
+                self._set_last_decision(True, "prompt", f"User allowed {tool_name} for the rest of the session.", "session", record_event=True)
                 return True
             if result == "deny_all":
                 self._session_denies.add(tool_name)
-                self.rules[tool_name] = "deny"
+                self._global_rules[tool_name] = "deny"
+                self._merge_visible_rules()
                 self._save_rules()
+                self._set_last_decision(False, "prompt", f"User denied {tool_name} and persisted the deny rule.", "persistent", record_event=True)
                 return False
+            self._set_last_decision(bool(result), "prompt", f"User {'approved' if result else 'denied'} {tool_name}.", "session", record_event=not result)
             return result
+        self._set_last_decision(False, "default-deny", f"{tool_name} requires approval and no TUI is available.", "runtime")
         return False  # Default deny when no TUI (safety)
 
     def _save_rules(self):
         try:
             os.makedirs(os.path.dirname(self._permissions_path), exist_ok=True)
             with open(self._permissions_path, "w", encoding="utf-8") as f:
-                json.dump(self.rules, f, indent=2, ensure_ascii=False)
+                payload = self._global_rules if self._global_rules else self.rules
+                json.dump(payload, f, indent=2, ensure_ascii=False)
         except OSError:
             pass
 
@@ -7968,7 +8877,8 @@ class PermissionMgr:
         """Allow a tool for the rest of this session, and persist if safe."""
         self._session_allows.add(tool_name)
         if tool_name not in self._NO_PERSIST_ALLOW:
-            self.rules[tool_name] = "allow"
+            self._global_rules[tool_name] = "allow"
+            self._merge_visible_rules()
             self._save_rules()
 
 
@@ -8678,6 +9588,20 @@ class Session:
         self._token_estimate = 0
         self._last_compact_msg_count = 0  # prevent infinite re-compaction
         self._just_compacted = False  # skip token reconciliation right after compaction
+        self.runtime_state = SessionRuntimeStore(config, self.session_id)
+        self.runtime_state.ensure_defaults(
+            cwd=os.path.abspath(getattr(config, "cwd", "")),
+            model=getattr(config, "model", ""),
+            profile=getattr(config, "profile", ""),
+            plan_mode=False,
+            active_plan_path=None,
+            autotest_enabled=False,
+            watcher_enabled=False,
+            last_known_phase="idle",
+            resume_hint="continue chat",
+        )
+        _set_active_runtime_state(self.runtime_state)
+        _restore_task_store(self.runtime_state)
 
     def set_client(self, client):
         """Set OllamaClient reference for sidecar model summarization."""
@@ -9154,6 +10078,16 @@ class Session:
             Session._save_project_index(self.config, index)
         except Exception:
             pass  # non-critical
+        try:
+            _persist_task_store()
+            self.runtime_state.ensure_defaults(
+                cwd=os.path.abspath(getattr(self.config, "cwd", "")),
+                model=getattr(self.config, "model", ""),
+                profile=getattr(self.config, "profile", ""),
+            )
+            self.runtime_state.update_runtime(updated_at=time.time())
+        except Exception:
+            pass
 
     def fork(self, new_session_id=None):
         """Create a fork (copy) of this session with a new ID.
@@ -9171,6 +10105,13 @@ class Session:
                 shutil.copy2(src, dst)
             except (OSError, shutil.Error):
                 return None
+        src_runtime = os.path.join(self.config.sessions_dir, f"{self.session_id}{SessionRuntimeStore.DB_SUFFIX}")
+        dst_runtime = os.path.join(self.config.sessions_dir, f"{fork_id}{SessionRuntimeStore.DB_SUFFIX}")
+        if os.path.isfile(src_runtime) and not os.path.islink(src_runtime):
+            try:
+                shutil.copy2(src_runtime, dst_runtime)
+            except (OSError, shutil.Error):
+                pass
         return fork_id
 
     MAX_SESSION_FILE_SIZE = 50 * 1024 * 1024  # 50MB safety limit
@@ -9225,11 +10166,24 @@ class Session:
                 print(f"{C.YELLOW}{t('warnings.session_corrupt_lines', default=f'Warning: Skipped {skipped} corrupt line(s) in session.')}{C.RESET}",
                       file=sys.stderr)
             self.session_id = sid
+            self.runtime_state = SessionRuntimeStore(self.config, sid)
+            self.runtime_state.ensure_defaults(
+                cwd=os.path.abspath(getattr(self.config, "cwd", "")),
+                model=getattr(self.config, "model", ""),
+                profile=getattr(self.config, "profile", ""),
+            )
+            self.runtime_state.reconcile_running_jobs()
+            self.runtime_state.record_resume_event("manual_resume", f"Resumed session {sid}.")
+            _set_active_runtime_state(self.runtime_state)
+            _restore_task_store(self.runtime_state)
             self._recalculate_tokens()
             return True
         except OSError as e:
             print(f"{C.RED}{t('errors.session_load_failed', default=f'Error loading session: {e}')}{C.RESET}", file=sys.stderr)
             return False
+
+    def get_resume_summary(self):
+        return self.runtime_state.get_resume_summary() if self.runtime_state else {}
 
     @staticmethod
     def list_sessions(config):
@@ -10841,10 +11795,48 @@ class TUI:
         ]
         if agent is not None:
             cp_summary = agent.git_checkpoint.summary()
+            runtime = session.get_resume_summary()
             lines.append(
                 f"  {_c87}Recovery{C.RESET}  checkpoints={cp_summary['count']} "
                 f"(latest: {cp_summary['latest'] or 'none'})"
             )
+            lines.append(
+                f"  {_c87}Phase{C.RESET}     {runtime.get('last_known_phase') or 'idle'}"
+            )
+            if runtime.get("active_plan_path"):
+                lines.append(
+                    f"  {_c87}Plan{C.RESET}      {os.path.basename(runtime['active_plan_path'])}"
+                )
+            pending_tasks = runtime.get("pending_tasks", 0)
+            if pending_tasks:
+                lines.append(f"  {_c87}Tasks{C.RESET}     pending={pending_tasks}")
+            running_jobs = runtime.get("running_jobs", 0)
+            orphaned_jobs = runtime.get("orphaned_jobs", 0)
+            if running_jobs or orphaned_jobs:
+                lines.append(
+                    f"  {_c87}Jobs{C.RESET}      running={running_jobs} orphaned={orphaned_jobs}"
+                )
+            latest_verifier = runtime.get("latest_verifier") or {}
+            if latest_verifier:
+                lines.append(
+                    f"  {_c87}Verifier{C.RESET}  {latest_verifier.get('status', 'unknown')}: "
+                    f"{_summarize_output_text(latest_verifier.get('summary', ''), 80)}"
+                )
+            recent_events = runtime.get("recent_events") or []
+            if recent_events:
+                lines.append(
+                    f"  {_c87}Timeline{C.RESET}  {_summarize_output_text(recent_events[-1].get('message', ''), 80)}"
+                )
+                for event in recent_events[:-1]:
+                    lines.append(
+                        f"  {_c240}            {_summarize_output_text(event.get('message', ''), 80)}{C.RESET}"
+                    )
+            policy_summary = agent.permissions.policy_summary() if getattr(agent, "permissions", None) else None
+            if policy_summary:
+                lines.append(
+                    f"  {_c87}Approval{C.RESET}  project={policy_summary['project_tool_rules'] + policy_summary['project_category_rules'] + policy_summary['project_path_rules']} "
+                    f"global={policy_summary['global_tool_rules'] + policy_summary['global_category_rules'] + policy_summary['global_path_rules']}"
+                )
             auto_desc = agent.auto_test.describe()
             lines.append(
                 f"  {_c87}Auto-test{C.RESET} {'ON' if agent.auto_test.enabled else 'OFF'}"
@@ -10911,11 +11903,15 @@ class Agent:
         self._active_plan_path = None     # current plan file path
         self.allowed_tool_names = None
 
-        self.git_checkpoint = GitCheckpoint(config.cwd)
+        self.git_checkpoint = GitCheckpoint(config.cwd, runtime_state=session.runtime_state)
         self.change_tracker = GitChangeTracker(config.cwd)
         self.auto_test = AutoTestRunner(config.cwd)
         self.file_watcher = FileWatcher(config.cwd)
         self.max_iterations = max(1, min(config.max_agent_steps, self.HARD_MAX_ITERATIONS))
+        runtime = session.get_resume_summary()
+        self._plan_mode = bool(runtime.get("plan_mode", False))
+        self._active_plan_path = runtime.get("active_plan_path")
+        self.auto_test.enabled = bool(runtime.get("autotest_enabled", False))
 
         # Store last assistant output for loop mode completion detection
         self._last_output: str = ""
@@ -11081,6 +12077,12 @@ class Agent:
     def _run_impl(self, user_input, skip_add=False):
         """Internal agent loop implementation."""
         _p = self.tui._scroll_print  # scroll-region-safe print
+        if self.session.runtime_state:
+            self.session.runtime_state.update_runtime(
+                last_known_phase="planning" if self._plan_mode else "acting",
+                resume_hint="continue chat",
+                updated_at=time.time(),
+            )
 
         # Auto-parallel detection: if user asks multiple independent tasks, run them in parallel
         # Known limitation: RAG context is not injected when auto-parallel fires, because
@@ -11360,7 +12362,12 @@ class Agent:
                             continue
                     # Then ask permission
                     if not self.permissions.check(tool_name, tool_params, self.tui):
-                        results.append(ToolResult(tc_id, "Permission denied by user. Do not retry this operation.", True))
+                        denial_reason = self.permissions.describe_last_decision()
+                        results.append(ToolResult(
+                            tc_id,
+                            f"Permission denied. {denial_reason} Do not retry this operation.",
+                            True,
+                        ))
                         self.tui.show_tool_result(tool_name, "Permission denied", True)
                         continue
                     validated_calls.append((tc_id, tool_name, tool_params, tool))
@@ -11480,17 +12487,58 @@ class Agent:
                             if tool_name in ("Write", "Edit", "NotebookEdit") and self.auto_test.enabled:
                                 fpath = tracked_path
                                 if fpath:
-                                    test_errors = self.auto_test.run_after_edit(fpath)
-                                    if test_errors:
+                                    verifier_desc = self.auto_test.describe()
+                                    verifier_cmd = verifier_desc.get("test") or verifier_desc.get("lint") or ""
+                                    verifier_pipeline = self.auto_test.run_pipeline(fpath)
+                                    test_errors = verifier_pipeline.get("error_output") if verifier_pipeline else None
+                                    if verifier_pipeline and verifier_pipeline.get("retry_attempted") and self.session.runtime_state:
+                                        self.session.runtime_state.record_resume_event(
+                                            "verifier_retry",
+                                            f"Retried verifier once because {verifier_pipeline.get('retry_reason', 'the failure looked retryable')}.",
+                                        )
+                                    if verifier_pipeline and not verifier_pipeline.get("ok"):
+                                        failure_kind = verifier_pipeline.get("failure_kind") or "unknown"
+                                        if self.session.runtime_state:
+                                            self.session.runtime_state.record_verifier_run(
+                                                "autotest",
+                                                verifier_cmd,
+                                                verifier_pipeline.get("status", f"failed:{failure_kind}"),
+                                                verifier_pipeline.get("summary") or test_errors,
+                                            )
+                                            self.session.runtime_state.update_runtime(
+                                                last_known_phase="verifier_failed",
+                                                resume_hint=f"retry last verifier ({failure_kind})",
+                                                updated_at=time.time(),
+                                            )
+                                            self.session.runtime_state.record_resume_event(
+                                                "verifier_failed",
+                                                verifier_pipeline.get("summary") or f"Verifier failed: {failure_kind}",
+                                            )
                                         _p(f"\n  {_ansi(chr(27)+'[38;5;196m')}Auto-test errors detected:{C.RESET}")
                                         for line in test_errors.split('\n')[:5]:
                                             _p(f"  {C.DIM}{line}{C.RESET}")
+                                        if verifier_pipeline.get("retry_attempted"):
+                                            _p(
+                                                f"  {C.DIM}retry policy: reran once because "
+                                                f"{verifier_pipeline.get('retry_reason', 'failure looked retryable')}{C.RESET}"
+                                            )
                                         # Feed errors back as additional context
                                         results.append(ToolResult(
                                             f"autotest_{tc_id}",
                                             f"[AUTO-TEST] Errors detected after {tool_name}:\n{test_errors}\n\nPlease fix these errors.",
                                             True
                                         ))
+                                    elif self.session.runtime_state:
+                                        self.session.runtime_state.record_verifier_run(
+                                            "autotest",
+                                            verifier_cmd,
+                                            verifier_pipeline.get("status", "passed") if verifier_pipeline else "passed",
+                                            verifier_pipeline.get("summary") if verifier_pipeline else f"{tool_name} completed without auto-test errors.",
+                                        )
+                                        self.session.runtime_state.record_resume_event(
+                                            "verifier_passed",
+                                            verifier_pipeline.get("summary") if verifier_pipeline else f"Verifier passed after {tool_name}.",
+                                        )
                         except KeyboardInterrupt:
                             self.tui.stop_spinner()
                             _tool_dur = time.time() - _tool_t0
@@ -11612,6 +12660,11 @@ class Agent:
                 _p(f"{C.DIM}セッションが終了しました。再開：eve-coder --resume (Session ended. Resume with: eve-coder --resume){C.RESET}")
 
         # Fire Stop hook when agent loop ends
+        if self.session.runtime_state:
+            self.session.runtime_state.update_runtime(
+                last_known_phase="idle",
+                updated_at=time.time(),
+            )
         if self.hook_mgr and self.hook_mgr.has_hooks:
             self.hook_mgr.fire("Stop", {"model": self.config.model, "cwd": self.config.cwd})
 
@@ -11657,6 +12710,18 @@ def _enter_plan_mode(agent, session):
     # Pre-set plan path with timestamp
     plan_name = time.strftime("plan-%Y%m%d-%H%M%S.md")
     agent._active_plan_path = os.path.join(plans_dir, plan_name)
+    if session.runtime_state:
+        session.runtime_state.update_runtime(
+            plan_mode=True,
+            active_plan_path=agent._active_plan_path,
+            last_known_phase="planning",
+            resume_hint="review active plan",
+            updated_at=time.time(),
+        )
+        session.runtime_state.record_resume_event(
+            "plan_mode_entered",
+            f"Entered plan mode with {os.path.basename(agent._active_plan_path)}.",
+        )
     # Inject system note to guide LLM
     session.add_system_note(
         "[Plan Mode] You are now in Plan mode. Your task is to explore the codebase, "
@@ -11927,6 +12992,7 @@ def _exit_plan_mode(agent, session):
         print(f"{C.YELLOW}Not in plan mode.{C.RESET}")
         return
     plan_content = _read_latest_plan(agent)
+    plan_name = os.path.basename(agent._active_plan_path) if agent._active_plan_path else "(none)"
     agent._plan_mode = False
     # Non-invasive checkpoint: create stash ref without modifying working tree
     if agent.git_checkpoint._is_git_repo:
@@ -11937,10 +13003,21 @@ def _exit_plan_mode(agent, session):
             "[Act Mode] The following plan was created in Plan mode. Implement it step by step.\n\n"
             + plan_content
         )
+    if session.runtime_state:
+        session.runtime_state.update_runtime(
+            plan_mode=False,
+            active_plan_path=agent._active_plan_path,
+            last_known_phase="acting",
+            resume_hint="continue implementing the approved plan",
+            updated_at=time.time(),
+        )
+        session.runtime_state.record_resume_event(
+            "plan_mode_exited",
+            f"Approved plan {plan_name} and returned to act mode.",
+        )
     # Banner
     _c46 = _ansi(chr(27) + '[38;5;46m')
     _c240 = _ansi(chr(27) + '[38;5;240m')
-    plan_name = os.path.basename(agent._active_plan_path) if agent._active_plan_path else "(none)"
     _scroll_aware_print(f"\n  {_c46}━━ Act Mode ━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
     _scroll_aware_print(f"  {_c46}All tools re-enabled. Implementing plan.{C.RESET}")
     if plan_content:
@@ -12372,7 +13449,7 @@ def main():
         signal.signal(signal.SIGWINCH, lambda s, f: tui.scroll_region.resize())
 
     # Helper: show last user message from session for "welcome back"
-    def _show_resume_info(label, msgs, pct, messages_list):
+    def _show_resume_info(label, msgs, pct, messages_list, runtime_summary=None):
         print(f"\n  {_ansi(chr(27)+'[38;5;51m')}✦ Welcome back! Resumed {label}{C.RESET}")
         # Find last user message for context
         last_user_msg = ""
@@ -12384,6 +13461,44 @@ def main():
         if last_user_msg:
             info += f' | last: "{last_user_msg}"'
         print(f"  {_ansi(chr(27)+'[38;5;240m')}{info}{C.RESET}\n")
+        if runtime_summary:
+            phase = runtime_summary.get("last_known_phase") or "unknown"
+            plan_path = runtime_summary.get("active_plan_path")
+            latest_plan = os.path.basename(plan_path) if plan_path else None
+            verifier = runtime_summary.get("latest_verifier") or {}
+            lines = [f"  {_ansi(chr(27)+'[38;5;240m')}phase: {phase}{C.RESET}"]
+            if latest_plan:
+                lines.append(f"  {_ansi(chr(27)+'[38;5;240m')}active plan: {latest_plan}{C.RESET}")
+            if runtime_summary.get("pending_tasks"):
+                lines.append(
+                    f"  {_ansi(chr(27)+'[38;5;240m')}pending tasks: {runtime_summary['pending_tasks']}{C.RESET}"
+                )
+            if runtime_summary.get("running_jobs") or runtime_summary.get("orphaned_jobs"):
+                lines.append(
+                    f"  {_ansi(chr(27)+'[38;5;240m')}jobs: running {runtime_summary.get('running_jobs', 0)}, "
+                    f"orphaned {runtime_summary.get('orphaned_jobs', 0)}{C.RESET}"
+                )
+            if runtime_summary.get("latest_checkpoint"):
+                lines.append(
+                    f"  {_ansi(chr(27)+'[38;5;240m')}latest checkpoint: {runtime_summary['latest_checkpoint']}{C.RESET}"
+                )
+            if verifier:
+                summary = verifier.get("summary", "") or verifier.get("status", "")
+                lines.append(
+                    f"  {_ansi(chr(27)+'[38;5;240m')}last verifier: {verifier.get('status', 'unknown')} — "
+                    f"{summary[:80]}{C.RESET}"
+                )
+            recent_events = runtime_summary.get("recent_events") or []
+            if recent_events:
+                lines.append(
+                    f"  {_ansi(chr(27)+'[38;5;240m')}timeline: {recent_events[-1].get('message', '')[:80]}{C.RESET}"
+                )
+            if runtime_summary.get("resume_hint"):
+                lines.append(
+                    f"  {_ansi(chr(27)+'[38;5;240m')}next: {runtime_summary['resume_hint']}{C.RESET}"
+                )
+            if len(lines) > 1:
+                print("\n".join(lines) + "\n")
 
     # Resume session if requested
     if config.resume:
@@ -12391,7 +13506,9 @@ def main():
             if session.load(config.session_id):
                 msgs = len(session.messages)
                 pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
-                _show_resume_info(f"session: {config.session_id}", msgs, pct, session.messages)
+                _show_resume_info(
+                    f"session: {config.session_id}", msgs, pct, session.messages, session.get_resume_summary()
+                )
             else:
                 print(f"{C.RED}No saved session found with ID '{config.session_id}'.{C.RESET}")
                 print(f"{C.DIM}List sessions: python3 eve-coder.py --list-sessions{C.RESET}")
@@ -12404,7 +13521,9 @@ def main():
                 if session.load(project_sid):
                     msgs = len(session.messages)
                     pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
-                    _show_resume_info(f"project session: {project_sid}", msgs, pct, session.messages)
+                    _show_resume_info(
+                        f"project session: {project_sid}", msgs, pct, session.messages, session.get_resume_summary()
+                    )
                     resumed = True
             if not resumed:
                 # Fall back to latest session
@@ -12414,7 +13533,7 @@ def main():
                     if session.load(latest):
                         msgs = len(session.messages)
                         pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
-                        _show_resume_info(latest, msgs, pct, session.messages)
+                        _show_resume_info(latest, msgs, pct, session.messages, session.get_resume_summary())
                     else:
                         print(f"{C.YELLOW}Could not resume. Starting new session.{C.RESET}")
 
@@ -13441,6 +14560,11 @@ def main():
                 # ── Auto test toggle ─────────────────────────────────
                 elif cmd == "/autotest":
                     agent.auto_test.enabled = not agent.auto_test.enabled
+                    if session.runtime_state:
+                        session.runtime_state.update_runtime(
+                            autotest_enabled=agent.auto_test.enabled,
+                            updated_at=time.time(),
+                        )
                     state = f"{C.GREEN}ON{C.RESET}" if agent.auto_test.enabled else f"{C.RED}OFF{C.RESET}"
                     print(f"  Auto-test: {state}")
                     if agent.auto_test.enabled:
@@ -13456,9 +14580,19 @@ def main():
                 elif cmd == "/watch":
                     if agent.file_watcher.enabled:
                         agent.file_watcher.stop()
+                        if session.runtime_state:
+                            session.runtime_state.update_runtime(
+                                watcher_enabled=False,
+                                updated_at=time.time(),
+                            )
                         print(f"  File watcher: {C.RED}OFF{C.RESET}")
                     else:
                         agent.file_watcher.start()
+                        if session.runtime_state:
+                            session.runtime_state.update_runtime(
+                                watcher_enabled=True,
+                                updated_at=time.time(),
+                            )
                         n = len(agent.file_watcher._snapshots)
                         print(f"  File watcher: {C.GREEN}ON{C.RESET}")
                         print(f"  {C.DIM}Tracking {n} files. External changes will be reported to the AI.{C.RESET}")

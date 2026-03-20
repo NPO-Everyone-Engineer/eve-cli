@@ -330,7 +330,8 @@ PROFILE=auto
 | ファイル | 内容 |
 |---------|------|
 | `~/.config/eve-cli/config` | メイン設定 |
-| `~/.config/eve-cli/permissions.json` | ツール許可・拒否（自動保存） |
+| `~/.config/eve-cli/permissions.json` | グローバルなツール許可・拒否（自動保存） |
+| `.eve-cli/permissions.json` | プロジェクト単位の approval policy（tool / category / path ルール） |
 | `~/.config/eve-cli/memory/memory.json` | 長期メモリ |
 | `~/.config/eve-cli/hooks.json` | グローバルフック |
 | `~/.config/eve-cli/mcp.json` | MCP サーバー設定 |
@@ -338,3 +339,5 @@ PROFILE=auto
 | `~/.config/eve-cli/skills/*.md` | カスタムスキル |
 | `~/.config/eve-cli/trusted_repos.json` | 信頼済みリポジトリ |
 | `~/.config/eve-cli/trusted_hooks.json` | 信頼済みフック |
+
+`permissions.json` は従来の `{ "ToolName": "allow|deny" }` 形式に加えて、`tools` / `categories` / `paths` を持つ構造化形式も読めます。

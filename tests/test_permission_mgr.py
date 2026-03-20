@@ -31,6 +31,7 @@ def _make_config(tmpdir, yes_mode=False, rules=None):
     return SimpleNamespace(
         yes_mode=yes_mode,
         permissions_file=perm_file,
+        cwd=tmpdir,
     )
 
 
@@ -205,6 +206,61 @@ class TestPermissionMgrPersistentRules(unittest.TestCase):
         cfg = _make_config(self.tmpdir, rules={"WebFetch": "deny"})
         mgr = PermissionMgr(cfg)
         self.assertFalse(mgr.check("WebFetch", {}))
+
+
+class TestPermissionMgrStructuredPolicies(unittest.TestCase):
+    """Tests for project/global structured policy loading."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_project_path_rule_allows_write_without_prompt(self):
+        project_dir = os.path.join(self.tmpdir, ".eve-cli")
+        os.makedirs(project_dir, exist_ok=True)
+        with open(os.path.join(project_dir, "permissions.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "paths": [
+                    {"tool": "Write", "path": "docs/**", "decision": "allow"}
+                ]
+            }, f)
+        cfg = _make_config(self.tmpdir, yes_mode=False)
+        mgr = PermissionMgr(cfg)
+
+        allowed = mgr.check("Write", {"file_path": os.path.join(self.tmpdir, "docs", "note.txt")})
+        self.assertTrue(allowed)
+        self.assertIn("path rule allow", mgr.describe_last_decision())
+
+    def test_project_category_rule_denies_network(self):
+        project_dir = os.path.join(self.tmpdir, ".eve-cli")
+        os.makedirs(project_dir, exist_ok=True)
+        with open(os.path.join(project_dir, "permissions.json"), "w", encoding="utf-8") as f:
+            json.dump({"categories": {"network": "deny"}}, f)
+        cfg = _make_config(self.tmpdir, yes_mode=False)
+        mgr = PermissionMgr(cfg)
+
+        allowed = mgr.check("WebFetch", {"url": "https://example.com"})
+        self.assertFalse(allowed)
+        self.assertIn("category rule deny", mgr.describe_last_decision())
+
+    def test_policy_summary_counts_project_rules(self):
+        project_dir = os.path.join(self.tmpdir, ".eve-cli")
+        os.makedirs(project_dir, exist_ok=True)
+        with open(os.path.join(project_dir, "permissions.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "tools": {"WebFetch": "deny"},
+                "categories": {"network": "deny"},
+                "paths": [{"tool": "Write", "path": "docs/**", "decision": "allow"}],
+            }, f)
+        cfg = _make_config(self.tmpdir, yes_mode=False)
+        mgr = PermissionMgr(cfg)
+
+        summary = mgr.policy_summary()
+        self.assertEqual(summary["project_tool_rules"], 1)
+        self.assertEqual(summary["project_category_rules"], 1)
+        self.assertEqual(summary["project_path_rules"], 1)
 
 
 class TestPermissionMgrSessionAllowDeny(unittest.TestCase):
