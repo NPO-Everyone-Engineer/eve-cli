@@ -266,7 +266,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.8.0"
+__version__ = "2.8.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -12677,7 +12677,7 @@ class Agent:
 
     HARD_MAX_ITERATIONS = Config.HARD_MAX_AGENT_STEPS
     MAX_RETRIES = 2      # retries for malformed LLM responses
-    MAX_SAME_TOOL_REPEAT = 3  # prevent infinite same-tool loops
+    MAX_SAME_TOOL_REPEAT = 5  # prevent infinite same-tool loops (5 allows thinking models to re-verify)
     PARALLEL_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep"})  # read-only, no side effects
 
     # Tools allowed in plan mode (read-only exploration + task tracking)
@@ -12929,6 +12929,7 @@ class Agent:
         self._interrupted.clear()
         self._auto_fix_count = 0
         _recent_tool_calls = []  # track recent calls for loop detection
+        _loop_warned = False    # True after first loop warning sent to LLM
         _empty_retries = 0     # cap empty response retries
         _start_time = time.time()
 
@@ -13083,9 +13084,27 @@ class Agent:
                 if len(_recent_tool_calls) >= self.MAX_SAME_TOOL_REPEAT:
                     recent = _recent_tool_calls[-self.MAX_SAME_TOOL_REPEAT:]
                     if all(r == recent[0] for r in recent):
-                        _p(f"\n{C.YELLOW}AI が同じアクションを繰り返して停止しました。(The AI got stuck repeating the same action - Stopped){C.RESET}")
-                        _p(f"{C.DIM}Try rephrasing your request or asking for a different approach.{C.RESET}")
-                        break
+                        if not _loop_warned:
+                            # First detection: inject warning into conversation so LLM can self-correct
+                            _loop_warned = True
+                            _loop_tool_name = current_calls[0][0] if current_calls else "unknown"
+                            _warn_text = (
+                                f"[SYSTEM WARNING] You have called '{_loop_tool_name}' with the same "
+                                f"arguments {self.MAX_SAME_TOOL_REPEAT} times in a row. "
+                                "This looks like an infinite loop. Please stop repeating the same call, "
+                                "re-evaluate your approach, and either try a different tool/argument or "
+                                "report your findings to the user."
+                            )
+                            self.session.add_user_message(_warn_text)
+                            _recent_tool_calls.clear()
+                            if self.config.debug:
+                                print(f"{C.DIM}[debug] Loop detected — injecting warning into context{C.RESET}", file=sys.stderr)
+                            continue
+                        else:
+                            # Second detection after warning: give up
+                            _p(f"\n{C.YELLOW}AI が同じアクションを繰り返して停止しました。(The AI got stuck repeating the same action - Stopped){C.RESET}")
+                            _p(f"{C.DIM}Try rephrasing your request or asking for a different approach.{C.RESET}")
+                            break
                 if len(_recent_tool_calls) > 10:
                     _recent_tool_calls = _recent_tool_calls[-10:]
 
