@@ -48,6 +48,9 @@ from datetime import datetime
 import collections
 import concurrent.futures
 import shlex
+import http.server
+import hmac
+import queue as _queue_mod
 
 # 言語設定グローバル変数
 _LANG = None  # 'ja' or 'en' (None = auto-detect)
@@ -263,7 +266,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.5.1"
+__version__ = "2.7.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1226,6 +1229,10 @@ class Config:
         self.learn_auto_explain = True  # auto-explain on errors
         self.ui_theme = "normal"  # UI theme: normal, gal, dandy, bushi
 
+        # Channels
+        self.channels = []  # list of enabled channel names e.g. ["webhook", "discord"]
+        self.channels_port = int(os.environ.get("EVE_CHANNELS_PORT", "8788"))
+
         # Paths (primary: eve-cli, with backward compat for old eve-coder dirs)
         if os.name == "nt":
             appdata = os.environ.get("LOCALAPPDATA",
@@ -1492,6 +1499,8 @@ class Config:
         # UI Theme
         parser.add_argument("--theme", choices=["normal", "gal", "dandy", "bushi"], default=None,
                             help=t('help.theme', default="UI theme: normal, gal, dandy, bushi (default: normal)"))
+        parser.add_argument("--channels", default="", metavar="NAMES",
+                            help="Enable external channels (comma-separated): webhook, discord, slack")
         args = parser.parse_args(argv)
 
         if args.prompt:
@@ -1584,6 +1593,9 @@ class Config:
         else:
             # Default theme (normal) - ensure it's applied
             C.apply_theme("normal")
+        # Channels
+        if args.channels:
+            self.channels = [c.strip().lower() for c in args.channels.split(",") if c.strip()]
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -8497,6 +8509,753 @@ class AgentTeam:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Channels — external message ingestion (webhook / Discord / Slack)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class ChannelMessage:
+    """A message received from an external channel."""
+
+    def __init__(self, channel, sender_id, sender_name, content,
+                 reply_target="", raw=None):
+        self.id = uuid.uuid4().hex[:12]
+        self.channel = channel          # "webhook" | "discord" | "slack"
+        self.sender_id = sender_id      # platform-specific user ID
+        self.sender_name = sender_name  # display name
+        self.content = content          # message text (≤4000 chars)
+        self.reply_target = reply_target  # where to send the reply
+        self.raw = raw or {}
+        self.received_at = time.time()
+
+    def __repr__(self):
+        return (f"<ChannelMessage channel={self.channel!r} "
+                f"sender={self.sender_name!r} content={self.content[:40]!r}>")
+
+
+class BaseChannelAdapter(ABC):
+    """Base class for all channel adapters."""
+
+    def __init__(self):
+        self._queue = None           # injected by ChannelManager
+        self._stop_event = threading.Event()
+
+    @property
+    def name(self):
+        return "base"
+
+    def start(self):
+        """Start the adapter (launch polling thread etc.)."""
+
+    def stop(self):
+        """Stop the adapter cleanly."""
+        self._stop_event.set()
+
+    @abstractmethod
+    def send(self, msg, content):
+        """Send a reply back through this channel."""
+
+    def _enqueue(self, ch_msg):
+        if self._queue is not None:
+            self._queue.put(ch_msg)
+
+
+# ── WebhookAdapter ────────────────────────────────────────────────────────────
+
+class WebhookAdapter(BaseChannelAdapter):
+    """
+    Receives messages via HTTP POST to /webhook.
+
+    Expected JSON body:
+      {
+        "content":      "message text",
+        "sender_id":    "user-id",        (optional, default: "webhook")
+        "sender_name":  "Display Name",   (optional, default: "webhook")
+        "callback_url": "http://..."      (optional, for reply delivery)
+      }
+
+    Optional request header for API key auth:
+      Authorization: Bearer <api_key>
+    """
+
+    def __init__(self, api_key=""):
+        super().__init__()
+        self._api_key = api_key
+
+    @property
+    def name(self):
+        return "webhook"
+
+    def handle_request(self, headers, body):
+        """
+        Called by ChannelServer when POST /webhook arrives.
+        Returns (status_code, response_body_str).
+        """
+        if self._api_key:
+            auth = headers.get("authorization", "")
+            if auth != f"Bearer {self._api_key}":
+                return 403, json.dumps({"error": "Unauthorized"})
+
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, AttributeError):
+            return 400, json.dumps({"error": "Invalid JSON"})
+
+        content = str(data.get("content", "")).strip()
+        if not content:
+            return 400, json.dumps({"error": "Missing 'content' field"})
+
+        sender_id = str(data.get("sender_id", "webhook"))[:128]
+        sender_name = str(data.get("sender_name", "webhook"))[:128]
+        callback_url = str(data.get("callback_url", ""))
+        content = content[:4000]
+
+        msg = ChannelMessage(
+            channel="webhook",
+            sender_id=sender_id,
+            sender_name=sender_name,
+            content=content,
+            reply_target=callback_url,
+            raw=data,
+        )
+        self._enqueue(msg)
+        return 200, json.dumps({"ok": True, "id": msg.id})
+
+    def send(self, msg, content):
+        """POST reply to callback_url if provided."""
+        url = msg.reply_target
+        if not url:
+            return
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return
+        try:
+            body = json.dumps(
+                {"content": content, "in_reply_to": msg.id},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass  # best-effort delivery
+
+
+# ── DiscordAdapter ────────────────────────────────────────────────────────────
+
+class DiscordAdapter(BaseChannelAdapter):
+    """
+    Polls Discord REST API for new messages every POLL_INTERVAL seconds.
+
+    Receive: GET /api/v10/channels/{id}/messages?after={last_id}&limit=10
+    Send:    POST /api/v10/channels/{id}/messages (auto-split at 1900 chars)
+
+    Pairing flow:
+      1. Unknown sender DMs the bot → bot replies with a 6-digit pairing code
+      2. User runs /discord:pair <code> in eve-cli → sender added to allowlist
+
+    Configuration (.eve-cli/channels/discord/.env):
+      DISCORD_BOT_TOKEN=<token>
+      DISCORD_CHANNEL_IDS=<id1>,<id2>   (comma-separated channel IDs to monitor)
+    """
+
+    BASE_URL = "https://discord.com/api/v10"
+    POLL_INTERVAL = 3   # seconds between polls
+    MAX_MSG_LEN = 1900  # Discord hard limit is 2000; leave margin
+
+    def __init__(self, token, channel_ids):
+        super().__init__()
+        self._token = token
+        self._channel_ids = list(channel_ids)
+        self._last_ids = {}       # channel_id -> last processed message_id
+        self._bot_user_id = None  # own ID, to skip self-messages
+        self._allowlist = set()   # synced from ChannelManager
+        self._pending_pairs = {}  # user_id -> pairing_code
+        self._thread = None
+
+    @property
+    def name(self):
+        return "discord"
+
+    def notify_allowed_senders(self, senders):
+        """Called by ChannelManager when the allowlist changes."""
+        self._allowlist = set(senders)
+
+    def start(self):
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+
+    # ── REST helpers ──────────────────────────────────────────────────────────
+
+    def _api(self, method, path, data=None):
+        """Make a Discord REST request. Returns (ok: bool, body: dict|list)."""
+        url = f"{self.BASE_URL}{path}"
+        headers = {
+            "Authorization": f"Bot {self._token}",
+            "Content-Type": "application/json",
+            "User-Agent": "EvECLIChannels/1.0",
+        }
+        try:
+            body = json.dumps(data, ensure_ascii=False).encode() if data else None
+            req = urllib.request.Request(url, data=body, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return True, json.loads(resp.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as e:
+            try:
+                return False, json.loads(e.read().decode("utf-8", errors="replace"))
+            except Exception:
+                return False, {"message": str(e)}
+        except Exception as e:
+            return False, {"message": str(e)}
+
+    # ── Polling ───────────────────────────────────────────────────────────────
+
+    def _poll_loop(self):
+        # Fetch own user ID so we can skip self-messages
+        ok, data = self._api("GET", "/users/@me")
+        if ok:
+            self._bot_user_id = data.get("id")
+
+        # Initialize watermarks: skip all historical messages
+        for ch_id in self._channel_ids:
+            if ch_id not in self._last_ids:
+                ok, msgs = self._api("GET", f"/channels/{ch_id}/messages?limit=1")
+                self._last_ids[ch_id] = msgs[0]["id"] if (ok and msgs) else "0"
+
+        while not self._stop_event.is_set():
+            for ch_id in self._channel_ids:
+                try:
+                    self._poll_channel(ch_id)
+                except Exception:
+                    pass
+            self._stop_event.wait(self.POLL_INTERVAL)
+
+    def _poll_channel(self, channel_id):
+        after = self._last_ids.get(channel_id, "0")
+        ok, data = self._api("GET",
+                             f"/channels/{channel_id}/messages?limit=10&after={after}")
+        if not ok or not isinstance(data, list):
+            return
+        # Discord returns newest-first; reverse for chronological processing
+        for msg in reversed(data):
+            msg_id = msg.get("id", "")
+            if not msg_id:
+                continue
+            self._last_ids[channel_id] = msg_id  # always advance watermark
+
+            author = msg.get("author", {})
+            author_id = author.get("id", "")
+            # Skip own messages and non-default message types
+            if author_id == self._bot_user_id or msg.get("type", 0) != 0:
+                continue
+            content = msg.get("content", "").strip()
+            if not content:
+                continue
+
+            # Unknown sender → send pairing code
+            if author_id not in self._allowlist:
+                code = self._make_pair_code(author_id)
+                self._send_raw(channel_id,
+                               f"\U0001f510 Pairing code: **{code}**\n"
+                               f"In eve-cli run: `/discord:pair {code}`")
+                continue
+
+            self._enqueue(ChannelMessage(
+                channel="discord",
+                sender_id=author_id,
+                sender_name=author.get("username", author_id),
+                content=content[:4000],
+                reply_target=channel_id,
+                raw=msg,
+            ))
+
+    # ── Pairing ───────────────────────────────────────────────────────────────
+
+    def _make_pair_code(self, user_id):
+        import random as _r
+        code = str(_r.randint(100000, 999999))
+        self._pending_pairs[user_id] = code
+        return code
+
+    def confirm_pair(self, code):
+        """Return sender_id if code matches a pending pairing request."""
+        for uid, stored in list(self._pending_pairs.items()):
+            if stored == code:
+                del self._pending_pairs[uid]
+                return uid
+        return None
+
+    # ── Send ──────────────────────────────────────────────────────────────────
+
+    def send(self, msg, content):
+        if msg.reply_target:
+            self._send_raw(msg.reply_target, content)
+
+    def _send_raw(self, channel_id, content):
+        for chunk in self._split(content):
+            self._api("POST", f"/channels/{channel_id}/messages", {"content": chunk})
+            time.sleep(0.3)  # rate-limit safety
+
+    def _split(self, content):
+        if len(content) <= self.MAX_MSG_LEN:
+            return [content]
+        chunks = []
+        while content:
+            if len(content) <= self.MAX_MSG_LEN:
+                chunks.append(content)
+                break
+            split_at = content.rfind("\n", 0, self.MAX_MSG_LEN)
+            if split_at <= 0:
+                split_at = self.MAX_MSG_LEN
+            chunks.append(content[:split_at])
+            content = content[split_at:].lstrip("\n")
+        return chunks
+
+
+# ── SlackAdapter ──────────────────────────────────────────────────────────────
+
+class SlackAdapter(BaseChannelAdapter):
+    """
+    Receives Slack Events API webhooks via ChannelServer POST /webhook/slack.
+    Sends replies via Slack Web API chat.postMessage (thread replies).
+
+    Security: HMAC-SHA256 signature verification on every incoming request.
+    Unknown senders receive a DM telling them to contact the admin.
+
+    Configuration (.eve-cli/channels/slack/.env):
+      SLACK_BOT_TOKEN=xoxb-xxx
+      SLACK_SIGNING_SECRET=xxx
+    """
+
+    SLACK_API = "https://slack.com/api"
+    MAX_MSG_LEN = 2900  # Slack block text limit is 3000; leave margin
+
+    def __init__(self, bot_token, signing_secret):
+        super().__init__()
+        self._token = bot_token
+        _sec = signing_secret if isinstance(signing_secret, bytes) else signing_secret.encode("utf-8")
+        self._secret = _sec
+        self._allowlist = set()   # synced from ChannelManager
+
+    @property
+    def name(self):
+        return "slack"
+
+    def notify_allowed_senders(self, senders):
+        self._allowlist = set(senders)
+
+    def handle_webhook(self, headers, body):
+        """
+        Called by ChannelServer for POST /webhook/slack.
+        Returns (status_code, response_body_str).
+        """
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace"))
+        except Exception:
+            return 400, json.dumps({"error": "Invalid JSON"})
+
+        # URL verification handshake must be handled before signature check
+        # (Slack sends this when you first configure the Events API endpoint)
+        if data.get("type") == "url_verification":
+            return 200, json.dumps({"challenge": data.get("challenge", "")})
+
+        # Verify HMAC-SHA256 signature for all other events
+        if self._secret and not self._verify(headers, body):
+            return 403, json.dumps({"error": "Invalid signature"})
+
+        # Process message events
+        event = data.get("event", {})
+        ev_type = event.get("type", "")
+        if ev_type == "message" and not event.get("subtype"):
+            user_id = event.get("user", "")
+            text = event.get("text", "").strip()
+            channel = event.get("channel", "")
+            ts = event.get("ts", "")
+            if user_id and text and channel:
+                if user_id not in self._allowlist:
+                    self._post(channel,
+                               "\u26d4 Not authorized. "
+                               "Ask an admin to run `/slack:allow` with your user ID.",
+                               thread_ts=ts)
+                else:
+                    self._enqueue(ChannelMessage(
+                        channel="slack",
+                        sender_id=user_id,
+                        sender_name=event.get("username", user_id),
+                        content=text[:4000],
+                        reply_target=f"{channel}:{ts}",
+                        raw=event,
+                    ))
+        return 200, json.dumps({"ok": True})
+
+    # ── Signature verification ────────────────────────────────────────────────
+
+    def _verify(self, headers, body):
+        ts = headers.get("x-slack-request-timestamp", "")
+        sig = headers.get("x-slack-signature", "")
+        if not ts or not sig:
+            return False
+        # Reject requests older than 5 minutes (replay attack prevention)
+        try:
+            if abs(time.time() - float(ts)) > 300:
+                return False
+        except (ValueError, TypeError):
+            return False
+        base = f"v0:{ts}:{body.decode('utf-8', errors='replace')}".encode("utf-8")
+        expected = "v0=" + hmac.new(self._secret, base, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, sig)
+
+    # ── Send ──────────────────────────────────────────────────────────────────
+
+    def send(self, msg, content):
+        parts = msg.reply_target.split(":", 1) if msg.reply_target else ["", ""]
+        channel = parts[0]
+        thread_ts = parts[1] if len(parts) > 1 else None
+        if not channel:
+            return
+        for chunk in self._split(content):
+            self._post(channel, chunk, thread_ts=thread_ts)
+            thread_ts = None  # subsequent chunks go to channel, not thread
+
+    def _post(self, channel, text, thread_ts=None):
+        payload = {"channel": channel, "text": text}
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
+        try:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.SLACK_API}/chat.postMessage",
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {self._token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+
+    def _split(self, content):
+        if len(content) <= self.MAX_MSG_LEN:
+            return [content]
+        chunks = []
+        while content:
+            if len(content) <= self.MAX_MSG_LEN:
+                chunks.append(content)
+                break
+            split_at = content.rfind("\n", 0, self.MAX_MSG_LEN)
+            if split_at <= 0:
+                split_at = self.MAX_MSG_LEN
+            chunks.append(content[:split_at])
+            content = content[split_at:].lstrip("\n")
+        return chunks
+
+
+# ── ChannelServer ─────────────────────────────────────────────────────────────
+
+class _ChannelRequestHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP request handler for the channel webhook server."""
+
+    _webhook_adapter = None  # injected by ChannelServer
+    _slack_adapter = None    # injected by ChannelServer
+
+    def log_message(self, fmt, *args):
+        pass  # silence default access log
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._respond(200, b'{"status":"ok"}')
+        else:
+            self._respond(404, b'{"error":"Not Found"}')
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length > 0 else b""
+        hdrs = {k.lower(): v for k, v in self.headers.items()}
+        if self.path in ("/webhook", "/webhook/"):
+            if self._webhook_adapter is not None:
+                status, resp = self._webhook_adapter.handle_request(hdrs, body)
+                self._respond(status, resp.encode("utf-8"))
+            else:
+                self._respond(503, b'{"error":"Webhook adapter not configured"}')
+        elif self.path in ("/webhook/slack", "/webhook/slack/"):
+            if self._slack_adapter is not None:
+                status, resp = self._slack_adapter.handle_webhook(hdrs, body)
+                self._respond(status, resp.encode("utf-8"))
+            else:
+                self._respond(503, b'{"error":"Slack adapter not configured"}')
+        else:
+            self._respond(404, b'{"error":"Not Found"}')
+
+    def _respond(self, status, body):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class ChannelServer(threading.Thread):
+    """
+    Lightweight HTTP server for receiving channel webhooks.
+    Binds to 127.0.0.1 only — never exposed to external networks.
+    """
+
+    def __init__(self, port, webhook_adapter=None, slack_adapter=None):
+        super().__init__(daemon=True)
+        self._port = port
+        self._webhook_adapter = webhook_adapter
+        self._slack_adapter = slack_adapter
+        self._server = None
+
+    def run(self):
+        webhook_adapter = self._webhook_adapter
+        slack_adapter = self._slack_adapter
+
+        class Handler(_ChannelRequestHandler):
+            _webhook_adapter = webhook_adapter
+            _slack_adapter = slack_adapter
+
+        try:
+            self._server = http.server.HTTPServer(("127.0.0.1", self._port), Handler)
+            self._server.serve_forever()
+        except OSError as e:
+            _scroll_aware_print(
+                f"{C.YELLOW}[channels] HTTP server failed on port {self._port}: {e}{C.RESET}"
+            )
+
+    def stop(self):
+        if self._server:
+            self._server.shutdown()
+
+
+# ── ChannelManager ────────────────────────────────────────────────────────────
+
+class ChannelManager:
+    """
+    Manages all channel adapters and provides a unified message queue.
+    Handles sender allowlists and reply routing.
+    """
+
+    def __init__(self, config, adapters):
+        self._config = config
+        self._adapters = {a.name: a for a in adapters}
+        self._queue = _queue_mod.Queue()
+        self._server = None
+        self._allowlists = {}  # channel_name -> set of sender_ids
+        self._policy = {}      # channel_name -> "allowlist" | "open"
+        self._load_allowlists()
+        for adapter in adapters:
+            adapter._queue = self._queue
+
+    # ── Allowlist management ──────────────────────────────────────────────────
+
+    def _channels_dir(self):
+        return os.path.join(self._config.cwd, ".eve-cli", "channels")
+
+    def _allowlist_path(self, channel_name):
+        return os.path.join(self._channels_dir(), channel_name, "allowlist.json")
+
+    def _load_allowlists(self):
+        for name in self._adapters:
+            path = self._allowlist_path(name)
+            try:
+                if os.path.isfile(path) and not os.path.islink(path):
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        data = json.load(f)
+                    self._allowlists[name] = set(data.get("senders", []))
+                    self._policy[name] = data.get("policy", "allowlist")
+                else:
+                    self._allowlists[name] = set()
+                    self._policy[name] = "allowlist"
+            except Exception:
+                self._allowlists[name] = set()
+                self._policy[name] = "allowlist"
+        # Sync loaded allowlists to adapters that need them (Discord, Slack)
+        self._sync_adapter_allowlists()
+
+    def _sync_adapter_allowlists(self):
+        """Push current allowlists into adapters that support notify_allowed_senders."""
+        for name, adapter in self._adapters.items():
+            if hasattr(adapter, "notify_allowed_senders"):
+                adapter.notify_allowed_senders(self._allowlists.get(name, set()))
+
+    def _save_allowlist(self, channel_name):
+        path = self._allowlist_path(channel_name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = {
+            "senders": sorted(self._allowlists.get(channel_name, set())),
+            "policy": self._policy.get(channel_name, "allowlist"),
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+        # Keep adapter in sync
+        adapter = self._adapters.get(channel_name)
+        if adapter and hasattr(adapter, "notify_allowed_senders"):
+            adapter.notify_allowed_senders(self._allowlists.get(channel_name, set()))
+
+    def is_allowed(self, msg):
+        """Return True if this sender is allowed to push messages."""
+        policy = self._policy.get(msg.channel, "allowlist")
+        if policy == "open":
+            return True
+        return msg.sender_id in self._allowlists.get(msg.channel, set())
+
+    def add_sender(self, channel_name, sender_id):
+        self._allowlists.setdefault(channel_name, set()).add(sender_id)
+        self._save_allowlist(channel_name)
+
+    def remove_sender(self, channel_name, sender_id):
+        self._allowlists.get(channel_name, set()).discard(sender_id)
+        self._save_allowlist(channel_name)
+
+    def set_policy(self, channel_name, policy):
+        if policy not in ("allowlist", "open"):
+            raise ValueError(f"Invalid policy: {policy!r}")
+        self._policy[channel_name] = policy
+        self._save_allowlist(channel_name)
+
+    def confirm_pair(self, channel_name, code):
+        """
+        Confirm a pairing code from /discord:pair or similar commands.
+        Returns the sender_id on success, None on failure.
+        """
+        adapter = self._adapters.get(channel_name)
+        if adapter and hasattr(adapter, "confirm_pair"):
+            sender_id = adapter.confirm_pair(code)
+            if sender_id:
+                self.add_sender(channel_name, sender_id)
+                return sender_id
+        return None
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self):
+        webhook_adapter = self._adapters.get("webhook")
+        slack_adapter = self._adapters.get("slack")
+        self._server = ChannelServer(
+            self._config.channels_port,
+            webhook_adapter=webhook_adapter,
+            slack_adapter=slack_adapter,
+        )
+        self._server.start()
+        for adapter in self._adapters.values():
+            adapter.start()
+
+    def stop(self):
+        for adapter in self._adapters.values():
+            adapter.stop()
+        if self._server:
+            self._server.stop()
+
+    # ── Message I/O ───────────────────────────────────────────────────────────
+
+    def get_message(self):
+        """Get next pending message (non-blocking). Returns None if empty."""
+        try:
+            return self._queue.get_nowait()
+        except Exception:
+            return None
+
+    def send_reply(self, msg, content):
+        adapter = self._adapters.get(msg.channel)
+        if adapter:
+            try:
+                adapter.send(msg, content)
+            except Exception:
+                pass
+
+    def status(self):
+        result = {}
+        for name in self._adapters:
+            result[name] = {
+                "policy": self._policy.get(name, "allowlist"),
+                "senders": sorted(self._allowlists.get(name, set())),
+            }
+        result["port"] = self._config.channels_port
+        return result
+
+
+def _build_channel_manager(config):
+    """Create a ChannelManager from config.channels. Returns None if disabled."""
+    if not config.channels:
+        return None
+    adapters = []
+    for name in config.channels:
+        if name == "webhook":
+            api_key = _load_channel_env(config, "webhook").get("WEBHOOK_API_KEY", "")
+            adapters.append(WebhookAdapter(api_key=api_key))
+        elif name == "discord":
+            env = _load_channel_env(config, "discord")
+            token = env.get("DISCORD_BOT_TOKEN", "")
+            ch_ids_raw = env.get("DISCORD_CHANNEL_IDS", "")
+            ch_ids = [c.strip() for c in ch_ids_raw.split(",") if c.strip()]
+            if not token:
+                print(f"{C.YELLOW}[channels] Discord: DISCORD_BOT_TOKEN not set. "
+                      f"Run /discord:configure <token> <channel_ids>{C.RESET}")
+            elif not ch_ids:
+                print(f"{C.YELLOW}[channels] Discord: DISCORD_CHANNEL_IDS not set. "
+                      f"Run /discord:configure <token> <channel_ids>{C.RESET}")
+            else:
+                adapters.append(DiscordAdapter(token=token, channel_ids=ch_ids))
+        elif name == "slack":
+            env = _load_channel_env(config, "slack")
+            token = env.get("SLACK_BOT_TOKEN", "")
+            secret = env.get("SLACK_SIGNING_SECRET", "")
+            if not token or not secret:
+                print(f"{C.YELLOW}[channels] Slack: SLACK_BOT_TOKEN or SLACK_SIGNING_SECRET not set. "
+                      f"Run /slack:configure <token> <signing_secret>{C.RESET}")
+            else:
+                adapters.append(SlackAdapter(bot_token=token, signing_secret=secret))
+        else:
+            print(f"{C.YELLOW}[channels] Unknown channel: {name!r} (skipped){C.RESET}")
+    if not adapters:
+        return None
+    return ChannelManager(config, adapters)
+
+
+def _load_channel_env(config, channel_name):
+    """Load .eve-cli/channels/{name}/.env file. Returns dict of key->value."""
+    env_path = os.path.join(config.cwd, ".eve-cli", "channels", channel_name, ".env")
+    result = {}
+    if not os.path.isfile(env_path) or os.path.islink(env_path):
+        return result
+    try:
+        with open(env_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                result[k.strip()] = v.strip().strip("\"'")
+    except OSError:
+        pass
+    return result
+
+
+def _save_channel_env(config, channel_name, key, value):
+    """Upsert a key=value entry in .eve-cli/channels/{name}/.env."""
+    env_dir = os.path.join(config.cwd, ".eve-cli", "channels", channel_name)
+    os.makedirs(env_dir, exist_ok=True)
+    env_path = os.path.join(env_dir, ".env")
+    existing = _load_channel_env(config, channel_name)
+    existing[key] = value
+    try:
+        with open(env_path, "w", encoding="utf-8") as f:
+            for k, v in existing.items():
+                f.write(f"{k}={v}\n")
+        os.chmod(env_path, 0o600)
+    except OSError:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Tool Registry
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -13438,6 +14197,19 @@ def main():
     agent = Agent(config, client, registry, permissions, session, tui,
                   rag_engine=_rag_engine, hook_mgr=hook_mgr)
 
+    # Initialize Channels (if --channels flag was given)
+    channel_manager = _build_channel_manager(config)
+    if channel_manager:
+        channel_manager.start()
+        _c51 = _ansi(chr(27) + '[38;5;51m')
+        _c240 = _ansi(chr(27) + '[38;5;240m')
+        _ch_names = ", ".join(config.channels)
+        print(f"  {_c51}⚡ Channels enabled:{C.RESET} {_ch_names}")
+        if "webhook" in config.channels:
+            print(f"  {_c240}Webhook listening on http://127.0.0.1:{config.channels_port}/webhook{C.RESET}")
+        print()
+        atexit.register(channel_manager.stop)
+
     # Handle Ctrl+C gracefully
     def signal_handler(sig, frame):
         agent.interrupt()
@@ -13674,6 +14446,29 @@ def main():
 
     while True:
         try:
+            # ── Channel message polling (non-blocking) ────────────────────────
+            if channel_manager:
+                _ch_msg = channel_manager.get_message()
+                if _ch_msg:
+                    if not channel_manager.is_allowed(_ch_msg):
+                        channel_manager.send_reply(_ch_msg, "Unauthorized sender.")
+                        _scroll_aware_print(
+                            f"  {C.YELLOW}[channels] Rejected unauthorized sender "
+                            f"'{_ch_msg.sender_id}' on {_ch_msg.channel}{C.RESET}"
+                        )
+                    else:
+                        _ch_color = _ansi(chr(27) + '[38;5;198m')
+                        _scroll_aware_print(
+                            f"\n  {_ch_color}⚡ [{_ch_msg.channel.upper()}:{_ch_msg.sender_name}]{C.RESET} "
+                            f"{_ch_msg.content[:120]}\n"
+                        )
+                        _ch_input = (f"[Channel:{_ch_msg.channel.upper()} from {_ch_msg.sender_name}] "
+                                     f"{_ch_msg.content}")
+                        agent.run(_ch_input)
+                        _ch_reply = agent.get_last_output()
+                        channel_manager.send_reply(_ch_msg, _ch_reply)
+                    continue
+
             user_input = tui.get_multiline_input(
                 session=session, plan_mode=agent._plan_mode,
             )
@@ -15134,6 +15929,203 @@ Review this code for:
                         # Store in session for restoration
                         session._custom_command_tools_override = _orig_tools
 
+                # ── Channel commands ──────────────────────────────────
+                elif cmd == "/channels":
+                    _parts = user_input.split(None, 1)
+                    _sub = _parts[1].strip().lower() if len(_parts) > 1 else ""
+                    _c51 = _ansi(chr(27) + '[38;5;51m')
+                    _c87 = _ansi(chr(27) + '[38;5;87m')
+                    _c240 = _ansi(chr(27) + '[38;5;240m')
+                    if _sub == "stop":
+                        if channel_manager:
+                            channel_manager.stop()
+                            channel_manager = None
+                            print(f"  {C.GREEN}Channels stopped.{C.RESET}")
+                        else:
+                            print(f"  {C.DIM}Channels are not running.{C.RESET}")
+                    elif _sub.startswith("allow "):
+                        # /channels allow <channel_name> <sender_id>
+                        _allow_parts = _sub.split(None, 2)
+                        if len(_allow_parts) == 3:
+                            _ch_n, _sid = _allow_parts[1], _allow_parts[2]
+                            if channel_manager:
+                                channel_manager.add_sender(_ch_n, _sid)
+                                print(f"  {C.GREEN}Added '{_sid}' to {_ch_n} allowlist.{C.RESET}")
+                            else:
+                                print(f"  {C.YELLOW}Channels not running. Start with --channels.{C.RESET}")
+                        else:
+                            print(f"  {C.YELLOW}Usage: /channels allow <channel_name> <sender_id>{C.RESET}")
+                    elif _sub.startswith("deny "):
+                        _deny_parts = _sub.split(None, 2)
+                        if len(_deny_parts) == 3:
+                            _ch_n, _sid = _deny_parts[1], _deny_parts[2]
+                            if channel_manager:
+                                channel_manager.remove_sender(_ch_n, _sid)
+                                print(f"  {C.GREEN}Removed '{_sid}' from {_ch_n} allowlist.{C.RESET}")
+                            else:
+                                print(f"  {C.YELLOW}Channels not running.{C.RESET}")
+                        else:
+                            print(f"  {C.YELLOW}Usage: /channels deny <channel_name> <sender_id>{C.RESET}")
+                    else:
+                        # Default: show status
+                        if channel_manager:
+                            st = channel_manager.status()
+                            port = st.pop("port", config.channels_port)
+                            print(f"\n  {_c51}⚡ Channels Status{C.RESET}")
+                            print(f"  {_c240}HTTP server: http://127.0.0.1:{port}{C.RESET}")
+                            for _ch_n, _info in st.items():
+                                _policy = _info["policy"]
+                                _senders = _info["senders"]
+                                _s_str = (f"{len(_senders)} senders"
+                                          if _senders else "no senders (all blocked)")
+                                print(f"  {_c87}{_ch_n}{C.RESET}  policy={_policy}  {_s_str}")
+                                for _s in _senders[:5]:
+                                    print(f"    {_c240}- {_s}{C.RESET}")
+                                if len(_senders) > 5:
+                                    print(f"    {_c240}  ... +{len(_senders)-5} more{C.RESET}")
+                            print(f"\n  {_c240}/channels allow <name> <sender_id>  — add to allowlist")
+                            print(f"  /channels deny  <name> <sender_id>  — remove from allowlist")
+                            print(f"  /channels stop                       — stop all channels{C.RESET}\n")
+                        else:
+                            print(f"  {C.DIM}Channels not running. Start with: eve-cli --channels webhook{C.RESET}")
+                            print(f"  {_c240}Available channels: webhook, discord (Phase 2), slack (Phase 3){C.RESET}")
+                    continue
+
+                elif cmd == "/webhook:configure":
+                    _parts = user_input.split(None, 1)
+                    _api_key = _parts[1].strip() if len(_parts) > 1 else ""
+                    _save_channel_env(config, "webhook", "WEBHOOK_API_KEY", _api_key)
+                    if _api_key:
+                        print(f"  {C.GREEN}Webhook API key saved to .eve-cli/channels/webhook/.env{C.RESET}")
+                        print(f"  {C.DIM}Restart with --channels webhook to apply.{C.RESET}")
+                    else:
+                        print(f"  {C.GREEN}Webhook API key cleared (no auth required).{C.RESET}")
+                    continue
+
+                elif cmd == "/discord:configure":
+                    # /discord:configure <bot_token> [channel_id1,channel_id2,...]
+                    _parts = user_input.split(None, 2)
+                    if len(_parts) < 2:
+                        print(f"  {C.YELLOW}Usage: /discord:configure <bot_token> [channel_ids]{C.RESET}")
+                        print(f"  {C.DIM}channel_ids: comma-separated Discord channel IDs to monitor{C.RESET}")
+                        continue
+                    _tok = _parts[1].strip()
+                    _cids = _parts[2].strip() if len(_parts) > 2 else ""
+                    _save_channel_env(config, "discord", "DISCORD_BOT_TOKEN", _tok)
+                    if _cids:
+                        _save_channel_env(config, "discord", "DISCORD_CHANNEL_IDS", _cids)
+                    print(f"  {C.GREEN}Discord bot token saved.{C.RESET}")
+                    if _cids:
+                        print(f"  {C.GREEN}Channel IDs: {_cids}{C.RESET}")
+                    print(f"  {C.DIM}Restart with --channels discord to activate.{C.RESET}")
+                    continue
+
+                elif cmd == "/discord:pair":
+                    _parts = user_input.split(None, 1)
+                    _code = _parts[1].strip() if len(_parts) > 1 else ""
+                    if not _code:
+                        print(f"  {C.YELLOW}Usage: /discord:pair <6-digit-code>{C.RESET}")
+                        continue
+                    if channel_manager:
+                        _sid = channel_manager.confirm_pair("discord", _code)
+                        if _sid:
+                            print(f"  {C.GREEN}Discord pairing confirmed! Sender '{_sid}' added to allowlist.{C.RESET}")
+                        else:
+                            print(f"  {C.RED}Invalid or expired pairing code: {_code}{C.RESET}")
+                            print(f"  {C.DIM}DM your bot again to receive a new code.{C.RESET}")
+                    else:
+                        print(f"  {C.YELLOW}Channels not running. Start with --channels discord.{C.RESET}")
+                    continue
+
+                elif cmd == "/discord:access":
+                    _parts = user_input.split(None, 2)
+                    _sub = _parts[1].strip().lower() if len(_parts) > 1 else ""
+                    _val = _parts[2].strip().lower() if len(_parts) > 2 else ""
+                    if _sub == "policy" and _val in ("allowlist", "open"):
+                        if channel_manager:
+                            channel_manager.set_policy("discord", _val)
+                            print(f"  {C.GREEN}Discord access policy: {_val}{C.RESET}")
+                        else:
+                            print(f"  {C.YELLOW}Channels not running.{C.RESET}")
+                    else:
+                        print(f"  {C.YELLOW}Usage: /discord:access policy <allowlist|open>{C.RESET}")
+                    continue
+
+                elif cmd == "/slack:configure":
+                    # /slack:configure <bot_token> <signing_secret>
+                    _parts = user_input.split(None, 2)
+                    if len(_parts) < 3:
+                        print(f"  {C.YELLOW}Usage: /slack:configure <bot_token> <signing_secret>{C.RESET}")
+                        print(f"  {C.DIM}bot_token: xoxb-xxx from Slack app settings{C.RESET}")
+                        print(f"  {C.DIM}signing_secret: from Slack app Basic Information page{C.RESET}")
+                        continue
+                    _tok = _parts[1].strip()
+                    _sec = _parts[2].strip()
+                    _save_channel_env(config, "slack", "SLACK_BOT_TOKEN", _tok)
+                    _save_channel_env(config, "slack", "SLACK_SIGNING_SECRET", _sec)
+                    print(f"  {C.GREEN}Slack credentials saved to .eve-cli/channels/slack/.env{C.RESET}")
+                    print(f"  {C.DIM}Set Events API Request URL to: http://your-host:{config.channels_port}/webhook/slack{C.RESET}")
+                    print(f"  {C.DIM}Restart with --channels slack to activate.{C.RESET}")
+                    continue
+
+                elif cmd == "/slack:allow":
+                    _parts = user_input.split(None, 1)
+                    _sid = _parts[1].strip() if len(_parts) > 1 else ""
+                    if not _sid:
+                        print(f"  {C.YELLOW}Usage: /slack:allow <slack_user_id>{C.RESET}")
+                        print(f"  {C.DIM}Slack user IDs look like: U01AB2CD3EF{C.RESET}")
+                        continue
+                    if channel_manager:
+                        channel_manager.add_sender("slack", _sid)
+                        print(f"  {C.GREEN}'{_sid}' added to Slack allowlist.{C.RESET}")
+                    else:
+                        print(f"  {C.YELLOW}Channels not running. Start with --channels slack.{C.RESET}")
+                    continue
+
+                elif cmd == "/slack:access":
+                    _parts = user_input.split(None, 2)
+                    _sub = _parts[1].strip().lower() if len(_parts) > 1 else ""
+                    _val = _parts[2].strip().lower() if len(_parts) > 2 else ""
+                    if _sub == "policy" and _val in ("allowlist", "open"):
+                        if channel_manager:
+                            channel_manager.set_policy("slack", _val)
+                            print(f"  {C.GREEN}Slack access policy: {_val}{C.RESET}")
+                        else:
+                            print(f"  {C.YELLOW}Channels not running.{C.RESET}")
+                    else:
+                        print(f"  {C.YELLOW}Usage: /slack:access policy <allowlist|open>{C.RESET}")
+                    continue
+
+                elif cmd == "/webhook:allow":
+                    _parts = user_input.split(None, 1)
+                    _sid = _parts[1].strip() if len(_parts) > 1 else ""
+                    if not _sid:
+                        print(f"  {C.YELLOW}Usage: /webhook:allow <sender_id>{C.RESET}")
+                        continue
+                    if channel_manager:
+                        channel_manager.add_sender("webhook", _sid)
+                        print(f"  {C.GREEN}Added '{_sid}' to webhook allowlist.{C.RESET}")
+                    else:
+                        print(f"  {C.YELLOW}Channels not running. Start with --channels webhook.{C.RESET}")
+                    continue
+
+                elif cmd == "/webhook:open":
+                    if channel_manager and "webhook" in channel_manager._adapters:
+                        channel_manager.set_policy("webhook", "open")
+                        print(f"  {C.YELLOW}Webhook policy set to OPEN — all senders accepted.{C.RESET}")
+                        print(f"  {C.DIM}Use /webhook:allowlist to restrict access.{C.RESET}")
+                    else:
+                        print(f"  {C.YELLOW}Channels not running. Start with --channels webhook.{C.RESET}")
+                    continue
+
+                elif cmd == "/webhook:allowlist":
+                    if channel_manager and "webhook" in channel_manager._adapters:
+                        channel_manager.set_policy("webhook", "allowlist")
+                        print(f"  {C.GREEN}Webhook policy set to allowlist.{C.RESET}")
+                    else:
+                        print(f"  {C.YELLOW}Channels not running. Start with --channels webhook.{C.RESET}")
+                    continue
+
                 elif cmd == "/team":
                     parts = user_input.split(None, 1)
                     team_args = parts[1].strip() if len(parts) > 1 else ""
@@ -15208,7 +16200,11 @@ Review this code for:
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",
                                      "/rollback", "/autotest", "/gentest", "/skills", "/hooks",
                                      "/image", "/browser", "/fork", "/index",
-                                     "/pr", "/gh", "/team", "/memory"]
+                                     "/pr", "/gh", "/team", "/memory",
+                                     "/channels", "/webhook:configure", "/webhook:allow",
+                                     "/webhook:open", "/webhook:allowlist",
+                                     "/discord:configure", "/discord:pair", "/discord:access",
+                                     "/slack:configure", "/slack:allow", "/slack:access"]
                         _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                         if not _close:
                             _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []
