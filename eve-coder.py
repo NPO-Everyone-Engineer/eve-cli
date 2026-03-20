@@ -266,7 +266,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.8.2"
+__version__ = "2.8.3"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -13479,7 +13479,7 @@ class Agent:
                 if cont in ("", "y", "yes", "はい"):
                     _p(f"{C.DIM}Continuing... (reset step counter){C.RESET}")
                     self.session.add_system_note(f"Session continued after {self.max_iterations} steps")
-                    self.run()  # restart agent loop
+                    self._run_impl(user_input, skip_add=True)  # restart without re-adding user message
                 else:
                     _p(f"{C.DIM}セッションが終了しました。再開：eve-coder --resume (Session ended. Resume with: eve-coder --resume){C.RESET}")
             except EOFError:
