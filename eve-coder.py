@@ -266,7 +266,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.7.2"
+__version__ = "2.7.3"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -16275,7 +16275,7 @@ Review this code for:
                                      "/pr", "/gh", "/team", "/memory",
                                      "/channels", "/webhook:configure", "/webhook:allow",
                                      "/webhook:open", "/webhook:allowlist",
-                                     "/discord:configure", "/discord:pair", "/discord:access",
+                                     "/discord:configure", "/discord:pair", "/discord:access", "/discord:status",
                                      "/slack:configure", "/slack:allow", "/slack:access"]
                         _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                         if not _close:
