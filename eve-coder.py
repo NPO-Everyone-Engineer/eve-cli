@@ -266,7 +266,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.7.1"
+__version__ = "2.7.2"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -16074,6 +16074,39 @@ Review this code for:
                             print(f"  {C.DIM}DM your bot again to receive a new code.{C.RESET}")
                     else:
                         print(f"  {C.YELLOW}Channels not running. Start with --channels discord.{C.RESET}")
+                    continue
+
+                elif cmd == "/discord:status":
+                    # Diagnose Discord connection: verify token + channel access
+                    _d_adapter_s = (channel_manager._adapters.get("discord")
+                                    if channel_manager else None)
+                    if not _d_adapter_s:
+                        print(f"  {C.YELLOW}Discord adapter not running.{C.RESET}")
+                        print(f"  {C.DIM}Run: eve-cli --channels discord  then  /discord:configure{C.RESET}")
+                        continue
+                    # Test token
+                    _ok_me, _me = _d_adapter_s._api("GET", "/users/@me")
+                    if _ok_me:
+                        print(f"  {C.GREEN}Bot token: OK  (user: {_me.get('username')}#{_me.get('discriminator','0')}  id: {_me.get('id')}){C.RESET}")
+                    else:
+                        print(f"  {C.RED}Bot token: INVALID  {_me.get('message', _me)}{C.RESET}")
+                        print(f"  {C.DIM}Re-run: /discord:configure <correct_token> <channel_ids>{C.RESET}")
+                        continue
+                    # Test each channel
+                    for _ch_id_s in _d_adapter_s._channel_ids:
+                        _ok_ch, _ch = _d_adapter_s._api("GET", f"/channels/{_ch_id_s}")
+                        if _ok_ch:
+                            _ch_name = _ch.get("name") or f"DM/{_ch_id_s}"
+                            _watermark = _d_adapter_s._last_ids.get(_ch_id_s, "未初期化")
+                            print(f"  {C.GREEN}Channel {_ch_id_s} ({_ch_name}): OK  watermark={_watermark}{C.RESET}")
+                        else:
+                            _err_msg = _ch.get('message', str(_ch))
+                            print(f"  {C.RED}Channel {_ch_id_s}: ERROR  {_err_msg}{C.RESET}")
+                            if "Missing Access" in str(_err_msg) or "403" in str(_err_msg):
+                                print(f"  {C.DIM}→ ボットがこのチャンネルへのアクセス権を持っていません。{C.RESET}")
+                                print(f"  {C.DIM}  サーバーでボットに「チャンネルを見る」「メッセージを読む」権限を付与してください。{C.RESET}")
+                            elif "Unknown Channel" in str(_err_msg):
+                                print(f"  {C.DIM}→ チャンネル ID が間違っています。{C.RESET}")
                     continue
 
                 elif cmd == "/discord:access":
