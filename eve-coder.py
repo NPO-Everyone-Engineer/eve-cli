@@ -266,7 +266,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.7.4"
+__version__ = "2.8.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1211,6 +1211,8 @@ class Config:
         self._cli_max_tokens_set = False
         self._cli_temperature_set = False
         self._cli_context_window_set = False
+        self.think_mode = None          # None=auto, True=force on, False=force off
+        self._cli_think_mode_set = False
 
         # RAG options
         self.rag = False
@@ -1457,6 +1459,10 @@ class Config:
         parser.add_argument("--max-tokens", type=int, help=t('help.max_tokens', default="Max output tokens"))
         parser.add_argument("--temperature", type=float, help=t('help.temperature', default="Sampling temperature"))
         parser.add_argument("--context-window", type=int, help=t('help.context_window', default="Context window size"))
+        parser.add_argument("--think", action="store_true", default=False,
+                            help="Force enable thinking mode (Qwen3 / reasoning models)")
+        parser.add_argument("--no-think", action="store_true", default=False,
+                            help="Force disable thinking mode")
         parser.add_argument(
             "--max-agent-steps",
             type=int,
@@ -1540,6 +1546,12 @@ class Config:
         if args.context_window is not None:
             self.context_window = args.context_window
             self._cli_context_window_set = True
+        if args.think:
+            self.think_mode = True
+            self._cli_think_mode_set = True
+        elif args.no_think:
+            self.think_mode = False
+            self._cli_think_mode_set = True
         if args.max_agent_steps is not None:
             parsed = self._normalize_max_agent_steps(args.max_agent_steps, emit_errors=True)
             if parsed is not None:
@@ -1757,6 +1769,7 @@ class Config:
         if self.model:
             # Set appropriate context window for known models
             self._apply_context_window(self.model)
+            self._apply_max_tokens(self.model)
             # Safety: if offline and model is cloud-only, warn but don't override
             # (user explicitly chose this model)
             return
@@ -1772,6 +1785,7 @@ class Config:
             if best:
                 self.model = best
                 self._apply_context_window(best)
+                self._apply_max_tokens(best)
                 if not self.sidecar_model:
                     self._pick_sidecar(installed, best, effective_mem_gb)
                 return
@@ -1851,6 +1865,14 @@ class Config:
                 elif tier == "B":
                     self.context_window = 65536
                 return
+
+    def _apply_max_tokens(self, model_name):
+        """Auto-increase num_predict for large reasoning models (tier S/A) if not explicitly set."""
+        if self._cli_max_tokens_set:
+            return
+        tier, _ = self.get_model_tier(model_name)
+        if tier in ("S", "A"):
+            self.max_tokens = 32768
 
     @classmethod
     def get_model_tier(cls, model_name):
@@ -2596,6 +2618,7 @@ class OllamaClient:
         self.max_tokens = config.max_tokens
         self.temperature = config.temperature
         self.context_window = config.context_window
+        self.think_mode = getattr(config, 'think_mode', None)
         self.debug = config.debug
         self.timeout = 300
         self._supports_tool_streaming = None  # None=untested, True/False=detected
@@ -2967,8 +2990,13 @@ class OllamaClient:
 
         temp = self.temperature
         if tools:
-            # Lower temperature for tool-calling (improves JSON reliability)
-            temp = min(self.temperature, 0.3)
+            # For tier S/A thinking models use 0.6 (Qwen team recommendation);
+            # for other models lower to 0.3 to improve JSON reliability.
+            _tier, _ = Config.get_model_tier(model)
+            if _tier in ("S", "A") and self.think_mode is not False:
+                temp = min(self.temperature, 0.6)
+            else:
+                temp = min(self.temperature, 0.3)
             # Auto-detect streaming with tools (Ollama 0.5+ supports this)
             if not self.detect_tool_streaming():
                 if stream:
@@ -2999,6 +3027,9 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
+        # Explicitly control thinking mode for Ollama 0.6.5+ (Qwen3 / reasoning models)
+        if self.think_mode is not None:
+            payload["think"] = self.think_mode
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -11107,6 +11138,7 @@ class TUI:
                 _slash_commands = [
                     "/help", "/exit", "/quit", "/q", "/clear", "/model", "/models",
                     "/status", "/save", "/compact", "/yes", "/no", "/tokens",
+                    "/think", "/no-think",
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/gentest", "/watch", "/skills",
@@ -14623,6 +14655,7 @@ def main():
                         if client.check_model(new_model, available_models=fresh_models if _ok else None):
                             config.model = new_model
                             config._apply_context_window(new_model)
+                            config._apply_max_tokens(new_model)
                             _tier, _ = Config.get_model_tier(new_model)
                             _tier_str = f" (Tier {_tier})" if _tier else ""
                             print(f"{C.GREEN}Switched to model: {new_model}{_tier_str}{C.RESET}")
@@ -14664,6 +14697,16 @@ def main():
                     config.yes_mode = False
                     permissions.yes_mode = False
                     print(f"{C.GREEN}{t('slash.no_disabled', default='Auto-approve disabled. Tool calls will require confirmation.')}{C.RESET}")
+                    continue
+                elif cmd == "/think":
+                    config.think_mode = True
+                    client.think_mode = True
+                    print(f"{C.GREEN}Thinking mode enabled. The model will use extended reasoning (<think> blocks).{C.RESET}")
+                    continue
+                elif cmd == "/no-think":
+                    config.think_mode = False
+                    client.think_mode = False
+                    print(f"{C.GREEN}Thinking mode disabled. The model will respond without extended reasoning.{C.RESET}")
                     continue
                 elif cmd == "/tokens":
                     tokens = session.get_token_estimate()
@@ -16281,7 +16324,8 @@ Review this code for:
                         # "Did you mean?" for typo'd slash commands
                         _all_cmds = ["/help", "/exit", "/quit", "/clear", "/model", "/models",
                                      "/status", "/save", "/compact", "/yes", "/no",
-                                     "/tokens", "/commit", "/diff", "/git", "/plan",
+                                     "/tokens", "/think", "/no-think",
+                                     "/commit", "/diff", "/git", "/plan",
                                      "/approve", "/act", "/execute", "/undo", "/init",
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",
                                      "/rollback", "/autotest", "/gentest", "/skills", "/hooks",
