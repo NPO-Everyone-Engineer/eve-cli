@@ -1614,6 +1614,8 @@ class Config:
         # Tier A — Expert (128GB+ RAM)
         "llama3.1:405b": 131072,
         "qwen3:235b": 32768,
+        "qwen3.5:397b-cloud": 262144,  # Cloud model, 256K ctx
+        "qwen3.5:35b-a3b": 262144,     # MoE 35B (3B active), 256K ctx
         "deepseek-coder-v2:236b": 131072,
         # Tier B — Advanced (48GB+ RAM)
         "qwen3-coder-next": 262144,  # 80B MoE (3B active), 256K ctx, coding agent
@@ -1625,20 +1627,24 @@ class Config:
         "qwen2.5:72b": 131072,
         "deepseek-r1:70b": 131072,
         "qwen3:32b": 32768,
+        "qwen3.5:32b": 131072,        # 128K ctx
         # Tier C — Solid (16GB+ RAM)
         "qwen3-coder:30b": 32768,
         "qwen2.5-coder:32b": 32768,
         "qwen3:14b": 32768,
         "qwen3:30b": 32768,
+        "qwen3.5:14b": 65536,         # 64K ctx
         "starcoder2:15b": 16384,
         # Tier D — Lightweight (8GB+ RAM)
         "qwen3:8b": 32768,
+        "qwen3.5:9b": 32768,          # 32K ctx
         "llama3.1:8b": 8192,
         "codellama:7b": 16384,
         "deepseek-coder:6.7b": 16384,
         # Tier E — Minimal (4GB+ RAM)
         "qwen3:4b": 8192,
         "qwen3:1.7b": 4096,
+        "qwen3.5:3b": 8192,           # 8K ctx
         "llama3.2:3b": 8192,
     }
 
