@@ -380,11 +380,12 @@ Discord ボットを作成し、DM やチャンネルのメッセージをエー
 
 #### 起動・設定
 
+`--channels discord` で起動し、その後トークンとチャンネル ID を登録します。
+登録後はアダプターが**自動で起動**するので、再起動は不要です。
+
 ```bash
 eve-cli --channels discord
 ```
-
-起動後、トークンとチャンネル ID を登録します：
 
 ```
 > /discord:configure ボットトークン チャンネルID
@@ -395,6 +396,8 @@ eve-cli --channels discord
 ```
 > /discord:configure ボットトークン 123456789,987654321
 ```
+
+設定後、ターミナルに `⚡ Discord adapter started.` と表示されればポーリング開始です。
 
 #### ペアリング（送信者の認証）
 

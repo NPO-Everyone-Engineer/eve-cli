@@ -266,7 +266,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.7.0"
+__version__ = "2.7.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -909,14 +909,23 @@ class ScrollRegion:
             sys.stdout.flush()
 
     def update_status(self, text):
-        """Store status text for display in footer (no immediate terminal write).
+        """Store status text and redraw footer if scroll region is active.
 
-        Status is rendered when setup() draws the footer. Use inline \\r
-        (within self._lock) for real-time mid-scroll status display.
+        Status is rendered in the footer row. When scroll region is active,
+        the footer is redrawn immediately to reflect the new status.
         Always stores text, even when scroll region is inactive.
         """
         with self._lock:
+            old_status = self._status_text
             self._status_text = text
+            # Redraw footer if active and status actually changed
+            if self._active and old_status != text:
+                status_row = self._rows - 1
+                _sep_color = C.CYAN
+                _rst = C.RESET
+                buf = f"\033[{status_row};1H\033[2K {text}{_rst}"
+                self._atomic_write(buf)
+
 
     def update_hint(self, text):
         """Store hint text (displayed in footer at next setup(), no terminal write).
@@ -16017,7 +16026,37 @@ Review this code for:
                     print(f"  {C.GREEN}Discord bot token saved.{C.RESET}")
                     if _cids:
                         print(f"  {C.GREEN}Channel IDs: {_cids}{C.RESET}")
-                    print(f"  {C.DIM}Restart with --channels discord to activate.{C.RESET}")
+                    # Auto-start Discord adapter in the current session
+                    # (Discord uses REST polling so no HTTP server restart needed)
+                    if "discord" in config.channels:
+                        _d_env2 = _load_channel_env(config, "discord")
+                        _d_tok2 = _d_env2.get("DISCORD_BOT_TOKEN", "")
+                        _d_cids2 = [c.strip() for c in _d_env2.get("DISCORD_CHANNEL_IDS", "").split(",") if c.strip()]
+                        if _d_tok2 and _d_cids2:
+                            if channel_manager is None:
+                                channel_manager = _build_channel_manager(config)
+                                if channel_manager:
+                                    channel_manager.start()
+                                    atexit.register(channel_manager.stop)
+                                    print(f"  {C.GREEN}⚡ Discord adapter started.{C.RESET}")
+                                    print(f"  {C.DIM}Send a message from Discord to receive a pairing code.{C.RESET}")
+                            elif "discord" not in channel_manager._adapters:
+                                _d_adapter2 = DiscordAdapter(token=_d_tok2, channel_ids=_d_cids2)
+                                _d_adapter2._queue = channel_manager._queue
+                                channel_manager._adapters["discord"] = _d_adapter2
+                                channel_manager._allowlists.setdefault("discord", set())
+                                channel_manager._policy.setdefault("discord", "allowlist")
+                                channel_manager._sync_adapter_allowlists()
+                                _d_adapter2.start()
+                                print(f"  {C.GREEN}⚡ Discord adapter started.{C.RESET}")
+                                print(f"  {C.DIM}Send a message from Discord to receive a pairing code.{C.RESET}")
+                            else:
+                                print(f"  {C.DIM}Discord adapter is already running.{C.RESET}")
+                        else:
+                            if not _d_cids2:
+                                print(f"  {C.DIM}Also specify channel IDs: /discord:configure <token> <channel_ids>{C.RESET}")
+                    else:
+                        print(f"  {C.DIM}Run: eve-cli --channels discord to activate.{C.RESET}")
                     continue
 
                 elif cmd == "/discord:pair":
