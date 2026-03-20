@@ -266,7 +266,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.7.3"
+__version__ = "2.7.4"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -14477,6 +14477,14 @@ def main():
                         _ch_reply = agent.get_last_output()
                         channel_manager.send_reply(_ch_msg, _ch_reply)
                     continue
+
+            # ── Non-blocking stdin wait when channels are active ──────────────
+            # Without this, input() blocks indefinitely and channel messages
+            # are never processed while waiting for user input.
+            if channel_manager and HAS_TERMIOS and sys.stdin.isatty():
+                _ch_ready, _, _ = _select_mod.select([sys.stdin], [], [], 0.3)
+                if not _ch_ready:
+                    continue  # no user input yet; loop back to poll channels
 
             user_input = tui.get_multiline_input(
                 session=session, plan_mode=agent._plan_mode,
