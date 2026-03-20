@@ -266,7 +266,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.8.1"
+__version__ = "2.8.2"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -924,6 +924,7 @@ class ScrollRegion:
                 _sep_color = C.CYAN
                 _rst = C.RESET
                 buf = f"\033[{status_row};1H\033[2K {text}{_rst}"
+                buf += f"\033[{self._scroll_end};1H"  # restore cursor to scroll region
                 self._atomic_write(buf)
 
 
