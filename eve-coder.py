@@ -266,7 +266,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.8.3"
+__version__ = "2.8.4"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -412,13 +412,6 @@ def _ansi(code):
     """Return ANSI escape code only if colors are enabled. Use for inline color codes."""
     return code if C._enabled else ""
 
-def _rl_ansi(code):
-    """Wrap ANSI code for readline so it doesn't count toward visible prompt length.
-    Use this ONLY in strings passed to input() — not for print()."""
-    a = _ansi(code)
-    if not a or not HAS_READLINE:
-        return a
-    return f"\001{a}\002"
 
 def _get_terminal_width():
     """Get terminal width, defaulting to 80."""
@@ -427,76 +420,6 @@ def _get_terminal_width():
     except Exception:
         return 80
 
-
-def show_command_palette():
-    """Display command palette with slash commands and AI tools."""
-    print(f"\n  {C.BCYAN}📋 コマンドパレット{C.RESET}")
-    print(f"  {C.GRAY}{'─' * 60}{C.RESET}")
-
-    # スラッシュコマンド
-    print(f"  {C.BYELLOW}【スラッシュコマンド】{C.RESET}")
-    _commands = [
-        ("/help", "ヘルプを表示"),
-        ("/context", "次のプロンプト候補を AI が提案"),
-        ("/suggest-help", "現在のコンテキストから次に聞くべきプロンプト候補を提案"),
-        ("/clear", "会話をリセット"),
-        ("/commit", "AI がコミットメッセージを生成"),
-        ("/diff", "変更差分を表示"),
-        ("/status", "セッション・Git 状態を表示"),
-        ("/undo", "直前のファイル変更を元に戻す"),
-        ("/checkpoint", "手動でチェックポイントを作成"),
-        ("/plan", "Plan モードに切り替え（読み取り専用）"),
-        ("/approve", "計画を承認して Act モードで実行"),
-        ("/index", "コードインテリジェンス（build/search/file/status）"),
-        ("/pr", "GitHub PR 操作（create/list/merge/checks）"),
-        ("/memory", "メモリ操作（add/remove/search/clear）"),
-        ("/fork", "会話を分岐"),
-        ("/save", "セッションを手動保存"),
-        ("/learn", "学習モードのオン/オフ"),
-        ("/hooks", "登録フック一覧"),
-        ("/skills", "利用可能スキル一覧"),
-        ("/browser", "ブラウザ操作セットアップ"),
-    ]
-    for cmd, desc in _commands:
-        print(f"  {C.CYAN}{cmd:<12}{C.RESET} {desc}")
-
-    print()
-
-    # AI ツール
-    print(f"  {C.BYELLOW}【AI ツール（自動使用）】{C.RESET}")
-    _tools_read = [
-        ("Read", "ファイルを読む（自動許可）"),
-        ("Glob", "ファイル名パターン検索"),
-        ("Grep", "ファイル内容検索"),
-        ("WebFetch", "Web ページ取得"),
-        ("WebSearch", "Web 検索"),
-        ("SubAgent", "サブエージェント起動"),
-        ("TaskCreate/List/Get/Update", "タスク管理"),
-        ("AskUserQuestion", "ユーザーに質問"),
-    ]
-    _tools_write = [
-        ("Bash", "シェルコマンド実行（確認必要）"),
-        ("Write", "ファイル新規作成（確認必要）"),
-        ("Edit", "ファイル編集（確認必要）"),
-        ("MultiEdit", "複数ファイル一括編集（確認必要）"),
-        ("NotebookEdit", "Jupyter Notebook 編集"),
-        ("MCP", "MCP サーバー経由ツール"),
-    ]
-    for tool, desc in _tools_read:
-        print(f"  {C.GREEN}{tool:<12}{C.RESET} {desc}")
-    for tool, desc in _tools_write:
-        print(f"  {C.YELLOW}{tool:<12}{C.RESET} {desc}")
-
-    print()
-
-    # キーバインド
-    print(f"  {C.BYELLOW}【キーバインド】{C.RESET}")
-    print(f"  {C.CYAN}ESC{C.RESET}        実行中断")
-    print(f"  {C.CYAN}Ctrl+G{C.RESET}     割り込みコメント")
-    print(f"  {C.CYAN}?{C.RESET}          このパレット表示")
-
-    print(f"  {C.GRAY}{'─' * 60}{C.RESET}\n")
-    sys.stdout.flush()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -511,8 +434,6 @@ DANGEROUS_COMMANDS = [
     "shutdown", "reboot", "kill", "pkill",
 ]
 
-# ツール実行前の確認プロンプト対象ツール名
-RISKY_TOOL_NAMES = {"Bash", "Write", "Edit", "MultiEdit"}
 
 def is_dangerous_command(command: str) -> bool:
     """Check if a command contains dangerous keywords."""
