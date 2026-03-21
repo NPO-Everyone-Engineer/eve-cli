@@ -157,13 +157,13 @@ class TestCatchupDocumentation(unittest.TestCase):
         )
         self.assertTrue(os.path.exists(instruction_path))
 
-    def test_readme_has_catchup_section(self):
-        """Test that README mentions catchup plan."""
+    def test_readme_has_docs_links(self):
+        """Test that README links to docs/ documentation."""
         readme_path = os.path.join(SCRIPT_DIR, "README.md")
         with open(readme_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        self.assertIn("CLI キャッチアップ計画", content)
-        self.assertIn("20260308_cli_catchup_instruction.md", content)
+        self.assertIn("docs/usage.md", content)
+        self.assertIn("docs/commands.md", content)
 
 
 if __name__ == "__main__":

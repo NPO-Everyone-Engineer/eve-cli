@@ -268,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.10.0"
+__version__ = "2.10.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -6885,6 +6885,8 @@ class MCPClient:
                 except Exception:
                     pass
 
+    MCP_SEND_TIMEOUT = 30  # seconds to wait for MCP server response
+
     def _send(self, method, params=None):
         """Send a JSON-RPC 2.0 request and return the result."""
         if not self._proc or self._proc.poll() is not None:
@@ -6901,6 +6903,16 @@ class MCPClient:
         try:
             self._proc.stdin.write(data.encode("utf-8"))
             self._proc.stdin.flush()
+            # Use select() with timeout to prevent infinite blocking
+            # (npx/MCP servers may take time to start or hang on first launch)
+            import select as _sel_mod
+            ready, _, _ = _sel_mod.select([self._proc.stdout], [], [], self.MCP_SEND_TIMEOUT)
+            if not ready:
+                raise RuntimeError(
+                    f"MCP server '{self.name}' did not respond within {self.MCP_SEND_TIMEOUT}s. "
+                    f"The server may still be starting (e.g. npx downloading packages). "
+                    f"Try running the MCP command manually first: {self.command} {' '.join(self.args)}"
+                )
             line = self._proc.stdout.readline()
             if not line:
                 raise RuntimeError(t('errors.mcp_server_closed_unexpectedly', default=f"MCP server '{self.name}' closed unexpectedly"))
