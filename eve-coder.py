@@ -268,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.8.6"
+__version__ = "2.9.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -2878,13 +2878,29 @@ class OllamaClient:
         
         return repaired
 
-    def _merge_chat_options(self, temperature, options=None):
-        """Build Ollama options, allowing per-call overrides."""
+    def _merge_chat_options(self, model, temperature, options=None):
+        """Build Ollama options with model-optimized sampling parameters."""
+        _tier, _ = Config.get_model_tier(model)
+
+        # Base num_predict; increase for thinking models
+        _num_predict = self.max_tokens
+        if self.think_mode is not False and _tier in ("S", "A"):
+            _num_predict = max(_num_predict, 49152)  # 48K for thinking chain + output
+
         merged = {
             "num_ctx": self.context_window,
-            "num_predict": self.max_tokens,
+            "num_predict": _num_predict,
             "temperature": temperature,
         }
+
+        # Qwen3.5 / tier S-A optimized sampling
+        if _tier in ("S", "A"):
+            merged["top_p"] = 0.85
+            merged["top_k"] = 40
+            merged["repeat_penalty"] = 1.05
+        elif _tier == "B":
+            merged["top_p"] = 0.9
+
         if not options:
             return merged
 
@@ -2946,8 +2962,8 @@ class OllamaClient:
             "model": model,
             "messages": api_messages,
             "stream": stream,
-            "keep_alive": -1,  # Keep model loaded in VRAM for the session
-            "options": self._merge_chat_options(temp, options),
+            "keep_alive": 300 if _is_cloud_model(model) else -1,  # Cloud: 5min, Local: keep loaded
+            "options": self._merge_chat_options(model, temp, options),
         }
         if tools:
             payload["tools"] = tools
@@ -10739,7 +10755,10 @@ class Session:
         # Force compaction if too many messages regardless of token estimate
         if not force and len(self.messages) > 300:
             force = True
-        max_tokens = self.config.context_window * 0.70  # leave 30% room for response + overhead
+        # Tier S/A models (256K ctx) can safely use more context before compacting
+        _tier, _ = Config.get_model_tier(self.config.model)
+        _threshold = 0.85 if _tier in ("S", "A") else 0.70
+        max_tokens = self.config.context_window * _threshold
         if not force and self.get_token_estimate() < max_tokens:
             return
         # Prevent infinite re-compaction: skip if we already compacted at this message count
