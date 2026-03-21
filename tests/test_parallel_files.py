@@ -30,7 +30,7 @@ class TestParallelFileEditing:
     def setup_method(self):
         """Create temporary directory and test files."""
         self.test_dir = tempfile.mkdtemp()
-        self.tool = MultiEditTool()
+        self.tool = MultiEditTool(cwd=self.test_dir)
         
         # Create test files
         self.test_files = []
@@ -167,6 +167,42 @@ class TestParallelFileEditing:
         
         result = self.tool.execute({"edits": edits})
         assert "symlink not allowed" in result
+
+    def test_outside_repo_rejected(self):
+        """MultiEdit rejects files outside its configured workspace."""
+        outside_dir = tempfile.mkdtemp()
+        try:
+            outside_file = os.path.join(outside_dir, "outside.txt")
+            with open(outside_file, "w", encoding="utf-8") as f:
+                f.write("secret\n")
+            edits = [{
+                "file_path": outside_file,
+                "old_string": "secret",
+                "new_string": "public"
+            }]
+            result = self.tool.execute({"edits": edits})
+            assert "outside repository" in result
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
+
+    def test_parent_symlink_escape_rejected(self):
+        """Symlinked parent directories cannot escape the workspace."""
+        outside_dir = tempfile.mkdtemp()
+        try:
+            outside_file = os.path.join(outside_dir, "outside.txt")
+            with open(outside_file, "w", encoding="utf-8") as f:
+                f.write("secret\n")
+            link_dir = os.path.join(self.test_dir, "linked")
+            os.symlink(outside_dir, link_dir)
+            edits = [{
+                "file_path": os.path.join(link_dir, "outside.txt"),
+                "old_string": "secret",
+                "new_string": "public"
+            }]
+            result = self.tool.execute({"edits": edits})
+            assert "outside repository" in result
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
 
     def test_multiple_edits_same_file(self):
         """Test multiple edits to the same file."""

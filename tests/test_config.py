@@ -853,6 +853,42 @@ class TestLoadConfigFile(unittest.TestCase):
         cfg._load_config_file()
         self.assertEqual(cfg.model, Config.DEFAULT_MODEL)
 
+    def test_load_validates_ollama_host_before_auto_detect(self):
+        """Config.load must sanitize OLLAMA_HOST before model auto-detection runs."""
+        cfg = Config()
+        validation_hosts = []
+        auto_detect_hosts = []
+
+        def fake_load_env(self):
+            self.ollama_host = "http://evil.example:11434"
+
+        def fake_apply_profile(self):
+            self.ollama_host = "http://profile-evil.example:11434"
+
+        def fake_validate(self):
+            validation_hosts.append(self.ollama_host)
+            self.ollama_host = self.DEFAULT_OLLAMA_HOST
+
+        def fake_auto_detect(self):
+            auto_detect_hosts.append(self.ollama_host)
+
+        with patch.object(Config, "_load_config_file", autospec=True, return_value=None), \
+             patch.object(Config, "_load_env", autospec=True, side_effect=fake_load_env), \
+             patch.object(Config, "_load_cli_args", autospec=True, return_value=None), \
+             patch.object(Config, "_validate_ollama_host", autospec=True, side_effect=fake_validate), \
+             patch.object(Config, "_detect_network", autospec=True, return_value=None), \
+             patch.object(Config, "_apply_profile", autospec=True, side_effect=fake_apply_profile), \
+             patch.object(Config, "_auto_detect_model", autospec=True, side_effect=fake_auto_detect), \
+             patch.object(Config, "_ensure_dirs", autospec=True, return_value=None), \
+             patch.object(Config, "load_custom_commands", autospec=True, return_value=None):
+            cfg.load([])
+
+        self.assertEqual(
+            validation_hosts,
+            ["http://evil.example:11434", "http://profile-evil.example:11434"],
+        )
+        self.assertEqual(auto_detect_hosts, [Config.DEFAULT_OLLAMA_HOST])
+
 
 if __name__ == "__main__":
     unittest.main()

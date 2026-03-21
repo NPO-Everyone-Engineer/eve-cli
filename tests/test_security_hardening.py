@@ -3,6 +3,7 @@ Test suite for security hardening regressions.
 """
 
 import importlib.util
+import json
 import os
 import shutil
 import sys
@@ -217,6 +218,40 @@ class TestSecurityHardening(unittest.TestCase):
         import inspect
         source = inspect.getsource(hooks_mgr.fire)
         self.assertIn("_build_clean_env()", source)
+
+    def test_webhook_requires_api_key(self):
+        adapter = eve_coder.WebhookAdapter(api_key="")
+
+        status, body = adapter.handle_request({}, json.dumps({"content": "hello"}).encode("utf-8"))
+
+        self.assertEqual(status, 403)
+        self.assertIn("api key is required", body.lower())
+
+    def test_webhook_rejects_private_callback_url(self):
+        adapter = eve_coder.WebhookAdapter(api_key="secret")
+
+        status, body = adapter.handle_request(
+            {"authorization": "Bearer secret"},
+            json.dumps({
+                "content": "hello",
+                "callback_url": "http://127.0.0.1:8080/reply",
+            }).encode("utf-8"),
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("invalid callback_url", body.lower())
+
+    def test_save_channel_env_refuses_symlinked_channel_dir(self):
+        config = self.make_config()
+        channel_root = Path(self.project_dir, ".eve-cli", "channels")
+        channel_root.mkdir(parents=True, exist_ok=True)
+        outside_dir = Path(self.test_dir, "outside")
+        outside_dir.mkdir()
+        (channel_root / "webhook").symlink_to(outside_dir, target_is_directory=True)
+
+        eve_coder._save_channel_env(config, "webhook", "WEBHOOK_API_KEY", "secret")
+
+        self.assertFalse((outside_dir / ".env").exists())
 
 
 if __name__ == "__main__":

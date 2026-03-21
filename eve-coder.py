@@ -1215,10 +1215,11 @@ class Config:
         self._load_config_file()
         self._load_env()
         self._load_cli_args(argv)
+        self._validate_ollama_host()
         self._detect_network()
         self._apply_profile()
-        self._auto_detect_model()
         self._validate_ollama_host()
+        self._auto_detect_model()
         self._ensure_dirs()
         self.load_custom_commands()
         return self
@@ -4465,6 +4466,53 @@ def _is_protected_path(file_path):
     return False
 
 
+def _path_is_within_root(path, root):
+    """Return True when path resolves inside root (or equals root)."""
+    return path == root or path.startswith(root + os.sep)
+
+
+def _resolve_repo_path(base_dir, target_path, require_exists=False, path_label="path"):
+    """Resolve a path and enforce repository containment."""
+    repo_root = os.path.realpath(base_dir or os.getcwd())
+    candidate = target_path if os.path.isabs(target_path) else os.path.join(repo_root, target_path)
+    try:
+        if os.path.islink(candidate):
+            return None, f"Error: refusing to access through symlink: {candidate}"
+        resolved = os.path.realpath(candidate)
+    except (OSError, ValueError):
+        return None, f"Error: cannot resolve path: {candidate}"
+    if require_exists and not os.path.exists(resolved):
+        return None, f"Error: {path_label} not found: {candidate}"
+    if not _path_is_within_root(resolved, repo_root):
+        return None, f"Error: access denied - {path_label} is outside repository: {candidate}"
+    return resolved, None
+
+
+def _resolve_repo_storage_path(base_dir, *parts):
+    """Resolve a repo-local storage path and reject symlinked path components."""
+    abs_base = os.path.abspath(base_dir or os.getcwd())
+    repo_root = os.path.realpath(abs_base)
+    candidate = os.path.join(abs_base, *parts)
+    try:
+        resolved = os.path.realpath(candidate)
+    except (OSError, ValueError) as e:
+        raise OSError(f"cannot resolve path: {candidate}") from e
+    if not _path_is_within_root(resolved, repo_root):
+        raise OSError(f"resolved path is outside repository: {candidate}")
+
+    cur = candidate
+    while True:
+        if os.path.lexists(cur) and os.path.islink(cur):
+            raise OSError(f"symlink path component not allowed: {cur}")
+        if os.path.abspath(cur) == abs_base:
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return resolved
+
+
 class WriteTool(Tool):
     name = "Write"
     description = """新規ファイルを作成する、または既存ファイルを全上書きする。
@@ -4499,23 +4547,11 @@ class WriteTool(Tool):
         if len(content) > self.MAX_WRITE_SIZE:
             return (f"Error: content too large ({len(content) // 1_000_000}MB). "
                     f"Max write size is {self.MAX_WRITE_SIZE // (1024*1024)}MB. Split into smaller writes.")
-        if not os.path.isabs(file_path):
-            file_path = os.path.join(self._base_dir(), file_path)
-
-        # Resolve symlinks to prevent symlink-based attacks
-        # Check islink() BEFORE exists() — dangling symlinks return False for exists()
-        try:
-            if os.path.islink(file_path):
-                return f"Error: refusing to write through symlink: {file_path}"
-            # For new files: resolve parent dir to prevent symlink escape
-            resolved = os.path.realpath(file_path)
-            if os.path.exists(file_path):
-                file_path = resolved
-            else:
-                # New file: ensure resolved parent matches expected parent
-                file_path = resolved
-        except (OSError, ValueError):
-            return f"Error: cannot resolve path: {file_path}"
+        file_path, path_error = _resolve_repo_path(self._base_dir(), file_path, path_label="file")
+        if path_error:
+            if "symlink" in path_error.lower():
+                return path_error.replace("access through", "write through")
+            return path_error
 
         # Block writes to protected config/permission files
         if _is_protected_path(file_path):
@@ -4604,19 +4640,13 @@ class EditTool(Tool):
             return "Error: old_string cannot be empty"
         if old_string == new_string:
             return "Error: old_string and new_string are identical"
-        if not os.path.isabs(file_path):
-            file_path = os.path.join(self._base_dir(), file_path)
-
-        if not os.path.exists(file_path):
-            return f"Error: file not found: {file_path}"
-
-        # Reject symlinks to prevent symlink-based attacks
-        try:
-            if os.path.islink(file_path):
-                return f"Error: refusing to edit through symlink: {file_path}"
-            file_path = os.path.realpath(file_path)
-        except (OSError, ValueError):
-            return f"Error: cannot resolve path: {file_path}"
+        file_path, path_error = _resolve_repo_path(
+            self._base_dir(), file_path, require_exists=True, path_label="file"
+        )
+        if path_error:
+            if "symlink" in path_error.lower():
+                return path_error.replace("access through", "edit through")
+            return path_error
 
         # Block edits to protected config/permission files
         if _is_protected_path(file_path):
@@ -4780,24 +4810,28 @@ class MultiEditTool(Tool):
 
         if not fpath or not os.path.isabs(fpath):
             return False, f"[{index+1}] Error: invalid path '{fpath}'"
-
-        if os.path.islink(fpath):
-            return False, f"[{index+1}] Error: symlink not allowed '{fpath}'"
+        resolved_path, path_error = _resolve_repo_path(
+            self._base_dir(), fpath, require_exists=True, path_label="file"
+        )
+        if path_error:
+            if "symlink" in path_error.lower():
+                return False, f"[{index+1}] Error: symlink not allowed '{fpath}'"
+            return False, f"[{index+1}] {path_error}"
         if _is_protected_path(fpath):
             return False, f"[{index+1}] Error: protected path '{fpath}'"
 
-        if not os.path.isfile(fpath):
+        if not os.path.isfile(resolved_path):
             return False, f"[{index+1}] Error: file not found '{fpath}'"
 
         # Acquire lock for this specific file to prevent concurrent writes
-        lock = self._get_file_lock(fpath)
+        lock = self._get_file_lock(resolved_path)
         with lock:
             try:
-                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
 
                 if old_s not in content:
-                    return False, f"[{index+1}] Error: old_string not found in {os.path.basename(fpath)}"
+                    return False, f"[{index+1}] Error: old_string not found in {os.path.basename(resolved_path)}"
 
                 count = content.count(old_s)
                 warning = ""
@@ -4805,10 +4839,20 @@ class MultiEditTool(Tool):
                     warning = f" [{count} occurrences, replacing first only]"
 
                 new_content = content.replace(old_s, new_s, 1)
-                with open(fpath, "w", encoding="utf-8", newline="") as f:
-                    f.write(new_content)
+                dirname = os.path.dirname(resolved_path)
+                fd, tmp_path = tempfile.mkstemp(dir=dirname or ".", suffix=".eve_tmp")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                        f.write(new_content)
+                    os.replace(tmp_path, resolved_path)
+                except Exception:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
 
-                return True, f"[{index+1}] OK: {os.path.basename(fpath)}{warning}"
+                return True, f"[{index+1}] OK: {os.path.basename(resolved_path)}{warning}"
             except OSError as e:
                 return False, f"[{index+1}] Error: {e}"
 
@@ -5501,15 +5545,13 @@ class NotebookEditTool(Tool):
 
         if not nb_path:
             return "Error: no notebook_path provided"
-        if not os.path.isabs(nb_path):
-            nb_path = os.path.join(os.getcwd(), nb_path)
-        # Reject symlinks to prevent symlink-based attacks
-        try:
-            if os.path.islink(nb_path):
-                return f"Error: refusing to edit notebook through symlink: {nb_path}"
-            nb_path = os.path.realpath(nb_path)
-        except (OSError, ValueError):
-            pass
+        nb_path, path_error = _resolve_repo_path(
+            self._base_dir(), nb_path, require_exists=True, path_label="notebook"
+        )
+        if path_error:
+            if "symlink" in path_error.lower():
+                return path_error.replace("access through", "edit notebook through")
+            return path_error
         # Block edits to protected config/permission files
         if _is_protected_path(nb_path):
             return f"Error: editing {os.path.basename(nb_path)} is blocked for security."
@@ -8651,6 +8693,20 @@ class WebhookAdapter(BaseChannelAdapter):
         super().__init__()
         self._api_key = api_key
 
+    @staticmethod
+    def _is_safe_callback_url(url):
+        if not url:
+            return True
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return False
+        if parsed.username or "@" in (parsed.netloc or ""):
+            return False
+        hostname = parsed.hostname or ""
+        if not hostname:
+            return False
+        return not WebFetchTool._is_private_ip(hostname)
+
     @property
     def name(self):
         return "webhook"
@@ -8660,10 +8716,11 @@ class WebhookAdapter(BaseChannelAdapter):
         Called by ChannelServer when POST /webhook arrives.
         Returns (status_code, response_body_str).
         """
-        if self._api_key:
-            auth = headers.get("authorization", "")
-            if auth != f"Bearer {self._api_key}":
-                return 403, json.dumps({"error": "Unauthorized"})
+        if not self._api_key:
+            return 403, json.dumps({"error": "Webhook API key is required. Run /webhook:configure first."})
+        auth = headers.get("authorization", "")
+        if auth != f"Bearer {self._api_key}":
+            return 403, json.dumps({"error": "Unauthorized"})
 
         try:
             data = json.loads(body.decode("utf-8", errors="replace"))
@@ -8678,6 +8735,8 @@ class WebhookAdapter(BaseChannelAdapter):
         sender_name = str(data.get("sender_name", "webhook"))[:128]
         callback_url = str(data.get("callback_url", ""))
         content = content[:4000]
+        if callback_url and not self._is_safe_callback_url(callback_url):
+            return 400, json.dumps({"error": "Invalid callback_url"})
 
         msg = ChannelMessage(
             channel="webhook",
@@ -8695,7 +8754,7 @@ class WebhookAdapter(BaseChannelAdapter):
         url = msg.reply_target
         if not url:
             return
-        if not (url.startswith("http://") or url.startswith("https://")):
+        if not self._is_safe_callback_url(url):
             return
         try:
             body = json.dumps(
@@ -9197,8 +9256,13 @@ class ChannelManager:
                 adapter.notify_allowed_senders(self._allowlists.get(name, set()))
 
     def _save_allowlist(self, channel_name):
-        path = self._allowlist_path(channel_name)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            path = _resolve_repo_storage_path(
+                self._config.cwd, ".eve-cli", "channels", channel_name, "allowlist.json"
+            )
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except OSError:
+            return
         data = {
             "senders": sorted(self._allowlists.get(channel_name, set())),
             "policy": self._policy.get(channel_name, "allowlist"),
@@ -9303,6 +9367,9 @@ def _build_channel_manager(config):
     for name in config.channels:
         if name == "webhook":
             api_key = _load_channel_env(config, "webhook").get("WEBHOOK_API_KEY", "")
+            if not api_key:
+                print(f"{C.YELLOW}[channels] Webhook: WEBHOOK_API_KEY not set. "
+                      f"Run /webhook:configure <api_key>{C.RESET}")
             adapters.append(WebhookAdapter(api_key=api_key))
         elif name == "discord":
             env = _load_channel_env(config, "discord")
@@ -9354,9 +9421,11 @@ def _load_channel_env(config, channel_name):
 
 def _save_channel_env(config, channel_name, key, value):
     """Upsert a key=value entry in .eve-cli/channels/{name}/.env."""
-    env_dir = os.path.join(config.cwd, ".eve-cli", "channels", channel_name)
-    os.makedirs(env_dir, exist_ok=True)
-    env_path = os.path.join(env_dir, ".env")
+    try:
+        env_path = _resolve_repo_storage_path(config.cwd, ".eve-cli", "channels", channel_name, ".env")
+        os.makedirs(os.path.dirname(env_path), exist_ok=True)
+    except OSError:
+        return
     existing = _load_channel_env(config, channel_name)
     existing[key] = value
     try:
@@ -9366,6 +9435,22 @@ def _save_channel_env(config, channel_name, key, value):
         os.chmod(env_path, 0o600)
     except OSError:
         pass
+
+
+def _should_load_project_permissions(config, permissions_path):
+    """Return True when a project permissions file is trusted for use."""
+    if not os.path.isfile(permissions_path) or os.path.islink(permissions_path):
+        return False
+    if not getattr(config, "config_dir", None) or not getattr(config, "cwd", None):
+        return False
+    return _ensure_repo_scope_trusted(
+        config,
+        "permissions",
+        "Project Permissions Trust Required",
+        "Project permissions can change approval behavior and reduce confirmation prompts.",
+        [permissions_path],
+        preview_paths=[permissions_path],
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -9460,7 +9545,8 @@ class PermissionMgr:
         self._last_decision = None
         self._load_rules(self._permissions_path, scope="global")
         if os.path.abspath(self._project_permissions_path) != os.path.abspath(self._permissions_path):
-            self._load_rules(self._project_permissions_path, scope="project")
+            if _should_load_project_permissions(config, self._project_permissions_path):
+                self._load_rules(self._project_permissions_path, scope="project")
 
     # Dangerous commands that require confirmation even in -y mode
     _ALWAYS_CONFIRM_PATTERNS = [
@@ -12430,7 +12516,7 @@ class TUI:
         print(f"  {_y}│{C.RESET} {warning_color}{warning_icon} {warning_title} {warning_message}{C.RESET}")
         print(f"  {_y}│{C.RESET} {warning_color}   {warning_sub}{C.RESET}")
         print(f"  {_y}│{C.RESET}")
-        persist_hint = " (保存)" if tool_name not in {"Bash", "Write", "Edit", "NotebookEdit"} else ""
+        persist_hint = " (保存)" if tool_name not in {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"} else ""
         print(f"  {_y}│{C.RESET}  [y] 一度許可   [a] 常に許可{persist_hint}")
         print(f"  {_y}│{C.RESET}  [n] 拒否 (Enter)  [d] 常に拒否   [Y] 全て自動許可")
         print(f"  {_y}╰{'─' * box_w}{C.RESET}")
@@ -13232,13 +13318,6 @@ class Agent:
                         continue
                     # Show what we're about to do FIRST
                     self.tui.show_tool_call(tool_name, tool_params)
-                    # PreToolUse hook: allow hooks to deny tool execution
-                    if self.hook_mgr and self.hook_mgr.has_hooks:
-                        _hook_result = self.hook_mgr.fire_pre_tool(tool_name, tool_params)
-                        if _hook_result == "deny":
-                            results.append(ToolResult(tc_id, "Blocked by hook (PreToolUse).", True))
-                            self.tui.show_tool_result(tool_name, "Blocked by hook", True)
-                            continue
                     # Plan mode: restrict Write to .eve-cli/plans/ only
                     if self._plan_mode and tool_name == "Write":
                         try:
@@ -13267,6 +13346,13 @@ class Agent:
                         ))
                         self.tui.show_tool_result(tool_name, "Permission denied", True)
                         continue
+                    # PreToolUse hook: allow hooks to deny tool execution after approval
+                    if self.hook_mgr and self.hook_mgr.has_hooks:
+                        _hook_result = self.hook_mgr.fire_pre_tool(tool_name, tool_params)
+                        if _hook_result == "deny":
+                            results.append(ToolResult(tc_id, "Blocked by hook (PreToolUse).", True))
+                            self.tui.show_tool_result(tool_name, "Blocked by hook", True)
+                            continue
                     validated_calls.append((tc_id, tool_name, tool_params, tool))
 
                 # Phase 3: Execute — parallel for read-only tools, sequential otherwise
@@ -14592,7 +14678,6 @@ def main():
                 _ch_msg = channel_manager.get_message()
                 if _ch_msg:
                     if not channel_manager.is_allowed(_ch_msg):
-                        channel_manager.send_reply(_ch_msg, "Unauthorized sender.")
                         _scroll_aware_print(
                             f"  {C.YELLOW}[channels] Rejected unauthorized sender "
                             f"'{_ch_msg.sender_id}' on {_ch_msg.channel}{C.RESET}"

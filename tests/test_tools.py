@@ -303,6 +303,16 @@ class TestWriteTool(unittest.TestCase):
         result = self.tool.execute({"file_path": path, "content": "a\nb\nc\n"})
         self.assertIn("3 lines", result)
 
+    def test_write_outside_repo_blocked(self):
+        """Writing outside the sandbox is rejected."""
+        outside_dir = tempfile.mkdtemp(prefix="eve_outside_")
+        try:
+            outside_path = os.path.join(outside_dir, "outside.txt")
+            result = self.tool.execute({"file_path": outside_path, "content": "nope"})
+            self.assertIn("outside repository", result.lower())
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # EditTool tests
@@ -427,6 +437,18 @@ class TestEditTool(unittest.TestCase):
         """Empty file_path returns error."""
         result = self.tool.execute({"file_path": "", "old_string": "a", "new_string": "b"})
         self.assertIn("Error", result)
+
+    def test_edit_outside_repo_blocked(self):
+        """Editing outside the sandbox is rejected."""
+        outside_dir = tempfile.mkdtemp(prefix="eve_outside_")
+        try:
+            outside_path = os.path.join(outside_dir, "outside.txt")
+            with open(outside_path, "w", encoding="utf-8") as f:
+                f.write("secret\n")
+            result = self.tool.execute({"file_path": outside_path, "old_string": "secret", "new_string": "public"})
+            self.assertIn("outside repository", result.lower())
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -988,6 +1010,20 @@ class TestNotebookEditTool(unittest.TestCase):
         })
         self.assertIn("Error", result)
         self.assertIn("invalid cell_type", result.lower())
+
+    def test_notebook_edit_outside_repo_blocked(self):
+        """Editing a notebook outside the sandbox is rejected."""
+        outside_dir = tempfile.mkdtemp(prefix="eve_outside_")
+        try:
+            outside_path = _make_notebook(outside_dir, "outside.ipynb")
+            result = self.tool.execute({
+                "notebook_path": outside_path,
+                "cell_number": 0,
+                "new_source": "print('x')",
+            })
+            self.assertIn("outside repository", result.lower())
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

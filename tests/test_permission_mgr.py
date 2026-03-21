@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SCRIPT_DIR)
@@ -32,6 +33,17 @@ def _make_config(tmpdir, yes_mode=False, rules=None):
         yes_mode=yes_mode,
         permissions_file=perm_file,
         cwd=tmpdir,
+        config_dir=tmpdir,
+    )
+
+
+def _trust_project_permissions(cfg):
+    project_path = os.path.join(cfg.cwd, ".eve-cli", "permissions.json")
+    hash_value = eve_coder._compute_file_hash(project_path)
+    eve_coder._remember_repo_scope_trust(
+        cfg,
+        "permissions",
+        {os.path.join(".eve-cli", "permissions.json"): hash_value},
     )
 
 
@@ -227,6 +239,7 @@ class TestPermissionMgrStructuredPolicies(unittest.TestCase):
                 ]
             }, f)
         cfg = _make_config(self.tmpdir, yes_mode=False)
+        _trust_project_permissions(cfg)
         mgr = PermissionMgr(cfg)
 
         allowed = mgr.check("Write", {"file_path": os.path.join(self.tmpdir, "docs", "note.txt")})
@@ -239,6 +252,7 @@ class TestPermissionMgrStructuredPolicies(unittest.TestCase):
         with open(os.path.join(project_dir, "permissions.json"), "w", encoding="utf-8") as f:
             json.dump({"categories": {"network": "deny"}}, f)
         cfg = _make_config(self.tmpdir, yes_mode=False)
+        _trust_project_permissions(cfg)
         mgr = PermissionMgr(cfg)
 
         allowed = mgr.check("WebFetch", {"url": "https://example.com"})
@@ -255,12 +269,24 @@ class TestPermissionMgrStructuredPolicies(unittest.TestCase):
                 "paths": [{"tool": "Write", "path": "docs/**", "decision": "allow"}],
             }, f)
         cfg = _make_config(self.tmpdir, yes_mode=False)
+        _trust_project_permissions(cfg)
         mgr = PermissionMgr(cfg)
 
         summary = mgr.policy_summary()
         self.assertEqual(summary["project_tool_rules"], 1)
         self.assertEqual(summary["project_category_rules"], 1)
         self.assertEqual(summary["project_path_rules"], 1)
+
+    @patch("sys.stdin.isatty", return_value=False)
+    def test_untrusted_project_permissions_are_ignored(self, _mock_isatty):
+        project_dir = os.path.join(self.tmpdir, ".eve-cli")
+        os.makedirs(project_dir, exist_ok=True)
+        with open(os.path.join(project_dir, "permissions.json"), "w", encoding="utf-8") as f:
+            json.dump({"categories": {"network": "deny"}}, f)
+        cfg = _make_config(self.tmpdir, yes_mode=False)
+        mgr = PermissionMgr(cfg)
+
+        self.assertEqual(mgr.policy_summary()["project_category_rules"], 0)
 
 
 class TestPermissionMgrSessionAllowDeny(unittest.TestCase):
