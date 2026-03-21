@@ -198,6 +198,8 @@ MAX_BG_TASKS = 50  # Prevent unbounded memory growth
 
 # Active scroll region reference (set during agent execution)
 _active_scroll_region = None
+# Active TUI reference (set during agent execution, used by tools to stop spinner)
+_active_tui = None
 
 # Custom commands cache: command_name -> {"description": str, "path": str, "frontmatter": dict}
 _custom_commands = {}
@@ -266,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.8.4"
+__version__ = "2.8.5"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -6223,6 +6225,10 @@ class AskUserQuestionTool(Tool):
         if not question:
             return "Error: question is required"
 
+        # Stop tool status spinner before prompting (prevents \r overwrite of input)
+        if _active_tui is not None:
+            _active_tui.stop_spinner()
+
         # Temporarily teardown scroll region for proper input handling
         _scroll_mode_active = False
         if _active_scroll_region is not None and _active_scroll_region._active:
@@ -6322,6 +6328,10 @@ class AskUserQuestionBatchTool(Tool):
         
         if len(questions) > 10:
             return "Error: maximum 10 questions allowed"
+
+        # Stop tool status spinner before prompting (prevents \r overwrite of input)
+        if _active_tui is not None:
+            _active_tui.stop_spinner()
 
         # Temporarily teardown scroll region for proper input handling
         _scroll_mode_active = False
@@ -14420,7 +14430,8 @@ def main():
     _session_start_msgs = len(session.messages)
 
     # Scroll region: activate for the entire interactive session
-    global _active_scroll_region
+    global _active_scroll_region, _active_tui
+    _active_tui = tui
     _scroll_mode = tui.scroll_region.supported()
     if _scroll_mode:
         _active_scroll_region = tui.scroll_region
