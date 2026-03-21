@@ -268,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.9.0"
+__version__ = "2.10.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1163,6 +1163,8 @@ class Config:
         self.learn_level = 3  # 1-5 (1=concise, 5=very detailed)
         self.learn_auto_explain = True  # auto-explain on errors
         self.ui_theme = "normal"  # UI theme: normal, gal, dandy, bushi
+        self.autotest_on_start = False  # --autotest flag
+        self.headless = False           # --headless (CI/CD mode)
 
         # Channels
         self.channels = []  # list of enabled channel names e.g. ["webhook", "discord"]
@@ -1438,6 +1440,10 @@ class Config:
         # UI Theme
         parser.add_argument("--theme", choices=["normal", "gal", "dandy", "bushi"], default=None,
                             help=t('help.theme', default="UI theme: normal, gal, dandy, bushi (default: normal)"))
+        parser.add_argument("--autotest", action="store_true", default=False,
+                            help="Enable auto lint/test after file changes")
+        parser.add_argument("--headless", action="store_true", default=False,
+                            help="Headless mode for CI/CD (no TUI, no colors, requires -p)")
         parser.add_argument("--channels", default="", metavar="NAMES",
                             help="Enable external channels (comma-separated): webhook, discord, slack")
         args = parser.parse_args(argv)
@@ -1538,6 +1544,16 @@ class Config:
         else:
             # Default theme (normal) - ensure it's applied
             C.apply_theme("normal")
+        # Autotest
+        if args.autotest:
+            self.autotest_on_start = True
+        # Headless mode (CI/CD)
+        if args.headless or os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS"):
+            self.headless = True
+            C._enabled = False  # disable colors
+            if not self.prompt:
+                print("Error: --headless requires -p <prompt>", file=sys.stderr)
+                sys.exit(1)
         # Channels
         if args.channels:
             self.channels = [c.strip().lower() for c in args.channels.split(",") if c.strip()]
@@ -3660,6 +3676,42 @@ class CodeIntelligence:
     @property
     def symbol_count(self):
         return sum(len(v) for v in self._index.values())
+
+    def repo_map(self, max_lines=200):
+        """Generate a structural map of the repository for LLM context.
+
+        Returns a text summary of the project structure including:
+        - File tree (directories and key files)
+        - Class/function definitions per file
+        """
+        if not self._index:
+            self.build_index()
+        # Group symbols by file
+        file_symbols = {}
+        for name, defs in self._index.items():
+            for d in defs:
+                fpath = d["file"]
+                kind = d["kind"]
+                file_symbols.setdefault(fpath, []).append((kind, name, d["line"]))
+        # Sort files, then symbols within each file by line number
+        lines = ["# Repository Map", ""]
+        line_count = 2
+        for fpath in sorted(file_symbols.keys()):
+            if line_count >= max_lines:
+                lines.append(f"... ({len(file_symbols) - len(lines)} more files)")
+                break
+            syms = sorted(file_symbols[fpath], key=lambda s: s[2])
+            lines.append(f"## {fpath}")
+            line_count += 1
+            for kind, name, lineno in syms:
+                if line_count >= max_lines:
+                    break
+                indent = "  " if kind in ("function", "method", "variable") else ""
+                lines.append(f"{indent}- {kind} {name} (L{lineno})")
+                line_count += 1
+            lines.append("")
+            line_count += 1
+        return "\n".join(lines)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -7700,6 +7752,7 @@ class AutoTestRunner:
         self.test_cmd = None
         self.lint_cmd = ["python3", "-m", "py_compile"]
         self._auto_detect()
+        self._detect_lint_tool()
 
     @staticmethod
     def _cmd_to_text(cmd):
@@ -7755,6 +7808,18 @@ class AutoTestRunner:
             self.test_cmd = ["python3", "-m", "unittest", "discover", "-s", ".", "-p", "test*.py", "-v"]
         elif not self.test_cmd and os.path.isfile(os.path.join(self.cwd, "package.json")):
             self.test_cmd = ["npm", "test"]
+
+    def _detect_lint_tool(self):
+        """Upgrade lint command to a better tool if available."""
+        # Python: prefer ruff > flake8 > py_compile
+        if shutil.which("ruff"):
+            self.lint_cmd = ["ruff", "check", "--fix"]
+        elif shutil.which("flake8"):
+            self.lint_cmd = ["flake8", "--max-line-length=120"]
+        # Node.js: prefer eslint if available and project uses it
+        if os.path.isfile(os.path.join(self.cwd, "package.json")):
+            if shutil.which("eslint") or os.path.isfile(os.path.join(self.cwd, "node_modules", ".bin", "eslint")):
+                self.lint_cmd = ["npx", "eslint", "--fix"]
 
     def _run_verifier_step(self, name, command, timeout, file_path=None):
         invoked = list(command) + ([file_path] if file_path else [])
@@ -11131,7 +11196,7 @@ class TUI:
                 _slash_commands = [
                     "/help", "/exit", "/quit", "/q", "/clear", "/model", "/models",
                     "/status", "/save", "/compact", "/yes", "/no", "/tokens",
-                    "/think", "/no-think",
+                    "/think", "/no-think", "/map",
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/gentest", "/watch", "/skills",
@@ -12705,6 +12770,8 @@ class Agent:
         self.git_checkpoint = GitCheckpoint(config.cwd, runtime_state=session.runtime_state)
         self.change_tracker = GitChangeTracker(config.cwd)
         self.auto_test = AutoTestRunner(config.cwd)
+        if config.autotest_on_start:
+            self.auto_test.enabled = True
         self.file_watcher = FileWatcher(config.cwd)
         self.max_iterations = max(1, min(config.max_agent_steps, self.HARD_MAX_ITERATIONS))
         runtime = session.get_resume_summary()
@@ -14096,6 +14163,8 @@ def main():
 
     # Show banner immediately so user sees output while connecting
     tui = TUI(config)
+    if config.headless:
+        tui.is_interactive = False  # suppress spinner/TUI in headless
     if not config.prompt:
         tui.banner(config, model_ok=True)  # skip banner in one-shot mode (-p)
 
@@ -15450,6 +15519,20 @@ def main():
                             print(f"  {C.DIM}No test command detected. Only syntax checks will run.{C.RESET}")
                     continue
 
+                elif cmd == "/map":
+                    _ci = agent.code_intel if hasattr(agent, 'code_intel') else None
+                    if not _ci:
+                        _ci = CodeIntelligence(config.cwd)
+                    _n = _ci.build_index()
+                    _map_text = _ci.repo_map()
+                    _map_lines = _map_text.count("\n")
+                    print(f"\n{_map_text}")
+                    print(f"{C.DIM}{_n} symbols indexed, {_map_lines} lines{C.RESET}")
+                    # Inject into session so LLM has context
+                    session.add_system_note(f"[Repo Map]\n{_map_text}")
+                    print(f"{C.GREEN}Repo map injected into context.{C.RESET}")
+                    continue
+
                 # ── File watcher toggle ───────────────────────────────
                 elif cmd == "/watch":
                     if agent.file_watcher.enabled:
@@ -16337,7 +16420,7 @@ Review this code for:
                         # "Did you mean?" for typo'd slash commands
                         _all_cmds = ["/help", "/exit", "/quit", "/clear", "/model", "/models",
                                      "/status", "/save", "/compact", "/yes", "/no",
-                                     "/tokens", "/think", "/no-think",
+                                     "/tokens", "/think", "/no-think", "/map",
                                      "/commit", "/diff", "/git", "/plan",
                                      "/approve", "/act", "/execute", "/undo", "/init",
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",

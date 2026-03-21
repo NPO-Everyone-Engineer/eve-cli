@@ -54,6 +54,9 @@ eve-cli -p "Hello Worldを作って"
 | `--learn --level <1-5>` | 学習モードの難易度を指定 | `--learn --level 3` |
 | `--loop` | ループモードで実行 | |
 | `--max-agent-steps <N>` | AI の内部ステップ上限（既定: 50） | `--max-agent-steps 80` |
+| `--think` / `--no-think` | Thinking モード（Qwen3 推論）の ON/OFF | `--think` |
+| `--autotest` | 自動 Lint/Test を有効にして起動 | |
+| `--headless` | CI/CD 向けヘッドレスモード（`-p` 必須） | |
 
 ### サイドカーモデルの指定
 
@@ -188,6 +191,62 @@ AI が指定ファイルのユニットテストを自動生成します。
 > /pr merge 42         # PR をマージ
 > /gh issue list       # Issue 一覧
 ```
+
+---
+
+## ヘッドレスモード（CI/CD）
+
+CI/CD パイプラインや自動化スクリプトから EvE CLI を実行するためのモードです。
+
+```bash
+# 基本的な使い方
+eve-cli --headless -p "READMEのタイポを修正して" -y --output-format json
+
+# GitHub Actions で使う場合
+eve-cli --headless -p "lint エラーを修正して" -y --autotest
+```
+
+| 動作 | 説明 |
+|------|------|
+| TUI 無効化 | スピナー・スクロールリージョン・色を無効 |
+| CI 自動検出 | `CI=true` や `GITHUB_ACTIONS` 環境変数で自動有効化 |
+| 終了コード | `0`=成功, `1`=エラー, `2`=タイムアウト, `3`=ループ上限到達 |
+| `-p` 必須 | 対話モードは不可（プロンプトが必要） |
+
+---
+
+## 自動 Lint/Test
+
+ファイル変更のたびに lint と test を自動実行し、失敗したら AI が自動修正します。
+
+```bash
+# 起動時に有効化
+eve-cli --autotest
+
+# セッション中にトグル
+/autotest
+```
+
+### 自動検出されるツール
+
+| 種別 | 検出順序（優先度順） |
+|------|---------------------|
+| **Lint (Python)** | ruff → flake8 → py_compile |
+| **Lint (Node.js)** | eslint |
+| **Test (Python)** | pytest → unittest |
+| **Test (Node.js)** | npm test |
+
+---
+
+## Repo Map（コード構造マップ）
+
+プロジェクト全体のクラス・関数構造を生成し、AI のコンテキストに注入します。
+
+```
+/map
+```
+
+AI が「どのファイルにどんなクラス/関数があるか」を正確に把握するため、大規模プロジェクトでの編集精度が向上します。
 
 ---
 
