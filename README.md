@@ -84,6 +84,10 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 
 - 学習モード（やさしく解説）
 - ループモード（完了まで自動で繰り返す）
+- **自動 Lint/Test** — ファイル変更のたびに ruff/flake8/eslint + pytest を自動実行・自動修正
+- **Repo Map** — プロジェクト構造を AI に注入して大規模コードベースでも正確に編集
+- **Thinking モード** — Qwen3.5 の拡張推論で複雑な問題を深く思考
+- **Headless モード** — CI/CD パイプラインから非対話で実行
 - GitHub 連携
 - Hooks / Skills / MCP
 - コードインテリジェンス
@@ -98,9 +102,10 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 
 | カテゴリ | 内容 |
 |---------|------|
-| **AI エージェント** | 複数の内蔵ツール、Plan/Act モード、Agent Teams、サブエージェント、ステップ数制限管理 |
-| **開発支援** | コミットメッセージ自動生成、テスト生成、ファイル監視、自動テスト、GitHub 連携 |
-| **使いやすさ** | 日本語 UX 完全対応（エラー・ヘルプ・スラッシュコマンド 153 件）、Tab 補完、画像添付、シンタックスハイライト、リッチ diff |
+| **AI エージェント** | 複数の内蔵ツール、Plan/Act モード、Agent Teams、サブエージェント、Thinking モード |
+| **開発支援** | コミット自動生成、テスト生成、自動 Lint/Test（ruff/flake8/eslint）、Repo Map、GitHub 連携 |
+| **CI/CD** | Headless モード、JSON 出力、終了コード、CI 環境自動検出、ループモード |
+| **使いやすさ** | 日本語 UX 完全対応、Tab 補完、画像添付、シンタックスハイライト、リッチ diff |
 | **カスタマイズ** | メモリ（長期記憶）、Skills、Hooks、MCP、プロファイル切替、テーマ変更 |
 | **Channels** | Discord・Slack・Webhook から実行中のエージェントへ双方向通信。ペアリングコードで安全認証 |
 | **安全性** | パーミッション管理、Git チェックポイント、`/undo`、ローカル優先設計 |
@@ -117,8 +122,10 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | モデルを指定する | `eve-cli --model qwen3:8b` |
 | 前回の続きから始める | `eve-cli --resume` |
 | 1回だけ実行する | `eve-cli -p "テストを書いて実行して"` |
+| 自動テスト付きで使う | `eve-cli --autotest` |
+| Thinking モードで使う | `eve-cli --think` |
 | 学習モードで使う | `eve-cli --learn --level 4` |
-| CI/CD 向けに JSON で受け取る | `eve-cli -p "状態を確認して" --output-format json` |
+| CI/CD で実行する | `eve-cli --headless -p "lint修正して" -y --output-format json` |
 | 完了まで自動で回す | `eve-cli -p "失敗テストを直して ALL_DONE と出して" --loop --done-string ALL_DONE -y` |
 | Discord から操作する | `eve-cli --channels discord` |
 
@@ -176,14 +183,6 @@ README は「最初の入口」に絞ってあります。
 | [コマンドリファレンス](docs/commands.md) | スラッシュコマンドと AI ツール一覧 | 全ユーザー |
 | [高度な機能](docs/advanced.md) | メモリ、Hooks、Skills、MCP、Agent Teams、環境変数 | 中〜上級者 |
 | [トラブルシューティング](docs/troubleshooting.md) | よくある問題と解決策 | 困ったとき |
-
----
-
-## CLI キャッチアップ計画
-
-CLI の改善メモや追従状況は、内部ドキュメントとして `00_Docs/20260308_cli_catchup_instruction.md` にまとまっています。
-
-これは主に開発・保守向けの資料です。利用者向けの手順は `docs/` を参照してください。
 
 ---
 
