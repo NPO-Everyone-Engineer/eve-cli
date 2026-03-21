@@ -268,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.8.5"
+__version__ = "2.8.6"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -8642,15 +8642,42 @@ class DiscordAdapter(BaseChannelAdapter):
     POLL_INTERVAL = 3   # seconds between polls
     MAX_MSG_LEN = 1900  # Discord hard limit is 2000; leave margin
 
+    _WATERMARK_FILE = os.path.join(
+        os.path.expanduser("~"), ".config", "eve-cli", "discord_watermarks.json"
+    )
+
     def __init__(self, token, channel_ids):
         super().__init__()
         self._token = token
         self._channel_ids = list(channel_ids)
-        self._last_ids = {}       # channel_id -> last processed message_id
+        self._last_ids = self._load_watermarks()  # channel_id -> last processed message_id
         self._bot_user_id = None  # own ID, to skip self-messages
         self._allowlist = set()   # synced from ChannelManager
         self._pending_pairs = {}  # user_id -> pairing_code
         self._thread = None
+
+    # ── Watermark persistence ────────────────────────────────────────────────
+
+    def _load_watermarks(self):
+        """Load saved message watermarks from disk."""
+        try:
+            if os.path.isfile(self._WATERMARK_FILE):
+                with open(self._WATERMARK_FILE, "r", encoding="utf-8") as f:
+                    data = json.loads(f.read())
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_watermarks(self):
+        """Persist current watermarks to disk."""
+        try:
+            os.makedirs(os.path.dirname(self._WATERMARK_FILE), exist_ok=True)
+            with open(self._WATERMARK_FILE, "w", encoding="utf-8") as f:
+                f.write(json.dumps(self._last_ids, ensure_ascii=False))
+        except Exception:
+            pass
 
     @property
     def name(self):
@@ -8700,7 +8727,10 @@ class DiscordAdapter(BaseChannelAdapter):
         for ch_id in self._channel_ids:
             if ch_id not in self._last_ids:
                 ok, msgs = self._api("GET", f"/channels/{ch_id}/messages?limit=1")
-                self._last_ids[ch_id] = msgs[0]["id"] if (ok and msgs) else "0"
+                if ok and msgs:
+                    self._last_ids[ch_id] = msgs[0]["id"]
+                # If API failed, do NOT set "0" — leave missing so _poll_channel skips it
+        self._save_watermarks()
 
         while not self._stop_event.is_set():
             for ch_id in self._channel_ids:
@@ -8711,17 +8741,26 @@ class DiscordAdapter(BaseChannelAdapter):
             self._stop_event.wait(self.POLL_INTERVAL)
 
     def _poll_channel(self, channel_id):
-        after = self._last_ids.get(channel_id, "0")
+        after = self._last_ids.get(channel_id)
+        if not after:
+            # Watermark not initialized — try to initialize now, skip polling this cycle
+            ok, msgs = self._api("GET", f"/channels/{channel_id}/messages?limit=1")
+            if ok and msgs:
+                self._last_ids[channel_id] = msgs[0]["id"]
+                self._save_watermarks()
+            return
         ok, data = self._api("GET",
                              f"/channels/{channel_id}/messages?limit=10&after={after}")
         if not ok or not isinstance(data, list):
             return
         # Discord returns newest-first; reverse for chronological processing
+        _watermark_advanced = False
         for msg in reversed(data):
             msg_id = msg.get("id", "")
             if not msg_id:
                 continue
             self._last_ids[channel_id] = msg_id  # always advance watermark
+            _watermark_advanced = True
 
             author = msg.get("author", {})
             author_id = author.get("id", "")
@@ -8748,6 +8787,9 @@ class DiscordAdapter(BaseChannelAdapter):
                 reply_target=channel_id,
                 raw=msg,
             ))
+        # Persist watermarks after processing batch
+        if _watermark_advanced:
+            self._save_watermarks()
 
     # ── Pairing ───────────────────────────────────────────────────────────────
 
