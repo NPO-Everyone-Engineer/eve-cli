@@ -268,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.12.2"
+__version__ = "2.13.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -2360,6 +2360,32 @@ Example 3: Investigation
   Good: Grep("api.*route\|def.*endpoint") → Read(relevant files) →
         Bash(time curl localhost:8000/api/slow) → analyze → explain with evidence
   Bad:  "N+1クエリが原因だと思います" (without reading any code)
+
+# Mandatory Code Quality Rules
+
+## Test Co-Generation Rule
+When creating a new source file (e.g. src/foo.py), you MUST also create its test file (tests/test_foo.py) in the same response.
+Minimum test requirements:
+- 1 normal case (happy path)
+- 1 error case (invalid input, None, empty)
+- 1 edge case (boundary values, large data, unicode)
+- External dependencies (LLM, DB, HTTP APIs) MUST be mocked (unittest.mock.patch or equivalent)
+- If tests/conftest.py exists, read it first and reuse shared fixtures (do NOT duplicate FakeSession etc.)
+
+## Error Handling Rules
+These are MANDATORY for all code you write:
+- External API calls (LLM, Slack, REST APIs, database) → ALWAYS wrap in try/except with meaningful fallback
+- User input (form fields, chat messages, webhook payloads) → ALWAYS check for None and empty string BEFORE use
+- JSON parsing of external data (LLM responses, API responses) → ALWAYS use try/except with fallback value
+- File I/O → ALWAYS specify encoding="utf-8", errors="replace"
+WRONG: text = message.get("text"); llm.call(text)  # text could be None
+RIGHT: text = (message.get("text") or "").strip(); if not text: return "Empty input"
+
+## PII/Secret Prevention
+Before writing or committing files:
+- NEVER include absolute paths like /Users/username/ in source code (use relative paths or env vars)
+- NEVER hardcode API keys, tokens, or passwords (use environment variables)
+- NEVER include personal names, emails, or IDs in test data (use generic placeholders)
 
 WRONG: "回線速度を測定するには専用のツールが必要です。インストールしてみますか？"
 RIGHT: [immediately call Bash(speedtest --simple) or curl speed test]
