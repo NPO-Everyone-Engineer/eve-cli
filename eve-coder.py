@@ -268,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.12.1"
+__version__ = "2.12.2"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -11851,6 +11851,8 @@ class TUI:
             self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
 
         full_text = "".join(raw_parts)
+        # Detect if thinking content was produced (before stripping)
+        _had_thinking = bool(re.search(r'<think>[\s\S]+?</think>', full_text))
         # Strip <think>...</think> from final text for history
         full_text = re.sub(r'<think>[\s\S]*?</think>', '', full_text).strip()
         self._scroll_print()  # newline
@@ -11877,10 +11879,10 @@ class TUI:
                 streamed_tool_calls = extracted
                 full_text = cleaned
 
-        return full_text, streamed_tool_calls
+        return full_text, streamed_tool_calls, _had_thinking
 
     def show_sync_response(self, data, known_tools=None):
-        """Display a sync (non-streaming) response. Returns (text, tool_calls)."""
+        """Display a sync (non-streaming) response. Returns (text, tool_calls, had_thinking)."""
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {})
         content = message.get("content", "") or ""
@@ -11888,6 +11890,7 @@ class TUI:
 
         # Extract and display <think>...</think> blocks before stripping
         _think_matches = re.findall(r'<think>([\s\S]*?)</think>', content)
+        _had_thinking = bool(_think_matches)
         for _tm in _think_matches:
             _think_text = _tm.strip()
             if _think_text:
@@ -11914,7 +11917,7 @@ class TUI:
             self._render_markdown(content)
             self._scroll_print()
 
-        return content, tool_calls
+        return content, tool_calls, _had_thinking
 
     # Keyword sets for syntax highlighting (no external deps)
     _SYNTAX_KEYWORDS = {
@@ -13266,13 +13269,15 @@ class Agent:
                 # 2. Parse response
                 if isinstance(response, dict):
                     # Sync response (tool use mode)
-                    text, tool_calls = self.tui.show_sync_response(
+                    _had_thinking = False
+                    text, tool_calls, _had_thinking = self.tui.show_sync_response(
                         response, known_tools=self.registry.names()
                     )
                 else:
                     # Streaming response — ensure generator is closed on exit
+                    _had_thinking = False
                     try:
-                        text, tool_calls = self.tui.stream_response(
+                        text, tool_calls, _had_thinking = self.tui.stream_response(
                             response, known_tools=self.registry.names()
                         )
                     finally:
@@ -13299,6 +13304,15 @@ class Agent:
                 # Handle empty response from local LLM (retry with backoff, max 3)
                 if not text and not tool_calls and iteration < self.max_iterations - 1:
                     _empty_retries += 1
+                    # If model produced thinking but no output, nudge it to respond
+                    if _had_thinking and _empty_retries <= 2:
+                        self.session.add_user_message(
+                            "[SYSTEM] Your thinking completed but you produced no visible output. "
+                            "Please provide your response or call a tool now."
+                        )
+                        if self.config.debug:
+                            print(f"{C.DIM}[debug] Thinking-only response — nudging model to produce output{C.RESET}", file=sys.stderr)
+                        continue
                     if _empty_retries > 3:
                         _p(f"\n{C.YELLOW}AI から空のレスポンスが返されました（モデルが過負荷または非互換の可能性があります）。(The AI returned empty responses - the model may be overloaded or incompatible){C.RESET}")
                         _p(f"{C.DIM}Try rephrasing, or switch models with: /model <name>{C.RESET}")
