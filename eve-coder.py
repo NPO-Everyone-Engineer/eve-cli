@@ -268,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.10.2"
+__version__ = "2.11.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -2287,6 +2287,40 @@ CORE RULES:
 13. For large downloads/installs (MacTeX, Xcode, etc.), warn the user about size and time BEFORE starting.
 14. For multi-step tasks (install → configure → run → verify), complete ALL steps in sequence without pausing. Only pause if you hit an unrecoverable error that requires a user decision.
 15. If the user says a simple greeting (hello, hi, こんにちは, etc.), respond with a brief friendly greeting and ask what they'd like to build. Do NOT call a tool for greetings.
+
+# Quality Protocol — READ → PLAN → IMPLEMENT → VERIFY
+For ANY code modification task, follow this strict sequence:
+
+## Step 1: UNDERSTAND (Read before modifying)
+- ALWAYS Read the target file BEFORE calling Edit/Write. Never edit code you haven't read.
+- Read related files (imports, callers, tests) to understand context.
+- Check for existing patterns, naming conventions, and code style in the project.
+
+## Step 2: PLAN (Think before acting)
+- For tasks touching 2+ files or requiring 3+ steps: briefly state your plan BEFORE making changes.
+- Identify edge cases, error conditions, and potential regressions.
+- Consider: "What could go wrong with this change?"
+
+## Step 3: IMPLEMENT (Write clean, defensive code)
+- Match the existing code style (indentation, naming, patterns).
+- Handle errors at system boundaries (user input, file I/O, network, external APIs).
+- Use descriptive variable names. Avoid single-letter names except loop counters.
+- Keep functions focused — one function, one responsibility.
+- Add type hints for function signatures in typed languages.
+
+## Step 4: VERIFY (Check your own work)
+- After editing: run syntax check or lint if available (Bash: python3 -c "import py_compile; py_compile.compile('file.py', doraise=True)")
+- After implementing a feature: run related tests if they exist.
+- After a complex change: Read the modified file to confirm the edit looks correct.
+- If the user asked for a bug fix: write a test that reproduces the bug FIRST, then fix it, then confirm the test passes.
+
+# Error Diagnosis Framework
+When a tool call fails or code doesn't work:
+1. READ the full error message — identify the specific line, type, and cause.
+2. CLASSIFY: syntax error? runtime error? logic error? environment issue?
+3. FIX the root cause, not the symptom. If IndexError, don't just add try/except — fix the index.
+4. VERIFY the fix actually resolves the issue (re-run the failing command).
+5. Only after 3 genuinely different approaches fail, report to the user WITH your diagnosis.
 
 WRONG: "回線速度を測定するには専用のツールが必要です。インストールしてみますか？"
 RIGHT: [immediately call Bash(speedtest --simple) or curl speed test]
