@@ -268,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.11.0"
+__version__ = "2.12.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -2321,6 +2321,45 @@ When a tool call fails or code doesn't work:
 3. FIX the root cause, not the symptom. If IndexError, don't just add try/except — fix the index.
 4. VERIFY the fix actually resolves the issue (re-run the failing command).
 5. Only after 3 genuinely different approaches fail, report to the user WITH your diagnosis.
+
+# Test-First for Bug Fixes
+When the user reports a bug or asks to fix something:
+1. REPRODUCE: Run the failing command or test to confirm the bug exists.
+2. WRITE TEST: Write a minimal test that reproduces the bug (it should FAIL).
+3. FIX: Make the minimum code change to fix the bug.
+4. VERIFY: Run the test again — it should now PASS.
+5. REGRESSION: Run existing tests to ensure nothing else broke.
+This order ensures the fix is validated, not just "looks right."
+
+# Self-Review After Complex Changes
+After completing a task that modifies 2+ files or adds significant logic:
+1. List all files you modified (use Bash: git diff --name-only or recall from your edits).
+2. Read each modified file to confirm the changes look correct.
+3. Check: Are there any syntax errors? Missing imports? Broken references?
+4. Check: Does the change handle edge cases (empty input, None values, large data)?
+5. Run tests if available. If no tests, run at least a syntax check.
+Only mark the task as complete AFTER this self-review.
+
+# Few-Shot Examples — Good Tool Usage Patterns
+
+Example 1: Bug fix (test-first)
+  User: "login関数でパスワードが空の時にクラッシュする"
+  Good: Read(login.py) → Bash(python3 -m pytest tests/test_login.py -x) to reproduce →
+        Edit(login.py, add validation) → Bash(python3 -m pytest tests/test_login.py -x) to verify
+  Bad:  Edit(login.py, add try/except around everything) → "修正しました"
+
+Example 2: New feature (plan → implement → verify)
+  User: "CSVエクスポート機能を追加して"
+  Good: Read(app.py) to understand structure → Read(models.py) to understand data →
+        Plan: "app.pyにエンドポイント追加、utils/csv_export.pyを新規作成" →
+        Write(utils/csv_export.py) → Edit(app.py) → Bash(python3 -m pytest) → Read(app.py) to confirm
+  Bad:  Write(csv_export.py) without reading existing code → "作成しました"
+
+Example 3: Investigation
+  User: "なんでこのAPIが遅いの？"
+  Good: Grep("api.*route\|def.*endpoint") → Read(relevant files) →
+        Bash(time curl localhost:8000/api/slow) → analyze → explain with evidence
+  Bad:  "N+1クエリが原因だと思います" (without reading any code)
 
 WRONG: "回線速度を測定するには専用のツールが必要です。インストールしてみますか？"
 RIGHT: [immediately call Bash(speedtest --simple) or curl speed test]
@@ -12894,7 +12933,7 @@ class Agent:
     ACT_ONLY_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit"}
 
     def __init__(self, config, client, registry, permissions, session, tui,
-                 rag_engine=None, hook_mgr=None):
+                 rag_engine=None, hook_mgr=None, code_intel=None):
         self.config = config
         self.client = client
         self.registry = registry
@@ -12903,6 +12942,7 @@ class Agent:
         self.tui = tui
         self.rag_engine = rag_engine
         self.hook_mgr = hook_mgr
+        self.code_intel = code_intel
         self._interrupted = threading.Event()
         self._tui_lock = threading.Lock()
         self._plan_mode = False
@@ -14423,8 +14463,15 @@ def main():
             print(f"{C.YELLOW}RAG initialization warning: {e}{C.RESET}")
             _rag_engine = None
 
-    # Code Intelligence (lightweight symbol indexing)
+    # Code Intelligence (lightweight symbol indexing) + auto Repo Map injection
     _code_intel = CodeIntelligence(config.cwd)
+    try:
+        _n_syms = _code_intel.build_index()
+        if _n_syms > 0:
+            _repo_map = _code_intel.repo_map(max_lines=150)
+            system_prompt += f"\n# Repo Map (auto-generated, {_n_syms} symbols)\n{_repo_map}\n"
+    except Exception:
+        pass
 
     session = Session(config, system_prompt)
     session.set_client(client)  # enable sidecar model for context compaction
@@ -14465,7 +14512,7 @@ def main():
         print(f"{C.DIM}[debug] Loaded {len(hook_mgr._hooks)} hooks{C.RESET}", file=sys.stderr)
 
     agent = Agent(config, client, registry, permissions, session, tui,
-                  rag_engine=_rag_engine, hook_mgr=hook_mgr)
+                  rag_engine=_rag_engine, hook_mgr=hook_mgr, code_intel=_code_intel)
 
     # Initialize Channels (if --channels flag was given)
     channel_manager = _build_channel_manager(config)
