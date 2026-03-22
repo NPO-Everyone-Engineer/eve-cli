@@ -200,6 +200,9 @@ MAX_BG_TASKS = 50  # Prevent unbounded memory growth
 _active_scroll_region = None
 # Active TUI reference (set during agent execution, used by tools to stop spinner)
 _active_tui = None
+# Active channel context: set when processing a channel message, cleared after
+# Contains {"channel_manager": ChannelManager, "source_msg": ChannelMessage} or None
+_active_channel_context = None
 
 # Custom commands cache: command_name -> {"description": str, "path": str, "frontmatter": dict}
 _custom_commands = {}
@@ -268,7 +271,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.15.0"
+__version__ = "2.16.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -6614,6 +6617,30 @@ class AskUserQuestionTool(Tool):
         if not question:
             return "Error: question is required"
 
+        # ── Channel mode: route question through channel_manager ──
+        ctx = _active_channel_context
+        if ctx is not None:
+            cm = ctx["channel_manager"]
+            src = ctx["source_msg"]
+            # Format question for channel
+            q_text = f"**Question:** {question}\n"
+            if options:
+                for i, opt in enumerate(options, 1):
+                    q_text += f"  {i}. {opt}\n"
+                q_text += "Reply with a number or type your answer."
+            else:
+                q_text += "Type your answer."
+            answer = cm.ask_question(src, q_text, timeout=300)
+            if not answer or answer.startswith("(no response"):
+                return "User provided no answer (channel timeout)."
+            answer = answer.strip()
+            if options and answer.isdigit():
+                idx = int(answer) - 1
+                if 0 <= idx < len(options):
+                    return f"User chose: {options[idx]}"
+            return f"User answered: {answer}"
+
+        # ── Terminal mode: original input() flow ──
         # Stop tool status spinner before prompting (prevents \r overwrite of input)
         if _active_tui is not None:
             _active_tui.stop_spinner()
@@ -6710,14 +6737,60 @@ class AskUserQuestionBatchTool(Tool):
         "required": ["questions"],
     }
 
+    @staticmethod
+    def _format_questions_text(questions):
+        """Format questions for display (shared between terminal and channel modes)."""
+        lines = []
+        for i, q in enumerate(questions, 1):
+            q_text = q.get("question", "")
+            q_options = q.get("options", [])
+            lines.append(f"Q{i}. {q_text}")
+            if q_options:
+                for j, opt in enumerate(q_options, ord('A')):
+                    lines.append(f"  {chr(j)}. {opt}")
+        lines.append("")
+        lines.append("Reply with answers separated by commas (e.g. A, B, C or 1, 2, custom answer)")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_batch_answers(answer, questions):
+        """Parse comma-separated answers and map to options."""
+        answers = [a.strip() for a in answer.split(',')]
+        results = []
+        for i, q in enumerate(questions, 1):
+            q_options = q.get("options", [])
+            user_answer = answers[i-1] if i-1 < len(answers) else "(no answer)"
+            if q_options and user_answer.isdigit():
+                idx = int(user_answer) - 1
+                if 0 <= idx < len(q_options):
+                    user_answer = q_options[idx]
+            elif q_options and len(user_answer) == 1 and user_answer.upper().isalpha():
+                idx = ord(user_answer.upper()) - ord('A')
+                if 0 <= idx < len(q_options):
+                    user_answer = q_options[idx]
+            results.append({"question_number": i, "question": q.get("question", ""), "answer": user_answer})
+        return "User answered:\n" + "\n".join(f"Q{r['question_number']}: {r['answer']}" for r in results)
+
     def execute(self, params):
         questions = params.get("questions", [])
         if not questions:
             return "Error: questions array is required"
-        
+
         if len(questions) > 10:
             return "Error: maximum 10 questions allowed"
 
+        # ── Channel mode: route questions through channel_manager ──
+        ctx = _active_channel_context
+        if ctx is not None:
+            cm = ctx["channel_manager"]
+            src = ctx["source_msg"]
+            q_text = self._format_questions_text(questions)
+            answer = cm.ask_question(src, q_text, timeout=300)
+            if not answer or answer.startswith("(no response"):
+                return "User provided no answer (channel timeout)."
+            return self._parse_batch_answers(answer.strip(), questions)
+
+        # ── Terminal mode: original input() flow ──
         # Stop tool status spinner before prompting (prevents \r overwrite of input)
         if _active_tui is not None:
             _active_tui.stop_spinner()
@@ -6734,7 +6807,7 @@ class AskUserQuestionBatchTool(Tool):
                 print(f"\n{_ansi(C.CYAN)}{_ansi(C.BOLD)}{'='*60}{_ansi(C.RESET)}")
                 print(f"{_ansi(C.CYAN)}{_ansi(C.BOLD)}質問：{len(questions)}件{_ansi(C.RESET)}")
                 print(f"{_ansi(C.CYAN)}{_ansi(C.BOLD)}{'='*60}{_ansi(C.RESET)}\n")
-                
+
                 for i, q in enumerate(questions, 1):
                     q_text = q.get("question", "")
                     q_options = q.get("options", [])
@@ -6743,7 +6816,7 @@ class AskUserQuestionBatchTool(Tool):
                         for j, opt in enumerate(q_options, ord('A')):
                             print(f"  - {chr(j)}. {opt}")
                     print()
-                
+
                 print(f"{_ansi(C.DIM)}回答形式:{_ansi(C.RESET)}")
                 print(f"  例：A, B, C または 1, 2, 3 または A, B, カスタム回答")
                 print(f"  {_ansi(C.DIM)}各質問の答えをカンマ区切りで入力してください:{_ansi(C.RESET)}")
@@ -6761,38 +6834,7 @@ class AskUserQuestionBatchTool(Tool):
             if not answer:
                 return "User provided no answer."
 
-            # Parse answers (comma-separated)
-            answers = [a.strip() for a in answer.split(',')]
-            
-            # Build result
-            results = []
-            for i, q in enumerate(questions, 1):
-                q_options = q.get("options", [])
-                user_answer = answers[i-1] if i-1 < len(answers) else "(no answer)"
-                
-                # Try to map number to option
-                if q_options and user_answer.isdigit():
-                    idx = int(user_answer) - 1
-                    if 0 <= idx < len(q_options):
-                        user_answer = q_options[idx]
-                # Try to map letter (A, B, C...) to option
-                elif q_options and len(user_answer) == 1 and user_answer.upper().isalpha():
-                    idx = ord(user_answer.upper()) - ord('A')
-                    if 0 <= idx < len(q_options):
-                        user_answer = q_options[idx]
-                
-                results.append({
-                    "question_number": i,
-                    "question": q.get("question", ""),
-                    "answer": user_answer,
-                })
-
-            # Format result string
-            result_lines = []
-            for r in results:
-                result_lines.append(f"Q{r['question_number']}: {r['answer']}")
-            
-            return "User answered:\n" + "\n".join(result_lines)
+            return self._parse_batch_answers(answer, questions)
         finally:
             # Restore scroll region if it was active
             if _scroll_mode_active and _active_scroll_region is not None:
@@ -9747,6 +9789,41 @@ class ChannelManager:
                 adapter.send(msg, content)
             except Exception:
                 pass
+
+    def ask_question(self, source_msg, question_text, timeout=300):
+        """Send a question to the channel and wait for a response.
+
+        Args:
+            source_msg: The original ChannelMessage that triggered this interaction.
+            question_text: Formatted question text to send to the channel.
+            timeout: Max seconds to wait for a response (default 5 minutes).
+
+        Returns:
+            str: The user's answer text, or "(no response - timed out)" on timeout.
+        """
+        # Send question to the channel
+        self.send_reply(source_msg, question_text)
+
+        # Poll the queue for a response from the same sender on the same channel
+        deadline = time.time() + timeout
+        _stash = []  # messages from other senders/channels to re-queue
+        try:
+            while time.time() < deadline:
+                try:
+                    msg = self._queue.get(timeout=min(3.0, deadline - time.time()))
+                except Exception:
+                    continue
+                # Check if this is a reply from the original sender
+                if (msg.channel == source_msg.channel and
+                        msg.sender_id == source_msg.sender_id):
+                    return msg.content
+                else:
+                    _stash.append(msg)  # not for us, save for later
+        finally:
+            # Re-queue stashed messages so they aren't lost
+            for m in _stash:
+                self._queue.put(m)
+        return "(no response - timed out)"
 
     def status(self):
         result = {}
@@ -15169,9 +15246,18 @@ def main():
                         )
                         _ch_input = (f"[Channel:{_ch_msg.channel.upper()} from {_ch_msg.sender_name}] "
                                      f"{_ch_msg.content}")
-                        agent.run(_ch_input)
-                        _ch_reply = agent.get_last_output()
-                        channel_manager.send_reply(_ch_msg, _ch_reply)
+                        # Set channel context so AskUserQuestion tools can route I/O through channels
+                        global _active_channel_context
+                        _active_channel_context = {
+                            "channel_manager": channel_manager,
+                            "source_msg": _ch_msg,
+                        }
+                        try:
+                            agent.run(_ch_input)
+                            _ch_reply = agent.get_last_output()
+                            channel_manager.send_reply(_ch_msg, _ch_reply)
+                        finally:
+                            _active_channel_context = None
                     continue
 
             # ── Non-blocking stdin wait when channels are active ──────────────
