@@ -268,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.14.0"
+__version__ = "2.15.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -2629,6 +2629,97 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
         except Exception as e:
             print(f"{C.YELLOW}{t('warnings.file_read_failed', default=f'Warning: Could not read {fname}: {e}')}{C.RESET}",
                   file=sys.stderr)
+
+    # CLAUDE.md 200-line warning
+    for _, fname, fpath in instruction_items_to_load:
+        if fname in ("CLAUDE.md", ".eve-cli/CLAUDE.md"):
+            try:
+                with open(fpath, encoding="utf-8", errors="replace") as _clf:
+                    _cl_lines = sum(1 for _ in _clf)
+                if _cl_lines > 200:
+                    print(f"{C.YELLOW}Warning: {fname} is {_cl_lines} lines (recommended: ≤200). "
+                          f"Consider splitting into .eve-cli/rules/*.md{C.RESET}", file=sys.stderr)
+            except OSError:
+                pass
+
+    # 3. Load path-scoped rules from .eve-cli/rules/ and ~/.config/eve-cli/rules/
+    def _parse_simple_yaml_frontmatter(text):
+        """Parse YAML frontmatter from markdown, return (frontmatter_dict, body)."""
+        if not text.startswith("---"):
+            return {}, text
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            return {}, text
+        fm = {}
+        for line in parts[1].strip().split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" in line:
+                key, val = line.split(":", 1)
+                key = key.strip()
+                val = val.strip().strip("\"'")
+                if val.startswith("[") and val.endswith("]"):
+                    val = [v.strip().strip("\"'") for v in val[1:-1].split(",") if v.strip()]
+                fm[key] = val
+        return fm, parts[2].strip()
+
+    def _match_path_patterns(patterns, working_files):
+        """Check if any working file matches any of the glob patterns."""
+        import fnmatch
+        for pat in patterns:
+            for wf in working_files:
+                if fnmatch.fnmatch(wf, pat):
+                    return True
+        return False
+
+    # Collect recently touched files for path scoping (from git or session)
+    _working_files = []
+    try:
+        _git_out = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            capture_output=True, text=True, cwd=cwd, timeout=5
+        )
+        if _git_out.returncode == 0 and _git_out.stdout.strip():
+            _working_files = _git_out.stdout.strip().split("\n")
+    except Exception:
+        pass
+
+    _rules_dirs = [
+        os.path.join(config.config_dir, "rules"),  # global: ~/.config/eve-cli/rules/
+        os.path.join(cwd, ".eve-cli", "rules"),     # project: .eve-cli/rules/
+    ]
+    _rules_loaded = 0
+    _rules_max = 4000  # byte budget for rules
+    for _rules_dir in _rules_dirs:
+        if not os.path.isdir(_rules_dir):
+            continue
+        try:
+            _rule_files = sorted(f for f in os.listdir(_rules_dir)
+                                 if f.endswith(".md") and not os.path.islink(os.path.join(_rules_dir, f)))
+        except OSError:
+            continue
+        for _rf in _rule_files:
+            if _rules_loaded >= _rules_max:
+                break
+            _rf_path = os.path.join(_rules_dir, _rf)
+            try:
+                with open(_rf_path, encoding="utf-8", errors="replace") as _rff:
+                    _rf_content = _rff.read(2000)
+            except OSError:
+                continue
+            _rf_fm, _rf_body = _parse_simple_yaml_frontmatter(_rf_content)
+            # Path scoping: skip if paths are specified and no working file matches
+            _rf_paths = _rf_fm.get("paths", [])
+            if _rf_paths and isinstance(_rf_paths, list) and _working_files:
+                if not _match_path_patterns(_rf_paths, _working_files):
+                    continue
+            elif _rf_paths and isinstance(_rf_paths, list) and not _working_files:
+                continue  # paths specified but no working files to match against
+            _safe_rule = _sanitize_instructions(_rf_body)
+            _rule_name = _rf[:-3]  # strip .md
+            prompt += f"\n# Rule: {_rule_name}\n{_safe_rule}\n"
+            _rules_loaded += len(_rf_body)
 
     prompt += _collect_project_context(cwd)
 
@@ -6777,6 +6868,10 @@ class SubAgentTool(Tool):
                     "type": "string",
                     "description": "The task for the sub-agent to perform",
                 },
+                "agent_name": {
+                    "type": "string",
+                    "description": "Name of a defined agent persona from .eve-cli/agents/*.md (e.g. 'code-reviewer'). Overrides default system prompt with the agent's persona.",
+                },
                 "max_turns": {
                     "type": "integer",
                     "description": "Max agent loop iterations (default 10, hard cap 20)",
@@ -6795,8 +6890,57 @@ class SubAgentTool(Tool):
         }
 
     @staticmethod
-    def _build_sub_system_prompt(config):
-        """Build a minimal system prompt for the sub-agent."""
+    def _load_agent_persona(config, agent_name):
+        """Load an agent persona from .eve-cli/agents/ or ~/.config/eve-cli/agents/.
+
+        Returns (system_prompt, allowed_tools, model) or (None, None, None) if not found.
+        """
+        _agent_dirs = [
+            os.path.join(config.cwd, ".eve-cli", "agents"),
+            os.path.join(config.config_dir, "agents"),
+        ]
+        for _adir in _agent_dirs:
+            _apath = os.path.join(_adir, f"{agent_name}.md")
+            if not os.path.isfile(_apath) or os.path.islink(_apath):
+                continue
+            try:
+                with open(_apath, encoding="utf-8", errors="replace") as f:
+                    _acontent = f.read(8000)
+            except OSError:
+                continue
+            # Parse frontmatter
+            fm, body = {}, _acontent
+            if _acontent.startswith("---"):
+                parts = _acontent.split("---", 2)
+                if len(parts) >= 3:
+                    for line in parts[1].strip().split("\n"):
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if ":" in line:
+                            key, val = line.split(":", 1)
+                            key = key.strip()
+                            val = val.strip().strip("\"'")
+                            if key == "tools" and val.startswith("[") and val.endswith("]"):
+                                val = [t.strip() for t in val[1:-1].split(",") if t.strip()]
+                            fm[key] = val
+                    body = parts[2].strip()
+            _tools = fm.get("tools")
+            if isinstance(_tools, str):
+                _tools = [t.strip() for t in _tools.split(",") if t.strip()]
+            _model = fm.get("model")
+            return body, _tools, _model
+        return None, None, None
+
+    @staticmethod
+    def _build_sub_system_prompt(config, persona_prompt=None):
+        """Build a system prompt for the sub-agent, optionally using a persona."""
+        if persona_prompt:
+            return (
+                f"{persona_prompt}\n\n"
+                f"Working directory: {config.cwd}\n"
+                f"Platform: {platform.system().lower()}\n"
+            )
         return (
             "You are a sub-agent assistant. Complete the given task using the available tools. "
             "Be thorough but concise. When you have enough information, provide a clear final answer. "
@@ -6865,14 +7009,32 @@ class SubAgentTool(Tool):
         else:
             sub_config = self._config
 
-        # Determine allowed tool set
-        allowed_tools = set(self.READ_ONLY_TOOLS)
-        if allow_writes:
-            allowed_tools |= self.WRITE_TOOLS
+        # Load agent persona if specified
+        _agent_name = params.get("agent_name", "")
+        _persona_prompt = None
+        _persona_tools = None
+        _persona_model = None
+        if _agent_name:
+            _persona_prompt, _persona_tools, _persona_model = self._load_agent_persona(
+                sub_config, _agent_name)
+            if _persona_prompt is None:
+                _avail_msg = f"Error: agent persona '{_agent_name}' not found. "
+                _avail_msg += "Place agent files in .eve-cli/agents/<name>.md"
+                if structured_result:
+                    return self._format_result_payload(_avail_msg, ok=False, duration=0.0, error=_avail_msg)
+                return _avail_msg
+
+        # Determine allowed tool set (persona tools override defaults)
+        if _persona_tools:
+            allowed_tools = set(_persona_tools)
+        else:
+            allowed_tools = set(self.READ_ONLY_TOOLS)
+            if allow_writes:
+                allowed_tools |= self.WRITE_TOOLS
         sub_tools = self._build_tool_map(allowed_tools, sub_config.cwd)
 
         # Print minimal status (with optional agent label for parallel runs)
-        agent_label = params.get("_agent_label", "")
+        agent_label = params.get("_agent_label", "") or _agent_name
         label_str = f" [{agent_label}]" if agent_label else ""
         prompt_preview = prompt[:80] + ("..." if len(prompt) > 80 else "")
         _sub_start = time.time()
@@ -6885,7 +7047,7 @@ class SubAgentTool(Tool):
 
         # Build sub-agent conversation
         messages = [
-            {"role": "system", "content": self._build_sub_system_prompt(sub_config)},
+            {"role": "system", "content": self._build_sub_system_prompt(sub_config, persona_prompt=_persona_prompt)},
             {"role": "user", "content": prompt},
         ]
 
@@ -6895,8 +7057,9 @@ class SubAgentTool(Tool):
 
         for turn in range(max_turns):
             try:
+                _sub_model = _persona_model or self._config.sidecar_model or self._config.model
                 resp = self._client.chat_sync(
-                    model=self._config.sidecar_model or self._config.model,
+                    model=_sub_model,
                     messages=messages,
                     tools=schemas if schemas else None,
                 )
@@ -7570,6 +7733,45 @@ def _expand_skill_variables(content, arguments="", skill_dir="", cwd=""):
         if token in result:
             value = parts[i] if i < len(parts) else ""
             result = result.replace(token, value)
+    return result
+
+
+def _expand_shell_injections(content, cwd=""):
+    """Expand !`command` shell injection patterns in command/skill content.
+
+    Replaces each !`command` with the stdout of running the command.
+    Timeout: 10s per command, max 5 injections per content.
+    """
+    _SHELL_INJECT_RE = re.compile(r'!\`([^`]+)\`')
+    matches = list(_SHELL_INJECT_RE.finditer(content))
+    if not matches:
+        return content
+    result = content
+    count = 0
+    for match in reversed(matches):  # reverse to preserve offsets
+        if count >= 5:
+            break
+        cmd = match.group(1).strip()
+        if not cmd:
+            continue
+        try:
+            proc = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                cwd=cwd or None, timeout=10,
+            )
+            output = (proc.stdout or "").strip()
+            if proc.returncode != 0 and proc.stderr:
+                output += f"\n(stderr: {proc.stderr.strip()[:200]})"
+            # Truncate very long output
+            if len(output) > 5000:
+                output = output[:2500] + "\n...(truncated)...\n" + output[-2500:]
+        except subprocess.TimeoutExpired:
+            output = f"(command timed out: {cmd[:80]})"
+        except Exception as e:
+            output = f"(command failed: {e})"
+        result = result[:match.start()] + output + result[match.end():]
+        count += 1
     return result
 
 
@@ -14592,6 +14794,45 @@ def main():
         if config.debug:
             print(f"{C.DIM}[debug] Loaded {len(skills)} skills: {', '.join(skills.keys())}{C.RESET}", file=sys.stderr)
 
+    # Load agent personas and inject summaries into system prompt
+    _agent_dirs = [
+        os.path.join(config.cwd, ".eve-cli", "agents"),
+        os.path.join(config.config_dir, "agents"),
+    ]
+    _agents_found = []
+    for _adir in _agent_dirs:
+        if not os.path.isdir(_adir):
+            continue
+        try:
+            for _af in sorted(os.listdir(_adir)):
+                if not _af.endswith(".md") or os.path.islink(os.path.join(_adir, _af)):
+                    continue
+                _aname = _af[:-3]
+                try:
+                    with open(os.path.join(_adir, _af), encoding="utf-8", errors="replace") as _afh:
+                        _ahead = _afh.read(500)
+                except OSError:
+                    continue
+                _adesc = ""
+                if _ahead.startswith("---"):
+                    _aparts = _ahead.split("---", 2)
+                    if len(_aparts) >= 3:
+                        for _al in _aparts[1].strip().split("\n"):
+                            if _al.strip().startswith("description:"):
+                                _adesc = _al.split(":", 1)[1].strip().strip("\"'")
+                                break
+                _agents_found.append((_aname, _adesc))
+        except OSError:
+            pass
+    if _agents_found:
+        system_prompt += "\n# Available Agent Personas\n"
+        system_prompt += "Use SubAgent(agent_name='<name>', prompt='...') to invoke these specialized agents:\n"
+        for _aname, _adesc in _agents_found:
+            system_prompt += f"- **{_aname}**: {_adesc}\n" if _adesc else f"- **{_aname}**\n"
+        if config.debug:
+            print(f"{C.DIM}[debug] Loaded {len(_agents_found)} agent personas: "
+                  f"{', '.join(n for n, _ in _agents_found)}{C.RESET}", file=sys.stderr)
+
     # RAG: inject local context into system prompt (query mode)
     _rag_engine = None
     if config.rag:
@@ -16428,8 +16669,10 @@ def main():
                                 for cname in sorted(_custom_commands.keys()):
                                     cinfo = _custom_commands[cname]
                                     desc = cinfo.get("description", "")
+                                    _arg_hint = (cinfo.get("frontmatter") or {}).get("argument-hint", "")
+                                    _hint_str = f" {_arg_hint}" if _arg_hint else ""
                                     desc_str = f" {C.DIM}- {desc}{C.RESET}" if desc else ""
-                                    print(f"  {_c87c}/{cname}{C.RESET}{desc_str}")
+                                    print(f"  {_c87c}/{cname}{_hint_str}{C.RESET}{desc_str}")
                                 print(f"  {_c51c}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
                             else:
                                 print(f"{C.YELLOW}No custom commands found.{C.RESET}")
@@ -16461,7 +16704,10 @@ Review this code for:
                     _arg_list = cmd_args.split()
                     for i, arg_val in enumerate(_arg_list, start=1):
                         cmd_body = cmd_body.replace(f"${i}", arg_val)
-                    
+
+                    # Expand !`command` shell injections
+                    cmd_body = _expand_shell_injections(cmd_body, cwd=config.cwd)
+
                     # Get allowed tools from frontmatter if specified
                     _allowed_tools = None
                     _frontmatter = cmd_info.get("frontmatter", {})
@@ -16819,6 +17065,8 @@ Review this code for:
                             _skill_info["content"], _skill_args,
                             skill_dir=_skill_info["skill_dir"],
                             cwd=config.cwd)
+                        # Expand !`command` shell injections
+                        _skill_content = _expand_shell_injections(_skill_content, cwd=config.cwd)
                         # Inject as user message and fall through to normal agent processing
                         user_input = _skill_content
                     else:
