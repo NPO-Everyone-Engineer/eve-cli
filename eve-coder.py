@@ -271,7 +271,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.16.0"
+__version__ = "2.16.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -2449,6 +2449,16 @@ For form handling in TypeScript projects:
 - NEVER maintain parallel type definitions that can drift.
 WRONG: Separate interface FormData {{}} and z.object({{}}) that must be kept in sync manually.
 RIGHT: const formSchema = z.object({{...}}); type FormData = z.infer<typeof formSchema>; — used everywhere.
+
+## P1: Runtime Context Awareness Rule (実行時コンテキスト設計)
+When designing features where behavior must differ based on runtime context (e.g. terminal vs channel, CLI vs API, local vs CI):
+- NEVER rely on the LLM choosing a different tool based on context — LLMs cannot reliably distinguish runtime environments.
+- Instead, use a SINGLE tool/function that detects context internally and branches its behavior.
+- Ask: "If I add a new tool, who decides when to call it?" If the answer is "the LLM guesses," the design is wrong.
+- Prefer: context detection via globals/flags/config → automatic behavior switching inside the existing code path.
+WRONG: Create ToolA for terminal and ToolB for Discord — LLM must choose correctly every time.
+RIGHT: Single Tool with internal branch: if channel_mode then route_via_channel() else input().
+This applies to any design where the caller (LLM or user) cannot reliably know or control the execution environment.
 
 WRONG: "回線速度を測定するには専用のツールが必要です。インストールしてみますか？"
 RIGHT: [immediately call Bash(speedtest --simple) or curl speed test]
