@@ -268,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.10.1"
+__version__ = "2.10.2"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -8806,6 +8806,7 @@ class DiscordAdapter(BaseChannelAdapter):
         self._bot_user_id = None  # own ID, to skip self-messages
         self._allowlist = set()   # synced from ChannelManager
         self._pending_pairs = {}  # user_id -> pairing_code
+        self._intent_warned = False  # warn once about missing MESSAGE_CONTENT intent
         self._thread = None
 
     # ── Watermark persistence ────────────────────────────────────────────────
@@ -8921,6 +8922,15 @@ class DiscordAdapter(BaseChannelAdapter):
                 continue
             content = msg.get("content", "").strip()
             if not content:
+                # Detect missing MESSAGE_CONTENT intent: allowed sender but empty content
+                if author_id in self._allowlist and not self._intent_warned:
+                    self._intent_warned = True
+                    _scroll_aware_print(
+                        f"  {C.YELLOW}[discord] メッセージ内容が空です。Bot の MESSAGE_CONTENT intent が"
+                        f"無効の可能性があります。{C.RESET}\n"
+                        f"  {C.DIM}Discord Developer Portal → Bot → Privileged Gateway Intents → "
+                        f"MESSAGE CONTENT INTENT を有効にしてください。{C.RESET}"
+                    )
                 continue
 
             # Unknown sender → send pairing code
@@ -16357,6 +16367,11 @@ Review this code for:
                                 print(f"  {C.DIM}  サーバーでボットに「チャンネルを見る」「メッセージを読む」権限を付与してください。{C.RESET}")
                             elif "Unknown Channel" in str(_err_msg):
                                 print(f"  {C.DIM}→ チャンネル ID が間違っています。{C.RESET}")
+                    # MESSAGE_CONTENT intent check
+                    print(f"\n  {_ansi(chr(27)+'[38;5;87m')}MESSAGE_CONTENT Intent:{C.RESET}")
+                    print(f"  {C.DIM}メンションなしのメッセージに応答するには、Discord Developer Portal で{C.RESET}")
+                    print(f"  {C.DIM}Bot → Privileged Gateway Intents → MESSAGE CONTENT INTENT を有効にしてください。{C.RESET}")
+                    print(f"  {C.DIM}https://discord.com/developers/applications{C.RESET}")
                     continue
 
                 elif cmd == "/discord:access":
