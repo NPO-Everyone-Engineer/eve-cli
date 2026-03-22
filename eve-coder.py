@@ -268,7 +268,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.12.0"
+__version__ = "2.12.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -12775,14 +12775,24 @@ class TUI:
   {_c198}/learn level <1-5>{C.RESET} Set explanation level (1=concise, 5=detailed)
   {_c198}/learn auto on|off{C.RESET} Toggle auto-explain for code/errors
   {_c51}━━ Extensions {sep[13:]}{C.RESET}
-  {_c198}/autotest{C.RESET}          Toggle auto syntax+test after edits
+  {_c198}/autotest{C.RESET}          Toggle auto lint/test (ruff/flake8/eslint + pytest)
   {_c198}/gentest{C.RESET} <file>    Generate unit tests for a Python file
   {_c198}/watch{C.RESET}             Toggle file watcher
+  {_c198}/think{C.RESET}             Enable thinking mode (Qwen3 extended reasoning)
+  {_c198}/no-think{C.RESET}          Disable thinking mode
+  {_c198}/map{C.RESET}               Generate repo map and inject into AI context
   {_c198}/skills{C.RESET}            List loaded skills
   {_c198}/hooks{C.RESET}             List loaded hooks
   {_c198}/index{C.RESET}             Code intelligence (symbols, definitions, references)
   {_c51}━━ Teams {sep[8:]}{C.RESET}
   {_c198}/team{C.RESET} <goal>       Launch agent team to work on goal collaboratively
+  {_c51}━━ Channels {sep[11:]}{C.RESET}
+  {_c198}/discord:configure{C.RESET} Setup Discord bot connection
+  {_c198}/discord:pair{C.RESET} <code> Pair a Discord user
+  {_c198}/discord:status{C.RESET}    Diagnose Discord connection
+  {_c198}/discord:access{C.RESET}    Manage Discord access policy
+  {_c198}/webhook:configure{C.RESET} Setup webhook endpoint
+  {_c198}/slack:configure{C.RESET}   Setup Slack connection
   {_c51}━━ Memory {sep[9:]}{C.RESET}
   {_c198}/memory{C.RESET}             List stored memories
   {_c198}/memory add{C.RESET} <text>  Save a persistent memory (prefix [category] optional)
@@ -12805,11 +12815,15 @@ class TUI:
   {_c198}--session-id ID{C.RESET}    Resume specific session
   {_c198}--list-sessions{C.RESET}    List saved sessions
   {_c198}-p "prompt"{C.RESET}        One-shot mode
+  {_c198}--think{C.RESET}            Enable thinking mode (Qwen3 extended reasoning)
+  {_c198}--autotest{C.RESET}         Enable auto lint/test after edits
+  {_c198}--headless{C.RESET}         CI/CD mode (no TUI, requires -p)
+  {_c198}--channels X{C.RESET}       Enable channels (discord, slack, webhook)
   {_c51}━━ Tools {sep[8:]}{C.RESET}
-  {_c87}Bash, Read, Write, Edit, Glob, Grep,{C.RESET}
-  {_c87}WebFetch, WebSearch, NotebookEdit,{C.RESET}
-  {_c87}TaskCreate/List/Get/Update, SubAgent,{C.RESET}
-  {_c87}ParallelAgents, AskUserQuestion/Batch{C.RESET}
+  {_c87}Bash, Read, Write, Edit, MultiEdit,{C.RESET}
+  {_c87}Glob, Grep, WebFetch, WebSearch,{C.RESET}
+  {_c87}NotebookEdit, SubAgent, ParallelAgents,{C.RESET}
+  {_c87}AskUserQuestion/Batch, MCP tools{C.RESET}
   {_c51}{sep}{C.RESET}{ime_hint}
 """)
 
