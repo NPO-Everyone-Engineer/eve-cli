@@ -271,7 +271,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.16.1"
+__version__ = "2.21.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1169,6 +1169,13 @@ class Config:
         self.ui_theme = "normal"  # UI theme: normal, gal, dandy, bushi
         self.autotest_on_start = False  # --autotest flag
         self.headless = False           # --headless (CI/CD mode)
+        self.max_turns = None           # --max-turns (agent turn limit in headless/one-shot)
+        self.carry_session = False      # --carry-session (loop mode history carryover)
+        self.auto_context = True        # auto project context analysis on startup
+        self.context_refresh = False    # force refresh cached context
+        self.sandbox = None             # --sandbox (docker/podman/auto)
+        self.sandbox_image = "python:3-slim"  # --sandbox-image
+        self.sandbox_no_network = False  # --sandbox-no-network
 
         # Channels
         self.channels = []  # list of enabled channel names e.g. ["webhook", "discord"]
@@ -1451,7 +1458,21 @@ class Config:
         parser.add_argument("--autotest", action="store_true", default=False,
                             help="Enable auto lint/test after file changes")
         parser.add_argument("--headless", action="store_true", default=False,
-                            help="Headless mode for CI/CD (no TUI, no colors, requires -p)")
+                            help="Headless mode for CI/CD (no TUI, no colors, requires -p or stdin)")
+        parser.add_argument("--max-turns", type=int, default=None,
+                            help="Max agent turns in headless/one-shot mode")
+        parser.add_argument("--carry-session", action="store_true", default=False,
+                            help="Carry session history across loop iterations (default: fresh each time)")
+        parser.add_argument("--no-auto-context", action="store_true", default=False,
+                            help="Disable automatic project context analysis on startup")
+        parser.add_argument("--context-refresh", action="store_true", default=False,
+                            help="Force refresh of cached project context")
+        parser.add_argument("--sandbox", choices=["docker", "podman", "auto"], default=None,
+                            help="Run Bash commands in a container sandbox (docker/podman/auto)")
+        parser.add_argument("--sandbox-image", default="python:3-slim",
+                            help="Docker/Podman image for sandbox (default: python:3-slim)")
+        parser.add_argument("--sandbox-no-network", action="store_true", default=False,
+                            help="Disable network access in sandbox containers")
         parser.add_argument("--channels", default="", metavar="NAMES",
                             help="Enable external channels (comma-separated): webhook, discord, slack")
         args = parser.parse_args(argv)
@@ -1555,12 +1576,36 @@ class Config:
         # Autotest
         if args.autotest:
             self.autotest_on_start = True
+        # Max turns and carry-session
+        if args.max_turns is not None:
+            if args.max_turns < 1:
+                print("Error: --max-turns must be >= 1", file=sys.stderr)
+                sys.exit(1)
+            self.max_turns = args.max_turns
+        if args.carry_session:
+            self.carry_session = True
+        if args.no_auto_context:
+            self.auto_context = False
+        if args.context_refresh:
+            self.context_refresh = True
+        if args.sandbox:
+            self.sandbox = args.sandbox
+        if args.sandbox_image:
+            self.sandbox_image = args.sandbox_image
+        if args.sandbox_no_network:
+            self.sandbox_no_network = True
         # Headless mode (CI/CD)
         if args.headless or os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS"):
             self.headless = True
             C._enabled = False  # disable colors
+            # Try reading from stdin pipe if -p not given
+            if not self.prompt and not sys.stdin.isatty():
+                try:
+                    self.prompt = sys.stdin.read().strip()
+                except Exception:
+                    pass
             if not self.prompt:
-                print("Error: --headless requires -p <prompt>", file=sys.stderr)
+                print("Error: --headless requires -p <prompt> or piped stdin", file=sys.stderr)
                 sys.exit(1)
         # Channels
         if args.channels:
@@ -2261,6 +2306,444 @@ def _collect_project_context(cwd):
     return f"\n# Project Context\n{ctx}\n"
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# Project Context Auto-Learning — static analysis + caching
+# ════════════════════════════════════════════════════════════════════════════════
+
+class ProjectContextCache:
+    """Cache project context analysis results in .eve-cli/context/project.json.
+
+    Uses git commit hash as cache key for freshness detection.
+    Falls back gracefully when git is unavailable or cache is unwritable.
+    """
+
+    _CACHE_DIR = ".eve-cli/context"
+    _CACHE_FILE = "project.json"
+
+    def __init__(self, cwd):
+        self.cwd = cwd
+        self._cache_path = os.path.join(cwd, self._CACHE_DIR, self._CACHE_FILE)
+
+    def _get_current_commit(self):
+        """Get current HEAD commit hash, or None if not a git repo."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.cwd, capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return None
+
+    def load(self):
+        """Load cached context if valid (commit matches). Returns dict or None."""
+        try:
+            if not os.path.isfile(self._cache_path):
+                return None
+            if os.path.islink(self._cache_path):
+                return None  # symlink safety
+            with open(self._cache_path, encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            # Validate cache freshness by commit hash
+            cached_commit = data.get("commit")
+            if cached_commit and cached_commit == self._get_current_commit():
+                return data
+        except (json.JSONDecodeError, OSError, KeyError):
+            pass
+        return None
+
+    def save(self, data):
+        """Save context data to cache file."""
+        try:
+            cache_dir = os.path.join(self.cwd, self._CACHE_DIR)
+            os.makedirs(cache_dir, exist_ok=True)
+            data["commit"] = self._get_current_commit() or ""
+            data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            with open(self._cache_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass  # cache write failure is non-fatal
+
+
+def _analyze_project_static(cwd):
+    """Phase 1: Static project analysis — reads config files, no LLM needed.
+
+    Detects: language, framework, test framework, linter, package manager,
+    directory structure (depth 2), coding conventions from .editorconfig.
+    Returns dict with analysis results.
+    """
+    result = {
+        "language": [],
+        "framework": [],
+        "test_fw": [],
+        "linter": [],
+        "pkg_manager": "",
+        "conventions": {},
+        "dir_snapshot": [],
+    }
+
+    _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox",
+                  ".mypy_cache", ".pytest_cache", ".eggs", "dist", "build",
+                  ".eve-cli", ".claude", ".qwen", ".next", ".nuxt", "target"}
+
+    # Language & framework detection from marker files
+    _LANG_MARKERS = {
+        "package.json": "JavaScript/TypeScript",
+        "requirements.txt": "Python", "pyproject.toml": "Python", "setup.py": "Python",
+        "go.mod": "Go", "go.sum": "Go",
+        "Cargo.toml": "Rust",
+        "Gemfile": "Ruby",
+        "pom.xml": "Java", "build.gradle": "Java",
+        "composer.json": "PHP",
+        "Package.swift": "Swift",
+    }
+    for fname, lang in _LANG_MARKERS.items():
+        if os.path.isfile(os.path.join(cwd, fname)) and lang not in result["language"]:
+            result["language"].append(lang)
+
+    # Framework detection from package.json devDependencies / dependencies
+    pkg_json_path = os.path.join(cwd, "package.json")
+    if os.path.isfile(pkg_json_path):
+        try:
+            with open(pkg_json_path, encoding="utf-8", errors="replace") as f:
+                pkg = json.load(f)
+            all_deps = {}
+            all_deps.update(pkg.get("dependencies", {}))
+            all_deps.update(pkg.get("devDependencies", {}))
+            _FW_MAP = {
+                "react": "React", "next": "Next.js", "vue": "Vue",
+                "nuxt": "Nuxt", "svelte": "Svelte", "@angular/core": "Angular",
+                "express": "Express", "fastify": "Fastify", "hono": "Hono",
+            }
+            for dep_name, fw_name in _FW_MAP.items():
+                if dep_name in all_deps and fw_name not in result["framework"]:
+                    result["framework"].append(fw_name)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Framework from pyproject.toml (simple regex, no toml parser needed)
+    pyproject_path = os.path.join(cwd, "pyproject.toml")
+    if os.path.isfile(pyproject_path):
+        try:
+            with open(pyproject_path, encoding="utf-8", errors="replace") as f:
+                pyproject_text = f.read(65536)  # 64KB cap
+            _PY_FW = {"django": "Django", "flask": "Flask", "fastapi": "FastAPI",
+                       "starlette": "Starlette", "tornado": "Tornado"}
+            lower_text = pyproject_text.lower()
+            for key, name in _PY_FW.items():
+                if key in lower_text and name not in result["framework"]:
+                    result["framework"].append(name)
+        except OSError:
+            pass
+
+    # Test framework detection
+    _TEST_MARKERS = [
+        ("pytest.ini", "pytest"), ("conftest.py", "pytest"),
+        ("jest.config.js", "Jest"), ("jest.config.ts", "Jest"), ("jest.config.mjs", "Jest"),
+        (".mocharc.yml", "Mocha"), (".mocharc.json", "Mocha"),
+        ("vitest.config.ts", "Vitest"), ("vitest.config.js", "Vitest"),
+        ("karma.conf.js", "Karma"),
+        ("phpunit.xml", "PHPUnit"),
+    ]
+    for fname, fw in _TEST_MARKERS:
+        if os.path.isfile(os.path.join(cwd, fname)) and fw not in result["test_fw"]:
+            result["test_fw"].append(fw)
+    # pytest from pyproject.toml
+    if os.path.isfile(pyproject_path):
+        try:
+            with open(pyproject_path, encoding="utf-8", errors="replace") as f:
+                if "[tool.pytest" in f.read(65536) and "pytest" not in result["test_fw"]:
+                    result["test_fw"].append("pytest")
+        except OSError:
+            pass
+
+    # Linter detection
+    _LINTER_MARKERS = [
+        (".eslintrc", "ESLint"), (".eslintrc.js", "ESLint"), (".eslintrc.json", "ESLint"),
+        ("eslint.config.js", "ESLint"), ("eslint.config.mjs", "ESLint"),
+        (".flake8", "flake8"),
+        (".prettierrc", "Prettier"), (".prettierrc.json", "Prettier"),
+        ("biome.json", "Biome"),
+        (".rubocop.yml", "RuboCop"),
+        ("golangci.yml", "golangci-lint"), (".golangci.yml", "golangci-lint"),
+    ]
+    for fname, linter in _LINTER_MARKERS:
+        if os.path.isfile(os.path.join(cwd, fname)) and linter not in result["linter"]:
+            result["linter"].append(linter)
+    # ruff from pyproject.toml
+    if os.path.isfile(pyproject_path):
+        try:
+            with open(pyproject_path, encoding="utf-8", errors="replace") as f:
+                if "[tool.ruff" in f.read(65536) and "ruff" not in result["linter"]:
+                    result["linter"].append("ruff")
+        except OSError:
+            pass
+    # ruff.toml
+    if os.path.isfile(os.path.join(cwd, "ruff.toml")) and "ruff" not in result["linter"]:
+        result["linter"].append("ruff")
+
+    # Package manager detection
+    _PKG_MARKERS = [
+        ("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"),
+        ("package-lock.json", "npm"), ("bun.lockb", "bun"),
+        ("Pipfile.lock", "pipenv"), ("poetry.lock", "poetry"),
+        ("uv.lock", "uv"),
+    ]
+    for fname, mgr in _PKG_MARKERS:
+        if os.path.isfile(os.path.join(cwd, fname)):
+            result["pkg_manager"] = mgr
+            break
+
+    # .editorconfig conventions
+    editorconfig_path = os.path.join(cwd, ".editorconfig")
+    if os.path.isfile(editorconfig_path):
+        try:
+            with open(editorconfig_path, encoding="utf-8", errors="replace") as f:
+                ec_text = f.read(8192)
+            indent_match = re.search(r'indent_style\s*=\s*(\w+)', ec_text)
+            size_match = re.search(r'indent_size\s*=\s*(\d+)', ec_text)
+            if indent_match:
+                style = indent_match.group(1)
+                size = size_match.group(1) if size_match else "4"
+                result["conventions"]["indent"] = f"{style}:{size}"
+            eol_match = re.search(r'end_of_line\s*=\s*(\w+)', ec_text)
+            if eol_match:
+                result["conventions"]["eol"] = eol_match.group(1)
+        except OSError:
+            pass
+
+    # Directory structure snapshot (depth 2)
+    try:
+        for entry in sorted(os.listdir(cwd)):
+            if entry in _SKIP_DIRS or entry.startswith("."):
+                continue
+            entry_path = os.path.join(cwd, entry)
+            if os.path.isdir(entry_path) and not os.path.islink(entry_path):
+                result["dir_snapshot"].append(entry + "/")
+                try:
+                    for sub in sorted(os.listdir(entry_path))[:10]:
+                        sub_path = os.path.join(entry_path, sub)
+                        if os.path.isdir(sub_path) and sub not in _SKIP_DIRS:
+                            result["dir_snapshot"].append(f"  {entry}/{sub}/")
+                except OSError:
+                    pass
+            if len(result["dir_snapshot"]) > 50:
+                break
+    except OSError:
+        pass
+
+    return result
+
+
+def _build_project_context_cached(config):
+    """Build enhanced project context with caching.
+
+    Phase 1: Static analysis (fast, no LLM)
+    Phase 2: Symbol index (via CodeIntelligence, no LLM)
+    Results cached in .eve-cli/context/project.json, keyed by git commit.
+    Falls back to basic _collect_project_context() on any error.
+    """
+    cwd = config.cwd
+    MAX_BYTES = 4000
+
+    # Start with basic git context (always fresh — branch/commits change often)
+    base_ctx = _collect_project_context(cwd)
+
+    # Check if auto-context is disabled
+    if getattr(config, "auto_context", True) is False:
+        return base_ctx
+
+    cache = ProjectContextCache(cwd)
+
+    # Try loading from cache (unless --context-refresh)
+    if not getattr(config, "context_refresh", False):
+        cached = cache.load()
+        if cached:
+            return base_ctx + _format_cached_context(cached)
+
+    # Cache miss — run static analysis
+    try:
+        analysis = _analyze_project_static(cwd)
+        cache.save(analysis)
+        return base_ctx + _format_cached_context(analysis)
+    except Exception:
+        return base_ctx
+
+
+def _format_cached_context(data):
+    """Format cached analysis data as system prompt section."""
+    sections = []
+
+    langs = data.get("language", [])
+    if langs:
+        sections.append(f"Languages: {', '.join(langs)}")
+
+    fws = data.get("framework", [])
+    if fws:
+        sections.append(f"Frameworks: {', '.join(fws)}")
+
+    test_fws = data.get("test_fw", [])
+    if test_fws:
+        sections.append(f"Test frameworks: {', '.join(test_fws)}")
+
+    linters = data.get("linter", [])
+    if linters:
+        sections.append(f"Linters: {', '.join(linters)}")
+
+    pkg = data.get("pkg_manager", "")
+    if pkg:
+        sections.append(f"Package manager: {pkg}")
+
+    conventions = data.get("conventions", {})
+    if conventions:
+        conv_parts = [f"{k}={v}" for k, v in conventions.items()]
+        sections.append(f"Conventions: {', '.join(conv_parts)}")
+
+    dirs = data.get("dir_snapshot", [])
+    if dirs:
+        # Show top-level only for brevity
+        top_dirs = [d for d in dirs if not d.startswith("  ")][:15]
+        sections.append(f"Structure: {' '.join(top_dirs)}")
+
+    sym_count = data.get("symbol_count")
+    if sym_count:
+        sections.append(f"Indexed symbols: {sym_count}")
+
+    if not sections:
+        return ""
+    return "\n# Project Analysis (cached)\n" + "\n".join(sections) + "\n"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Code Review Agent — /review command infrastructure
+# ════════════════════════════════════════════════════════════════════════════════
+
+_REVIEW_SYSTEM_PROMPT = """You are a senior code reviewer. Analyze the provided diff and produce a structured review.
+
+## Review Dimensions
+1. **Security** — injection, auth flaws, secrets exposure, SSRF, path traversal
+2. **Performance** — N+1 queries, unbounded loops, missing caching, large allocations
+3. **Maintainability** — code duplication, unclear naming, missing error handling, tight coupling
+
+## Output Format
+Produce a Markdown table followed by a summary:
+
+| Severity | Category | File:Line | Issue | Suggestion |
+|----------|----------|-----------|-------|------------|
+| Critical | Security | path:42  | ...   | ...        |
+| High     | Perf     | path:88  | ...   | ...        |
+| Medium   | Maint    | path:12  | ...   | ...        |
+| Low      | Maint    | path:55  | ...   | ...        |
+
+## Summary
+- Total issues: N (X critical, Y high, Z medium, W low)
+- Overall assessment: 1-2 sentences
+
+## Rules
+- Only report real issues found in the diff — never fabricate line numbers.
+- If the diff is clean, say so. Do not invent problems.
+- Be concise: max 15 issues. Prioritize by severity.
+- Use the exact file paths from the diff.
+"""
+
+_REVIEW_MAX_DIFF_BYTES = 100_000  # 100KB cap for diff content
+
+
+def _get_review_diff(cwd, target=None):
+    """Get diff content for code review.
+
+    Args:
+        cwd: Working directory
+        target: None (uncommitted changes), "HEAD~N" (last N commits),
+                "--staged" (staged only), or PR number string like "123"
+    Returns:
+        tuple: (diff_content, source_description) or (None, error_message)
+    """
+    try:
+        if target and target.strip() == "--staged":
+            result = subprocess.run(
+                ["git", "diff", "--staged"],
+                cwd=cwd, capture_output=True, text=True, timeout=30,
+            )
+            desc = "staged changes"
+        elif target and target.strip().isdigit():
+            # PR number — use gh pr diff
+            pr_num = target.strip()
+            if not shutil.which("gh"):
+                return None, "Error: 'gh' CLI not installed. Install from https://cli.github.com/"
+            result = subprocess.run(
+                ["gh", "pr", "diff", pr_num],
+                cwd=cwd, capture_output=True, text=True, timeout=30,
+            )
+            desc = f"PR #{pr_num}"
+        elif target and target.strip().startswith("HEAD"):
+            result = subprocess.run(
+                ["git", "diff", target.strip()],
+                cwd=cwd, capture_output=True, text=True, timeout=30,
+            )
+            desc = f"changes in {target.strip()}"
+        else:
+            # Default: all uncommitted changes (staged + unstaged)
+            result = subprocess.run(
+                ["git", "diff", "HEAD"],
+                cwd=cwd, capture_output=True, text=True, timeout=30,
+            )
+            desc = "uncommitted changes"
+
+        if result.returncode != 0:
+            return None, f"Error getting diff: {result.stderr.strip()}"
+
+        diff = result.stdout.strip()
+        if not diff:
+            return None, "No changes found."
+
+        # Truncate if too large
+        if len(diff.encode("utf-8", errors="replace")) > _REVIEW_MAX_DIFF_BYTES:
+            diff = diff.encode("utf-8", errors="replace")[:_REVIEW_MAX_DIFF_BYTES].decode("utf-8", errors="ignore")
+            diff += "\n\n... (diff truncated at 100KB — review may be incomplete)"
+
+        return diff, desc
+
+    except subprocess.TimeoutExpired:
+        return None, "Error: diff command timed out."
+    except Exception as e:
+        return None, f"Error: {e}"
+
+
+def _run_code_review(config, agent, session, tui, target=None):
+    """Execute code review using the agent with a specialized review prompt.
+
+    Args:
+        config: Config instance
+        agent: Agent instance
+        session: Session instance
+        tui: TUI instance
+        target: Review target (see _get_review_diff)
+    """
+    diff, desc = _get_review_diff(config.cwd, target)
+    if diff is None:
+        print(f"  {C.YELLOW}{desc}{C.RESET}")
+        return
+
+    print(f"  {C.CYAN}Reviewing {desc}...{C.RESET}")
+
+    # Build review prompt with diff content
+    review_prompt = (
+        f"{_REVIEW_SYSTEM_PROMPT}\n\n"
+        f"## Diff to Review ({desc})\n"
+        f"```diff\n{diff}\n```\n\n"
+        f"Analyze this diff and produce the structured review table."
+    )
+
+    session.add_user_message(review_prompt)
+    try:
+        agent.run(review_prompt)
+    except Exception as e:
+        print(f"  {C.RED}Review failed: {e}{C.RESET}")
+
+
 def _build_system_prompt(config):
     """Build system prompt with environment info and OS-specific hints."""
     cwd = config.cwd
@@ -2739,7 +3222,7 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
             prompt += f"\n# Rule: {_rule_name}\n{_safe_rule}\n"
             _rules_loaded += len(_rf_body)
 
-    prompt += _collect_project_context(cwd)
+    prompt += _build_project_context_cached(config)
 
     # Inject persistent memory
     memory = Memory(config.config_dir)
@@ -3997,6 +4480,94 @@ class CodeIntelligence:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Headless Output Collector — structured JSON output for CI/CD
+# ════════════════════════════════════════════════════════════════════════════════
+
+class HeadlessOutputCollector:
+    """Collects tool calls, results, and assistant text for structured JSON output.
+
+    Used in headless/CI mode to produce machine-readable output.
+    Each event is flushed as a single JSON line to stdout (stream-json mode)
+    or accumulated for a final summary (json mode).
+    """
+
+    def __init__(self, output_format="json", model="", session_id=""):
+        self._output_format = output_format  # "json" or "stream-json"
+        self._model = model
+        self._session_id = session_id
+        self._events = []
+        self._lock = threading.Lock()
+        self._tool_call_count = 0
+        self._last_text = ""
+
+    def tool_call(self, tool_name, params):
+        """Record a tool invocation."""
+        event = {
+            "type": "tool_call",
+            "tool": tool_name,
+            "params": params,
+            "timestamp": time.time(),
+        }
+        with self._lock:
+            self._events.append(event)
+            self._tool_call_count += 1
+        if self._output_format == "stream-json":
+            self._flush_line(event)
+
+    def tool_result(self, tool_name, result, is_error=False):
+        """Record a tool execution result."""
+        # Truncate long results for structured output
+        output = str(result)
+        if len(output) > 10000:
+            output = output[:10000] + "... (truncated)"
+        event = {
+            "type": "tool_result",
+            "tool": tool_name,
+            "output": output,
+            "is_error": is_error,
+            "timestamp": time.time(),
+        }
+        with self._lock:
+            self._events.append(event)
+        if self._output_format == "stream-json":
+            self._flush_line(event)
+
+    def assistant_text(self, text):
+        """Record assistant text output."""
+        if not text:
+            return
+        event = {
+            "type": "assistant",
+            "content": text,
+            "timestamp": time.time(),
+        }
+        with self._lock:
+            self._events.append(event)
+            self._last_text = text
+        if self._output_format == "stream-json":
+            self._flush_line(event)
+
+    def _flush_line(self, event):
+        """Write a single JSON line to stdout (thread-safe via _lock)."""
+        try:
+            print(json.dumps(event, ensure_ascii=False), flush=True)
+        except Exception:
+            pass
+
+    def get_summary(self):
+        """Return final summary dict for json output mode."""
+        with self._lock:
+            return {
+                "role": "assistant",
+                "content": self._last_text,
+                "model": self._model,
+                "session_id": self._session_id,
+                "tool_calls": self._tool_call_count,
+                "events": self._events,
+            }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Tool Base Class + Registry
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -4049,6 +4620,117 @@ class Tool(ABC):
         }
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# Sandbox Runtime — Docker/Podman container isolation for Bash execution
+# ════════════════════════════════════════════════════════════════════════════════
+
+class SandboxRuntime:
+    """Docker/Podman container sandbox for executing Bash commands in isolation.
+
+    Provides process-level isolation with:
+    - Volume mount of project directory (read-write)
+    - Dropped capabilities (--cap-drop ALL)
+    - Read-only root filesystem (--read-only --tmpfs /tmp)
+    - Optional network isolation (--network none)
+    - User namespace mapping to host user
+    """
+
+    def __init__(self, cwd, image="python:3-slim", no_network=False):
+        self.cwd = cwd
+        self.image = image
+        self.no_network = no_network
+        self._runtime = self._detect_runtime()
+
+    @staticmethod
+    def _detect_runtime():
+        """Detect available container runtime: docker or podman."""
+        for rt in ("docker", "podman"):
+            if shutil.which(rt):
+                try:
+                    result = subprocess.run(
+                        [rt, "info"], capture_output=True, timeout=10,
+                    )
+                    if result.returncode == 0:
+                        return rt
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+        return None
+
+    @property
+    def is_available(self):
+        """Check if container runtime is available."""
+        return self._runtime is not None
+
+    @property
+    def runtime_name(self):
+        return self._runtime or "none"
+
+    def run_command(self, command, timeout_s=120, env=None):
+        """Execute a command inside a container.
+
+        Args:
+            command: Shell command string
+            timeout_s: Timeout in seconds
+            env: Optional dict of environment variables to pass
+
+        Returns:
+            tuple: (output_string, return_code)
+        """
+        if not self._runtime:
+            raise RuntimeError("No container runtime available")
+
+        import shlex
+        cmd = [self._runtime, "run", "--rm"]
+
+        # Security hardening
+        cmd.extend(["--cap-drop", "ALL"])
+        cmd.extend(["--security-opt", "no-new-privileges"])
+        cmd.extend(["--read-only"])
+        cmd.extend(["--tmpfs", "/tmp:rw,noexec,nosuid,size=256m"])
+
+        # User mapping (match host user to avoid permission issues)
+        try:
+            uid = os.getuid()
+            gid = os.getgid()
+            cmd.extend(["--user", f"{uid}:{gid}"])
+        except AttributeError:
+            pass  # Windows — skip user mapping
+
+        # Network isolation
+        if self.no_network:
+            cmd.extend(["--network", "none"])
+
+        # Mount project directory
+        quoted_cwd = self.cwd
+        cmd.extend(["-v", f"{quoted_cwd}:{quoted_cwd}:rw"])
+        cmd.extend(["-w", quoted_cwd])
+
+        # Pass environment variables
+        if env:
+            for k, v in env.items():
+                cmd.extend(["-e", f"{k}={v}"])
+
+        # Image and command
+        cmd.extend([self.image, "sh", "-c", command])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                stdin=subprocess.DEVNULL,
+            )
+            output = result.stdout
+            if result.stderr:
+                output += result.stderr
+            return output.rstrip(), result.returncode
+        except subprocess.TimeoutExpired:
+            return f"Command timed out after {timeout_s}s (sandbox)", 124
+        except OSError as e:
+            return f"Sandbox execution error: {e}", 1
+
+
 class BashTool(Tool):
     name = "Bash"
     description = """bash コマンドをサブプロセスで実行する。
@@ -4082,6 +4764,36 @@ class BashTool(Tool):
         },
         "required": ["command"],
     }
+
+    def __init__(self, cwd=None, config=None):
+        super().__init__(cwd)
+        self._config = config
+        self._sandbox = None  # lazy-init SandboxRuntime
+
+    def _get_sandbox(self):
+        """Lazy-initialize sandbox runtime if configured."""
+        if self._sandbox is not None:
+            return self._sandbox
+        if self._config and getattr(self._config, "sandbox", None):
+            sandbox_mode = self._config.sandbox
+            image = getattr(self._config, "sandbox_image", "python:3-slim")
+            no_network = getattr(self._config, "sandbox_no_network", False)
+            rt = SandboxRuntime(self.cwd, image=image, no_network=no_network)
+            if sandbox_mode == "auto":
+                self._sandbox = rt if rt.is_available else False
+            elif rt.is_available:
+                self._sandbox = rt
+            else:
+                print(f"Warning: --sandbox {sandbox_mode} requested but "
+                      f"{sandbox_mode} is not available. Falling back to host execution.",
+                      file=sys.stderr)
+                self._sandbox = False
+            if self._sandbox and self._sandbox is not False:
+                print(f"  Sandbox: {self._sandbox.runtime_name} ({image})"
+                      f"{' [no-network]' if no_network else ''}", file=sys.stderr)
+        else:
+            self._sandbox = False
+        return self._sandbox if self._sandbox is not False else None
 
     def _build_clean_env(self):
         """Build sanitized environment dict, stripping secrets."""
@@ -4309,6 +5021,15 @@ class BashTool(Tool):
             return f"Background task started: {task_id}\nUse Bash(command='bg_status {task_id}') to check result."
 
         try:
+            # Sandbox routing: if sandbox is configured, execute via container
+            sandbox = self._get_sandbox()
+            if sandbox:
+                clean_env = self._build_clean_env()
+                output, returncode = sandbox.run_command(command, timeout_s=timeout_s, env=clean_env)
+                if returncode != 0:
+                    return f"{output}\n(exit code: {returncode})"
+                return output if output else "(no output)"
+
             clean_env = self._build_clean_env()
             # Use process group on Unix to ensure all child processes are killed on timeout
             use_pgroup = platform.system() != "Windows"
@@ -7710,6 +8431,376 @@ def _load_mcp_servers(config):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Extension Manager — install/uninstall/list community extensions
+# ════════════════════════════════════════════════════════════════════════════════
+
+class ExtensionManager:
+    """Manage community extensions (skills, agents, MCP configs) from GitHub repos.
+
+    Extensions are installed to ~/.config/eve-cli/extensions/<name>/ and must
+    contain an extension.json manifest file.
+    """
+
+    _ALLOWED_FILE_EXTS = {".md", ".json", ".yaml", ".yml", ".txt"}
+    _NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$')
+
+    def __init__(self, config):
+        self.config = config
+        self.extensions_dir = os.path.join(config.config_dir, "extensions")
+        self._trusted_path = os.path.join(config.config_dir, "trusted_extensions.json")
+
+    def _validate_manifest(self, data):
+        """Validate extension.json manifest. Returns (ok, error_message)."""
+        name = data.get("name", "")
+        if not self._NAME_PATTERN.match(name):
+            return False, f"Invalid extension name: '{name}' (must be alphanumeric/hyphen, 1-64 chars)"
+
+        ext_type = data.get("type", "")
+        if ext_type not in ("skill", "agent", "mcp", "mixed"):
+            return False, f"Invalid type: '{ext_type}' (must be skill, agent, mcp, or mixed)"
+
+        files = data.get("files", [])
+        if not isinstance(files, list) or not files:
+            return False, "Manifest must have a non-empty 'files' list"
+
+        for fpath in files:
+            if not isinstance(fpath, str):
+                return False, f"Invalid file entry: {fpath}"
+            # Path traversal check
+            normalized = os.path.normpath(fpath)
+            if normalized.startswith("..") or os.path.isabs(normalized):
+                return False, f"Path traversal detected: '{fpath}'"
+            # File extension check
+            _, ext = os.path.splitext(fpath)
+            if ext.lower() not in self._ALLOWED_FILE_EXTS:
+                return False, f"Disallowed file type: '{fpath}' (allowed: {self._ALLOWED_FILE_EXTS})"
+
+        return True, ""
+
+    def _load_trusted(self):
+        """Load trusted extensions list."""
+        try:
+            if os.path.isfile(self._trusted_path) and not os.path.islink(self._trusted_path):
+                with open(self._trusted_path, encoding="utf-8", errors="replace") as f:
+                    return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+        return {}
+
+    def _save_trusted(self, trusted):
+        """Save trusted extensions list."""
+        try:
+            os.makedirs(os.path.dirname(self._trusted_path), exist_ok=True)
+            with open(self._trusted_path, "w", encoding="utf-8") as f:
+                json.dump(trusted, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def install(self, github_url, yes_mode=False):
+        """Install extension from GitHub URL.
+
+        Args:
+            github_url: GitHub repository URL
+            yes_mode: Skip confirmation prompt if True
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        # URL validation
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(github_url)
+            if parsed.netloc not in ("github.com", "www.github.com"):
+                return False, f"Only GitHub URLs are allowed (got: {parsed.netloc})"
+            if not parsed.path or parsed.path.count("/") < 2:
+                return False, f"Invalid GitHub URL: {github_url}"
+        except Exception as e:
+            return False, f"Invalid URL: {e}"
+
+        # Clone to temp directory
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(prefix="eve-ext-")
+        try:
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", github_url, tmp_dir],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                return False, f"git clone failed: {result.stderr.strip()}"
+
+            # Read and validate manifest
+            manifest_path = os.path.join(tmp_dir, "extension.json")
+            if not os.path.isfile(manifest_path):
+                return False, "No extension.json found in repository"
+
+            with open(manifest_path, encoding="utf-8", errors="replace") as f:
+                manifest = json.load(f)
+
+            ok, err = self._validate_manifest(manifest)
+            if not ok:
+                return False, f"Invalid manifest: {err}"
+
+            name = manifest["name"]
+            ext_type = manifest.get("type", "unknown")
+            desc = manifest.get("description", "(no description)")
+            version = manifest.get("version", "0.0.0")
+
+            # Check if already installed
+            dest_dir = os.path.join(self.extensions_dir, name)
+            if os.path.isdir(dest_dir):
+                return False, f"Extension '{name}' is already installed. Use 'eve-cli uninstall {name}' first."
+
+            # Confirmation prompt
+            if not yes_mode:
+                print(f"\n  Extension: {name} v{version}")
+                print(f"  Type: {ext_type}")
+                print(f"  Description: {desc}")
+                print(f"  Source: {github_url}")
+                print(f"  Files: {', '.join(manifest.get('files', []))}")
+                try:
+                    confirm = input(f"\n  Install this extension? [y/N]: ").strip().lower()
+                    if confirm not in ("y", "yes"):
+                        return False, "Installation cancelled."
+                except (EOFError, KeyboardInterrupt):
+                    return False, "Installation cancelled."
+
+            # Copy validated files to extensions directory
+            os.makedirs(dest_dir, exist_ok=True)
+            # Copy manifest
+            shutil.copy2(manifest_path, os.path.join(dest_dir, "extension.json"))
+            # Copy listed files
+            for fpath in manifest.get("files", []):
+                src = os.path.join(tmp_dir, fpath)
+                if not os.path.isfile(src):
+                    continue
+                dst = os.path.join(dest_dir, fpath)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+
+            # Add to trusted list
+            trusted = self._load_trusted()
+            trusted[name] = {"url": github_url, "version": version, "type": ext_type}
+            self._save_trusted(trusted)
+
+            return True, f"Extension '{name}' v{version} installed successfully."
+
+        except subprocess.TimeoutExpired:
+            return False, "git clone timed out."
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            return False, f"Installation error: {e}"
+        finally:
+            # Cleanup temp directory
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    def uninstall(self, name):
+        """Remove an installed extension.
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        if not self._NAME_PATTERN.match(name):
+            return False, f"Invalid extension name: '{name}'"
+
+        dest_dir = os.path.join(self.extensions_dir, name)
+        if not os.path.isdir(dest_dir):
+            return False, f"Extension '{name}' is not installed."
+
+        # Verify it's not a symlink
+        if os.path.islink(dest_dir):
+            return False, f"Refusing to remove symlink: {dest_dir}"
+
+        try:
+            shutil.rmtree(dest_dir)
+        except OSError as e:
+            return False, f"Failed to remove: {e}"
+
+        # Remove from trusted list
+        trusted = self._load_trusted()
+        trusted.pop(name, None)
+        self._save_trusted(trusted)
+
+        return True, f"Extension '{name}' uninstalled."
+
+    def list_extensions(self):
+        """List installed extensions.
+
+        Returns:
+            list of dict: [{name, version, type, description}]
+        """
+        extensions = []
+        if not os.path.isdir(self.extensions_dir):
+            return extensions
+
+        for entry in sorted(os.listdir(self.extensions_dir)):
+            ext_dir = os.path.join(self.extensions_dir, entry)
+            if not os.path.isdir(ext_dir) or os.path.islink(ext_dir):
+                continue
+            manifest_path = os.path.join(ext_dir, "extension.json")
+            if not os.path.isfile(manifest_path):
+                continue
+            try:
+                with open(manifest_path, encoding="utf-8", errors="replace") as f:
+                    manifest = json.load(f)
+                extensions.append({
+                    "name": manifest.get("name", entry),
+                    "version": manifest.get("version", "?"),
+                    "type": manifest.get("type", "?"),
+                    "description": manifest.get("description", ""),
+                })
+            except (json.JSONDecodeError, OSError):
+                extensions.append({"name": entry, "version": "?", "type": "?", "description": "(invalid manifest)"})
+
+        return extensions
+
+    def load_skills(self):
+        """Load skills from installed extensions.
+
+        Returns:
+            dict: name -> {"content": str, "skill_dir": str}
+        """
+        skills = {}
+        if not os.path.isdir(self.extensions_dir):
+            return skills
+
+        for entry in os.listdir(self.extensions_dir):
+            ext_dir = os.path.join(self.extensions_dir, entry)
+            if not os.path.isdir(ext_dir) or os.path.islink(ext_dir):
+                continue
+            # Load manifest to check type
+            manifest_path = os.path.join(ext_dir, "extension.json")
+            if not os.path.isfile(manifest_path):
+                continue
+            try:
+                with open(manifest_path, encoding="utf-8", errors="replace") as f:
+                    manifest = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            ext_type = manifest.get("type", "")
+            if ext_type not in ("skill", "mixed"):
+                continue
+
+            # Find .md files in skills/ subdirectory or listed files
+            for fpath in manifest.get("files", []):
+                if not fpath.endswith(".md"):
+                    continue
+                full_path = os.path.join(ext_dir, fpath)
+                if not os.path.isfile(full_path) or os.path.islink(full_path):
+                    continue
+                try:
+                    with open(full_path, encoding="utf-8", errors="replace") as f:
+                        content = f.read(51200)  # 50KB cap per skill
+                    skill_name = os.path.splitext(os.path.basename(fpath))[0]
+                    # Prefix with extension name to avoid collisions
+                    qualified_name = f"ext:{entry}:{skill_name}"
+                    skills[qualified_name] = {
+                        "content": content,
+                        "skill_dir": os.path.dirname(full_path),
+                    }
+                except OSError:
+                    pass
+
+        return skills
+
+    def load_mcp_configs(self):
+        """Load MCP configs from installed extensions.
+
+        Returns:
+            dict: server_name -> config_dict (same format as mcp.json)
+        """
+        servers = {}
+        if not os.path.isdir(self.extensions_dir):
+            return servers
+
+        for entry in os.listdir(self.extensions_dir):
+            ext_dir = os.path.join(self.extensions_dir, entry)
+            if not os.path.isdir(ext_dir) or os.path.islink(ext_dir):
+                continue
+            manifest_path = os.path.join(ext_dir, "extension.json")
+            if not os.path.isfile(manifest_path):
+                continue
+            try:
+                with open(manifest_path, encoding="utf-8", errors="replace") as f:
+                    manifest = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            if manifest.get("type", "") not in ("mcp", "mixed"):
+                continue
+
+            # Look for mcp.json in the extension directory
+            mcp_path = os.path.join(ext_dir, "mcp.json")
+            if os.path.isfile(mcp_path) and not os.path.islink(mcp_path):
+                try:
+                    with open(mcp_path, encoding="utf-8", errors="replace") as f:
+                        mcp_data = json.load(f)
+                    if isinstance(mcp_data, dict):
+                        for sname, sconfig in mcp_data.items():
+                            servers[f"ext_{entry}_{sname}"] = sconfig
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+        return servers
+
+
+def _handle_extension_command(argv, config):
+    """Handle eve-cli install/uninstall/extensions subcommands.
+
+    Args:
+        argv: sys.argv[1:] (e.g., ["install", "https://github.com/..."])
+        config: Config instance
+
+    Returns:
+        int: exit code
+    """
+    ext_mgr = ExtensionManager(config)
+
+    if not argv:
+        return 1
+
+    subcmd = argv[0]
+
+    if subcmd == "install":
+        if len(argv) < 2:
+            print("Usage: eve-cli install <github-url>", file=sys.stderr)
+            return 1
+        url = argv[1]
+        yes = "--yes" in argv or "-y" in argv
+        ok, msg = ext_mgr.install(url, yes_mode=yes)
+        print(msg)
+        return 0 if ok else 1
+
+    elif subcmd == "uninstall":
+        if len(argv) < 2:
+            print("Usage: eve-cli uninstall <name>", file=sys.stderr)
+            return 1
+        ok, msg = ext_mgr.uninstall(argv[1])
+        print(msg)
+        return 0 if ok else 1
+
+    elif subcmd == "extensions":
+        sub2 = argv[1] if len(argv) > 1 else "list"
+        if sub2 == "list":
+            exts = ext_mgr.list_extensions()
+            if not exts:
+                print("No extensions installed.")
+                return 0
+            print(f"  {'Name':<30} {'Version':<10} {'Type':<8} Description")
+            print(f"  {'-'*30} {'-'*10} {'-'*8} {'-'*30}")
+            for e in exts:
+                print(f"  {e['name']:<30} {e['version']:<10} {e['type']:<8} {e['description'][:40]}")
+            return 0
+        else:
+            print(f"Unknown subcommand: extensions {sub2}", file=sys.stderr)
+            return 1
+
+    return 1
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Skills — SKILL.md loading (compatible with Gemini CLI format)
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -7773,6 +8864,15 @@ def _load_skills(config):
                     pass
         except OSError:
             pass
+
+    # Merge skills from installed extensions
+    try:
+        ext_mgr = ExtensionManager(config)
+        ext_skills = ext_mgr.load_skills()
+        skills.update(ext_skills)
+    except Exception:
+        pass  # extension loading failure is non-fatal
+
     return skills
 
 
@@ -13363,7 +14463,8 @@ class Agent:
     ACT_ONLY_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit"}
 
     def __init__(self, config, client, registry, permissions, session, tui,
-                 rag_engine=None, hook_mgr=None, code_intel=None):
+                 rag_engine=None, hook_mgr=None, code_intel=None,
+                 output_collector=None):
         self.config = config
         self.client = client
         self.registry = registry
@@ -13373,6 +14474,7 @@ class Agent:
         self.rag_engine = rag_engine
         self.hook_mgr = hook_mgr
         self.code_intel = code_intel
+        self.output_collector = output_collector  # HeadlessOutputCollector for CI/CD
         self._interrupted = threading.Event()
         self._tui_lock = threading.Lock()
         self._plan_mode = False
@@ -13385,7 +14487,11 @@ class Agent:
         if config.autotest_on_start:
             self.auto_test.enabled = True
         self.file_watcher = FileWatcher(config.cwd)
-        self.max_iterations = max(1, min(config.max_agent_steps, self.HARD_MAX_ITERATIONS))
+        # Apply --max-turns override if set
+        effective_steps = config.max_agent_steps
+        if config.max_turns is not None:
+            effective_steps = min(config.max_turns, config.max_agent_steps)
+        self.max_iterations = max(1, min(effective_steps, self.HARD_MAX_ITERATIONS))
         runtime = session.get_resume_summary()
         self._plan_mode = bool(runtime.get("plan_mode", False))
         self._active_plan_path = runtime.get("active_plan_path")
@@ -13741,6 +14847,10 @@ class Agent:
                 # Store last assistant output for loop mode completion detection
                 self._last_output = text
 
+                # Headless output collector: record assistant text
+                if self.output_collector and text:
+                    self.output_collector.assistant_text(text)
+
                 # Learn mode: add explanations after code or errors
                 if self.config.learn_mode and self.config.learn_auto_explain:
                     # Check if response contains code blocks
@@ -13888,6 +14998,10 @@ class Agent:
 
                 if all_parallel_safe:
                     _parallel_durations = {}
+                    # Headless output collector: record tool calls before parallel execution
+                    if self.output_collector:
+                        for _, _tn, _tp, _ in validated_calls:
+                            self.output_collector.tool_call(_tn, _tp)
                     def _exec_one(item):
                         tc_id, tool_name, tool_params, tool = item
                         try:
@@ -13929,6 +15043,9 @@ class Agent:
                         self.tui.show_tool_result(tool_name, result.output, result.is_error,
                                                   duration=_pdur, params=tool_params)
                         results.append(result)
+                        # Headless output collector (parallel path)
+                        if self.output_collector:
+                            self.output_collector.tool_result(tool_name, result.output, result.is_error)
                         # PostToolUse hook (parallel path)
                         if self.hook_mgr and self.hook_mgr.has_hooks:
                             self.hook_mgr.fire_post_tool(tool_name, result.output, result.is_error)
@@ -13964,6 +15081,10 @@ class Agent:
                             self.tui.show_tool_result(tool_name, output, is_error=_is_err,
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
+                            # Headless output collector (sequential path)
+                            if self.output_collector:
+                                self.output_collector.tool_call(tool_name, tool_params)
+                                self.output_collector.tool_result(tool_name, output, _is_err)
                             # PostToolUse hook (sequential path)
                             if self.hook_mgr and self.hook_mgr.has_hooks:
                                 self.hook_mgr.fire_post_tool(tool_name, output, _is_err)
@@ -14742,6 +15863,13 @@ def _run_gh_command(args, cwd=None, timeout=30):
 
 
 def main():
+    # Handle extension subcommands early (before full config load)
+    if len(sys.argv) > 1 and sys.argv[1] in ("install", "uninstall", "extensions"):
+        config = Config()
+        # Minimal load: just paths, no model detection
+        config._ensure_dirs()
+        sys.exit(_handle_extension_command(sys.argv[1:], config))
+
     # Parse config
     config = Config().load()
 
@@ -14956,6 +16084,9 @@ def main():
     session = Session(config, system_prompt)
     session.set_client(client)  # enable sidecar model for context compaction
     registry = ToolRegistry().register_defaults()
+    # Replace BashTool with sandbox-aware instance if --sandbox is set
+    if config.sandbox:
+        registry.register(BashTool(cwd=config.cwd, config=config))
     permissions = PermissionMgr(config)
     registry.register(SubAgentTool(config, client, registry, permissions, tui))
     coordinator = MultiAgentCoordinator(config, client, registry, permissions, tui)
@@ -15131,15 +16262,26 @@ def main():
         # Build system prompt once (shared across all loop iterations)
         system_prompt = _build_system_prompt(config)
         exit_code = 0  # Track exit code for CI/CD
-        
+
+        # Create headless output collector for structured CI/CD output
+        _output_collector = None
+        if config.headless and config.output_format in ("json", "stream-json"):
+            _output_collector = HeadlessOutputCollector(
+                output_format=config.output_format,
+                model=config.model,
+                session_id="",  # will be set after session creation
+            )
+
         if config.loop_mode:
             # Loop mode: re-run until done_string is detected or max iterations/time reached
             loop_start_time = time.time()
             loop_i = 0
             loop_success = False
+            # --carry-session: reuse session across iterations
+            _carry_session = None
             while loop_i < config.max_loop_iterations:
                 loop_i += 1
-                
+
                 # Check time-based limit
                 if config.max_loop_hours is not None:
                     elapsed_hours = (time.time() - loop_start_time) / 3600.0
@@ -15157,9 +16299,15 @@ def main():
                           f"(remaining: {config.max_loop_iterations - loop_i})")
                 print(f"{'='*60}")
 
-                # Create new session and agent for each iteration (no history carryover)
-                session = Session(config, system_prompt)
-                agent = Agent(config, client, registry, permissions, session, tui)
+                # --carry-session: reuse session (history carryover) or create fresh
+                if config.carry_session and _carry_session is not None:
+                    session = _carry_session
+                else:
+                    session = Session(config, system_prompt)
+                if _output_collector:
+                    _output_collector._session_id = session.session_id
+                agent = Agent(config, client, registry, permissions, session, tui,
+                              output_collector=_output_collector)
                 try:
                     agent.run(config.prompt)
                 except Exception as e:
@@ -15175,6 +16323,10 @@ def main():
                         print(json.dumps(_output, ensure_ascii=False))
                     sys.exit(exit_code)
 
+                # Save reference for --carry-session
+                if config.carry_session:
+                    _carry_session = session
+
                 last_output = agent.get_last_output()
                 if config.done_string in last_output:
                     print(f"\n  Loop complete: '{config.done_string}' detected.")
@@ -15183,14 +16335,17 @@ def main():
             else:
                 print(f"\n  Loop ended: reached max iterations ({config.max_loop_iterations}).")
                 exit_code = 3  # Max iterations reached without success
-            
+
             # Set success if loop completed normally
             if loop_success and exit_code == 0:
                 exit_code = 0
         else:
             # Standard one-shot mode
             session = Session(config, system_prompt)
-            agent = Agent(config, client, registry, permissions, session, tui)
+            if _output_collector:
+                _output_collector._session_id = session.session_id
+            agent = Agent(config, client, registry, permissions, session, tui,
+                          output_collector=_output_collector)
             try:
                 agent.run(config.prompt)
             except Exception as e:
@@ -15204,22 +16359,27 @@ def main():
                     }
                     print(json.dumps(_output, ensure_ascii=False))
                 sys.exit(exit_code)
-        
+
         session.save()
         if config.output_format in ("json", "stream-json"):
-            # Extract last assistant message from session
-            _last_content = ""
-            for _msg in reversed(session.messages):
-                if _msg.get("role") == "assistant":
-                    _last_content = _msg.get("content", "")
-                    break
-            _output = {
-                "role": "assistant",
-                "content": _last_content,
-                "model": config.model,
-                "session_id": session.session_id,
-                "exit_code": exit_code,
-            }
+            if _output_collector:
+                # Use headless collector's structured summary
+                _output = _output_collector.get_summary()
+                _output["exit_code"] = exit_code
+            else:
+                # Extract last assistant message from session
+                _last_content = ""
+                for _msg in reversed(session.messages):
+                    if _msg.get("role") == "assistant":
+                        _last_content = _msg.get("content", "")
+                        break
+                _output = {
+                    "role": "assistant",
+                    "content": _last_content,
+                    "model": config.model,
+                    "session_id": session.session_id,
+                    "exit_code": exit_code,
+                }
             print(json.dumps(_output, ensure_ascii=False))
         sys.exit(exit_code)
 
@@ -15915,6 +17075,14 @@ def main():
 
                     else:
                         print(f"{C.YELLOW}{t('slash.pr_usage', default='Usage: /pr [list|create|view|checks|diff|merge] [number]')}{C.RESET}")
+                    continue
+
+                elif cmd == "/review":
+                    # Code review command: /review [target]
+                    # target: (empty)=uncommitted, --staged, HEAD~N, PR number
+                    parts = user_input.split(maxsplit=1)
+                    review_target = parts[1].strip() if len(parts) > 1 else None
+                    _run_code_review(config, agent, session, tui, review_target)
                     continue
 
                 elif cmd == "/gh":

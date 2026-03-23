@@ -87,7 +87,11 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 - **自動 Lint/Test** — ファイル変更のたびに ruff/flake8/eslint + pytest を自動実行・自動修正
 - **Repo Map** — プロジェクト構造を AI に注入して大規模コードベースでも正確に編集
 - **Thinking モード** — Qwen3.5 の拡張推論で複雑な問題を深く思考
-- **Headless モード** — CI/CD パイプラインから非対話で実行
+- **Headless モード** — CI/CD パイプラインから非対話で実行（stdin パイプ、`--max-turns`、`--carry-session` 対応）
+- **プロジェクトコンテキスト自動学習** — 言語・FW・リンター・テストFW を自動検出してキャッシュ、初回から文脈を理解
+- **コードレビュー** — `/review` コマンドでセキュリティ・パフォーマンス・保守性の構造化レビュー
+- **Docker サンドボックス** — `--sandbox docker` で Bash コマンドをコンテナ内で安全に実行
+- **Extensions** — `eve-cli install <github-url>` でコミュニティ製スキル・エージェントを追加
 - GitHub 連携
 - Hooks / Skills / MCP
 - コードインテリジェンス
@@ -103,12 +107,13 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | カテゴリ | 内容 |
 |---------|------|
 | **AI エージェント** | 複数の内蔵ツール、Plan/Act モード、Agent Teams、サブエージェント、Thinking モード |
-| **開発支援** | コミット自動生成、テスト生成、自動 Lint/Test（ruff/flake8/eslint）、Repo Map、GitHub 連携 |
-| **CI/CD** | Headless モード、JSON 出力、終了コード、CI 環境自動検出、ループモード |
+| **開発支援** | コミット自動生成、テスト生成、自動 Lint/Test、Repo Map、コードレビュー（`/review`）、GitHub 連携 |
+| **CI/CD** | Headless モード（stdin パイプ対応）、JSON 出力、`--max-turns`、`--carry-session`、ループモード |
+| **コンテキスト** | プロジェクト自動解析（言語・FW・リンター・テストFW 検出）、キャッシュ、コードインテリジェンス |
 | **使いやすさ** | 日本語 UX 完全対応、Tab 補完、画像添付、シンタックスハイライト、リッチ diff |
-| **カスタマイズ** | メモリ（長期記憶）、Skills、Hooks、MCP、プロファイル切替、テーマ変更 |
+| **カスタマイズ** | メモリ（長期記憶）、Skills、Hooks、MCP、Extensions（`eve-cli install`）、テーマ変更 |
 | **Channels** | Discord・Slack・Webhook から実行中のエージェントへ双方向通信。ペアリングコードで安全認証 |
-| **安全性** | パーミッション管理、Git チェックポイント、`/undo`、ローカル優先設計 |
+| **安全性** | パーミッション管理、Docker サンドボックス（`--sandbox`）、Git チェックポイント、`/undo` |
 
 > ツールの数や MCP 連携ツールは、設定やバージョンによって増減することがあります。詳しくは [コマンドリファレンス](docs/commands.md) を参照してください。
 
@@ -126,7 +131,13 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | Thinking モードで使う | `eve-cli --think` |
 | 学習モードで使う | `eve-cli --learn --level 4` |
 | CI/CD で実行する | `eve-cli --headless -p "lint修正して" -y --output-format json` |
+| stdin パイプで実行する | `echo "テスト実行" \| eve-cli --headless --output-format json` |
+| ターン数制限付き実行 | `eve-cli --headless -p "修正して" --max-turns 5 -y` |
 | 完了まで自動で回す | `eve-cli -p "失敗テストを直して ALL_DONE と出して" --loop --done-string ALL_DONE -y` |
+| ループで履歴を維持 | `eve-cli -p "修正" --loop --carry-session -y` |
+| コードレビューする | 対話モードで `/review` または `/review 123`（PR番号） |
+| サンドボックスで安全に | `eve-cli --sandbox docker --sandbox-no-network` |
+| 拡張機能を追加する | `eve-cli install https://github.com/user/eve-ext-name` |
 | Discord から操作する | `eve-cli --channels discord` |
 
 ---
