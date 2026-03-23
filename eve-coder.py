@@ -1133,7 +1133,8 @@ class Config:
         self.profile = "auto"       # "auto", "online", "offline", or user-defined name
         self.network_status = None  # "online" or "offline" (detected at startup)
         self._profiles = {}         # profile_name -> {key: value} from config file
-        self._cli_model_set = False # True if --model was passed on CLI
+        self._cli_model_set = False  # True if --model was passed on CLI
+        self._cli_sidecar_set = False  # True if --sidecar or SIDECAR_MODEL was set
         self._cli_ollama_host_set = False
         self._cli_max_tokens_set = False
         self._cli_temperature_set = False
@@ -1279,6 +1280,7 @@ class Config:
                         self.model = val
                     elif key == "SIDECAR_MODEL" and val:
                         self.sidecar_model = val
+                        self._cli_sidecar_set = True
                     elif key == "OLLAMA_HOST" and val:
                         self.ollama_host = val
                     elif key == "PROFILE" and val:
@@ -1328,8 +1330,10 @@ class Config:
         if os.environ.get("EVE_CLI_MODEL"):
             self.model = os.environ["EVE_CLI_MODEL"]
         if os.environ.get("EVE_CODER_SIDECAR"):
+            self._cli_sidecar_set = True
             self.sidecar_model = os.environ["EVE_CODER_SIDECAR"]
         if os.environ.get("EVE_CLI_SIDECAR_MODEL"):
+            self._cli_sidecar_set = True
             self.sidecar_model = os.environ["EVE_CLI_SIDECAR_MODEL"]
         if os.environ.get("EVE_CODER_MAX_AGENT_STEPS"):
             parsed = self._normalize_max_agent_steps(os.environ["EVE_CODER_MAX_AGENT_STEPS"])
@@ -1685,6 +1689,7 @@ class Config:
             self.model = prof["MODEL"]
         if prof.get("SIDECAR_MODEL") and not self._cli_model_set:
             self.sidecar_model = prof["SIDECAR_MODEL"]
+            self._cli_sidecar_set = True
         if prof.get("OLLAMA_HOST") and not self._cli_ollama_host_set:
             self.ollama_host = prof["OLLAMA_HOST"]
         if prof.get("MAX_TOKENS") and not self._cli_max_tokens_set:
@@ -1730,7 +1735,7 @@ class Config:
                 self.model = best
                 self._apply_context_window(best)
                 self._apply_max_tokens(best)
-                if not self.sidecar_model:
+                if not self.sidecar_model and not self._cli_sidecar_set:
                     self._pick_sidecar(installed, best, effective_mem_gb)
                 return
         # Fallback: RAM-based heuristic (no Ollama connection yet)
@@ -1741,7 +1746,7 @@ class Config:
         else:
             self.model = "qwen3:1.7b"
             self.context_window = 4096
-        if not self.sidecar_model:
+        if not self.sidecar_model and not self._cli_sidecar_set:
             if effective_mem_gb >= 32:
                 self.sidecar_model = "qwen3:8b"
             elif effective_mem_gb >= 16:
