@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -118,6 +119,36 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertIn("global", loaded)
         self.assertNotIn("repo", loaded)
 
+    def test_expand_shell_injections_blocks_untrusted_content_without_running_shell(self):
+        with patch.object(eve_coder.subprocess, "run", side_effect=AssertionError("shell must not run")):
+            expanded, error = eve_coder._expand_shell_injections(
+                "before !`echo hacked` after",
+                cwd=self.project_dir,
+                allow_commands=False,
+                source_name="project skill 'repo'",
+            )
+
+        self.assertIsNone(expanded)
+        self.assertIn("blocked", error.lower())
+        self.assertIn("project skill", error.lower())
+
+    def test_expand_shell_injections_allows_global_content(self):
+        with patch.object(
+            eve_coder.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=["echo", "safe"], returncode=0, stdout="safe\n", stderr=""),
+        ) as mock_run:
+            expanded, error = eve_coder._expand_shell_injections(
+                "before !`echo safe` after",
+                cwd=self.config_dir,
+                allow_commands=True,
+                source_name="global skill 'safe'",
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(expanded, "before safe after")
+        mock_run.assert_called_once()
+
     def test_subagent_network_tool_respects_parent_permissions(self):
         permissions = eve_coder.PermissionMgr(
             SimpleNamespace(
@@ -146,6 +177,102 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertIn("EVE_CLI_ALLOW_UNVERIFIED_INSTALLERS", content)
         self.assertIn("EVE_CLI_ALLOW_UNVERIFIED_HOMEBREW_INSTALLER", content)
         self.assertIn("EVE_CLI_ALLOW_UNVERIFIED_OLLAMA_INSTALLER", content)
+
+    def test_windows_install_script_verifies_remote_downloads(self):
+        content = Path(SCRIPT_DIR, "install.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Resolve-InstallRef", content)
+        self.assertIn("function Download-RepoFileVerified", content)
+        self.assertIn("install-manifest.json", content)
+        self.assertIn("EVE_CLI_INSTALL_REF", content)
+        self.assertIn("Confirm-UnverifiedRemoteInstaller", content)
+        self.assertIn("EVE_CLI_OLLAMA_SETUP_SHA256", content)
+
+    def test_extension_manifest_rejects_unsupported_agent_type(self):
+        mgr = eve_coder.ExtensionManager(SimpleNamespace(config_dir=self.config_dir))
+
+        ok, err = mgr._validate_manifest({
+            "name": "demo-agent",
+            "type": "agent",
+            "files": ["README.md"],
+        })
+
+        self.assertFalse(ok)
+        self.assertIn("invalid type", err.lower())
+
+    def test_extension_install_rejects_symlinked_files(self):
+        mgr = eve_coder.ExtensionManager(SimpleNamespace(config_dir=self.config_dir))
+        secret_path = Path(self.test_dir, "secret.txt")
+        secret_path.write_text("TOP_SECRET", encoding="utf-8")
+
+        def fake_clone(args, capture_output, text, timeout):
+            tmp_dir = Path(args[-1])
+            (tmp_dir / "skills").mkdir(parents=True, exist_ok=True)
+            (tmp_dir / "extension.json").write_text(
+                json.dumps({
+                    "name": "demoext",
+                    "type": "skill",
+                    "version": "1.0.0",
+                    "files": ["skills/leak.md"],
+                }),
+                encoding="utf-8",
+            )
+            (tmp_dir / "skills" / "leak.md").symlink_to(secret_path)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with patch.object(eve_coder.subprocess, "run", side_effect=fake_clone):
+            ok, msg = mgr.install("https://github.com/example/demoext", yes_mode=True)
+
+        self.assertFalse(ok)
+        self.assertIn("invalid extension file", msg.lower())
+        self.assertFalse(Path(self.config_dir, "extensions", "demoext").exists())
+
+    def test_installed_extension_mcp_configs_are_loaded(self):
+        config = self.make_config()
+        ext_dir = Path(self.config_dir, "extensions", "demoext")
+        ext_dir.mkdir(parents=True, exist_ok=True)
+        (ext_dir / "extension.json").write_text(
+            json.dumps({
+                "name": "demoext",
+                "type": "mcp",
+                "version": "1.0.0",
+                "files": ["mcp.json"],
+            }),
+            encoding="utf-8",
+        )
+        (ext_dir / "mcp.json").write_text(
+            json.dumps({
+                "mcpServers": {
+                    "demo": {
+                        "command": "python3",
+                        "args": ["-m", "json.tool"],
+                    }
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        servers = eve_coder._load_mcp_servers(config)
+
+        self.assertIn("ext_demoext_demo", servers)
+        self.assertEqual(servers["ext_demoext_demo"]["command"], "python3")
+
+    def test_webfetch_resolve_public_ip_skips_private_addresses(self):
+        with patch("socket.getaddrinfo", return_value=[
+            (None, None, None, None, ("127.0.0.1", 443)),
+            (None, None, None, None, ("93.184.216.34", 443)),
+        ]):
+            ip = eve_coder.WebFetchTool._resolve_public_ip("example.com", 443)
+
+        self.assertEqual(ip, "93.184.216.34")
+
+    def test_webfetch_resolve_public_ip_rejects_all_private_results(self):
+        with patch("socket.getaddrinfo", return_value=[
+            (None, None, None, None, ("127.0.0.1", 443)),
+            (None, None, None, None, ("10.0.0.5", 443)),
+        ]):
+            with self.assertRaises(eve_coder.urllib.error.URLError):
+                eve_coder.WebFetchTool._resolve_public_ip("example.com", 443)
 
     def test_read_tool_blocks_path_escape_via_symlink(self):
         config = self.make_config()

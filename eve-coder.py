@@ -5366,6 +5366,7 @@ class BashTool(Tool):
             bg_clean_env = self._build_clean_env()
             def _run_bg(tid, cmd, t_s):
                 state = "finished"
+                proc = None
                 try:
                     _bg_pgroup = platform.system() != "Windows"
                     proc = subprocess.Popen(
@@ -5401,6 +5402,14 @@ class BashTool(Tool):
                 except Exception as e:
                     state = "failed"
                     out = f"Error: {e}"
+                finally:
+                    if proc is not None:
+                        for _stream in (proc.stdout, proc.stderr):
+                            if _stream is not None:
+                                try:
+                                    _stream.close()
+                                except Exception:
+                                    pass
                 with _bg_tasks_lock:
                     _bg_tasks[tid]["result"] = out.strip() or "(no output)"
                 runtime_state = _get_active_runtime_state()
@@ -5471,51 +5480,61 @@ class BashTool(Tool):
             if use_pgroup:
                 popen_kwargs["start_new_session"] = True  # create new process group
             # Use Popen instead of run() to access PID for process group cleanup on timeout
-            proc = subprocess.Popen(command, **popen_kwargs)
+            proc = None
             try:
-                stdout, stderr = proc.communicate(timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                # Kill entire process group (not just shell) to prevent zombies
-                if use_pgroup:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except (OSError, ProcessLookupError):
-                        pass
-                proc.kill()
+                proc = subprocess.Popen(command, **popen_kwargs)
                 try:
-                    proc.wait(timeout=5)
+                    stdout, stderr = proc.communicate(timeout=timeout_s)
                 except subprocess.TimeoutExpired:
-                    pass
-                # Hang diagnosis: provide actionable context for timeout
-                _diag_lines = [
-                    f"Error: command timed out after {int(timeout_s)}s and was killed.",
-                    f"  Command: {command[:200]}{'...' if len(command) > 200 else ''}",
-                    "  Possible causes:",
-                    "    - Interactive prompt waiting for input (add -y/--yes or echo | ...)",
-                    "    - Network request to unreachable host (check connectivity)",
-                    "    - Infinite loop or deadlock in the program",
-                    "    - Large dataset processing (increase timeout parameter)",
-                    "  Next steps:",
-                    "    - Break the command into smaller parts to isolate the slow step",
-                    "    - Add timeout/--max-time flag to sub-commands (e.g. curl --max-time 30)",
-                    f"    - Increase timeout: Bash(command='...', timeout={int(min(timeout_ms * 2, 600000))})",
-                ]
-                return "\n".join(_diag_lines)
-            output = ""
-            if stdout:
-                output += stdout
-            if stderr:
-                if output:
-                    output += "\n"
-                output += stderr
-            if proc.returncode != 0:
-                output += f"\n(exit code: {proc.returncode})"
-            if not output.strip():
-                output = "(no output)"
-            # Truncate very long output
-            if len(output) > 30000:
-                output = output[:15000] + "\n\n... (truncated) ...\n\n" + output[-15000:]
-            return output.strip()
+                    # Kill entire process group (not just shell) to prevent zombies
+                    if use_pgroup:
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except (OSError, ProcessLookupError):
+                            pass
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    # Hang diagnosis: provide actionable context for timeout
+                    _diag_lines = [
+                        f"Error: command timed out after {int(timeout_s)}s and was killed.",
+                        f"  Command: {command[:200]}{'...' if len(command) > 200 else ''}",
+                        "  Possible causes:",
+                        "    - Interactive prompt waiting for input (add -y/--yes or echo | ...)",
+                        "    - Network request to unreachable host (check connectivity)",
+                        "    - Infinite loop or deadlock in the program",
+                        "    - Large dataset processing (increase timeout parameter)",
+                        "  Next steps:",
+                        "    - Break the command into smaller parts to isolate the slow step",
+                        "    - Add timeout/--max-time flag to sub-commands (e.g. curl --max-time 30)",
+                        f"    - Increase timeout: Bash(command='...', timeout={int(min(timeout_ms * 2, 600000))})",
+                    ]
+                    return "\n".join(_diag_lines)
+                output = ""
+                if stdout:
+                    output += stdout
+                if stderr:
+                    if output:
+                        output += "\n"
+                    output += stderr
+                if proc.returncode != 0:
+                    output += f"\n(exit code: {proc.returncode})"
+                if not output.strip():
+                    output = "(no output)"
+                # Truncate very long output
+                if len(output) > 30000:
+                    output = output[:15000] + "\n\n... (truncated) ...\n\n" + output[-15000:]
+                return output.strip()
+            finally:
+                if proc is not None:
+                    for _stream in (proc.stdout, proc.stderr):
+                        if _stream is not None:
+                            try:
+                                _stream.close()
+                            except Exception:
+                                pass
         except Exception as e:
             return f"Error: {e}"
 
@@ -6712,6 +6731,133 @@ class WebFetchTool(Tool):
             return True  # fail-closed: if DNS fails, block the request
         return False
 
+    @staticmethod
+    def _resolve_public_ip(hostname, port):
+        """Resolve hostname and return a public IP literal for pinned connections."""
+        import socket
+        import ipaddress
+        try:
+            infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        except (socket.gaierror, ValueError, OSError) as e:
+            raise urllib.error.URLError(f"DNS resolution failed for {hostname}: {e}")
+        for info in infos:
+            ip_str = info[4][0]
+            addr = ipaddress.ip_address(ip_str)
+            if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
+                continue
+            if hasattr(addr, "ipv4_mapped") and addr.ipv4_mapped:
+                mapped = addr.ipv4_mapped
+                if mapped.is_private or mapped.is_loopback or mapped.is_reserved:
+                    continue
+            return ip_str
+        raise urllib.error.URLError(f"All resolved addresses for {hostname} are private or blocked")
+
+    def _fetch_pinned(self, url, timeout=30, max_redirects=5):
+        """Fetch a URL by connecting to a resolved public IP to avoid DNS rebinding."""
+        import http.client
+        import socket
+        import ssl
+
+        class _PinnedHTTPConnection(http.client.HTTPConnection):
+            def __init__(self, host, port=None, *, connect_host=None, timeout=None):
+                super().__init__(host, port=port, timeout=timeout)
+                self._connect_host = connect_host or host
+
+            def connect(self):
+                self.sock = socket.create_connection(
+                    (self._connect_host, self.port),
+                    self.timeout,
+                    self.source_address,
+                )
+                if self._tunnel_host:
+                    self._tunnel()
+
+        class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+            def __init__(self, host, port=None, *, connect_host=None, timeout=None, context=None):
+                super().__init__(host, port=port, timeout=timeout, context=context)
+                self._connect_host = connect_host or host
+
+            def connect(self):
+                sock = socket.create_connection(
+                    (self._connect_host, self.port),
+                    self.timeout,
+                    self.source_address,
+                )
+                if self._tunnel_host:
+                    self.sock = sock
+                    self._tunnel()
+                    sock = self.sock
+                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+        current_url = url
+        for _ in range(max_redirects + 1):
+            parsed = urllib.parse.urlparse(current_url)
+            scheme = (parsed.scheme or "https").lower()
+            if scheme not in ("http", "https"):
+                raise urllib.error.URLError(
+                    t('errors.url_redirect_blocked_scheme', default=f"Redirect to blocked scheme: {scheme}")
+                )
+            if parsed.username or "@" in (parsed.netloc or ""):
+                raise urllib.error.URLError("URLs with credentials (user@host) are not allowed")
+            hostname = parsed.hostname or ""
+            if not hostname:
+                raise urllib.error.URLError("Missing hostname")
+            port = parsed.port or (443 if scheme == "https" else 80)
+            connect_ip = self._resolve_public_ip(hostname, port)
+
+            path = urllib.parse.quote(parsed.path or "/", safe="/%:@!$&'()*+,;=-._~")
+            if parsed.params:
+                path += ";" + urllib.parse.quote(parsed.params, safe="%:@!$&'()*+,;=-._~")
+            if parsed.query:
+                path += "?" + urllib.parse.quote(parsed.query, safe="=&%:@!$'()*+,;/-._~")
+
+            host_header = hostname if parsed.port is None else f"{hostname}:{parsed.port}"
+            headers = {
+                "Host": host_header,
+                "User-Agent": f"eve-cli/{__version__} (+https://github.com/NPO-Everyone-Engineer/eve-cli)",
+            }
+
+            conn = None
+            resp = None
+            try:
+                if scheme == "https":
+                    conn = _PinnedHTTPSConnection(
+                        hostname,
+                        port=port,
+                        connect_host=connect_ip,
+                        timeout=timeout,
+                        context=ssl.create_default_context(),
+                    )
+                else:
+                    conn = _PinnedHTTPConnection(
+                        hostname,
+                        port=port,
+                        connect_host=connect_ip,
+                        timeout=timeout,
+                    )
+                conn.request("GET", path, headers=headers)
+                resp = conn.getresponse()
+                if resp.status in (301, 302, 303, 307, 308):
+                    location = resp.getheader("Location", "")
+                    if not location:
+                        raise urllib.error.URLError("Redirect response missing Location header")
+                    current_url = urllib.parse.urljoin(current_url, location)
+                    continue
+                return resp.getheader("Content-Type", ""), resp.read(5 * 1024 * 1024)
+            finally:
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        raise urllib.error.URLError("Too many redirects")
+
     def execute(self, params):
         url = params.get("url", "")
         if not url:
@@ -6739,30 +6885,7 @@ class WebFetchTool(Tool):
             return f"Error: request to private/internal IP blocked (SSRF protection): {hostname}"
 
         try:
-            # Build a redirect handler that also blocks private/internal IPs
-            _is_private = self._is_private_ip
-            class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    parsed = urllib.parse.urlparse(newurl)
-                    if parsed.scheme and parsed.scheme.lower() not in ("http", "https"):
-                        raise urllib.error.URLError(t('errors.url_redirect_blocked_scheme', default=f"Redirect to blocked scheme: {parsed.scheme}"))
-                    redir_host = parsed.hostname or ""
-                    if _is_private(redir_host):
-                        raise urllib.error.URLError(t('errors.url_redirect_private_ip', default=f"Redirect to private IP blocked: {redir_host}"))
-                    return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-            opener = urllib.request.build_opener(_SafeRedirectHandler)
-            # Encode non-ASCII characters in URL path/query (e.g. Japanese search terms)
-            url = urllib.parse.quote(url, safe=':/?#[]@!$&\'()*+,;=-._~%')
-            req = urllib.request.Request(url, headers={
-                "User-Agent": f"eve-cli/{__version__} (+https://github.com/NPO-Everyone-Engineer/eve-cli)",
-            })
-            resp = opener.open(req, timeout=30)
-            try:
-                content_type = resp.headers.get("Content-Type", "")
-                raw = resp.read(5 * 1024 * 1024)  # 5MB max read
-            finally:
-                resp.close()
+            content_type, raw = self._fetch_pinned(url, timeout=30)
 
             if "text" not in content_type and "json" not in content_type and "xml" not in content_type:
                 return f"(binary content: {content_type}, {len(raw)} bytes)"
@@ -8995,6 +9118,18 @@ def _load_mcp_servers(config):
         else:
             print(f"{C.YELLOW}Project MCP config found but not trusted. "
                   f"Use /browser setup or manually trust.{C.RESET}", file=sys.stderr)
+    try:
+        ext_mgr = ExtensionManager(config)
+        for name, srv in ext_mgr.load_mcp_configs().items():
+            if isinstance(srv, dict) and "command" in srv:
+                cmd = srv["command"]
+                if _is_allowed_mcp_command(cmd):
+                    servers[name] = srv
+                else:
+                    msg = t('warnings.mcp_server_blocked', default=f"MCP server '{name}' blocked — command '{cmd}' is not in allowlist")
+                    print(f"{C.YELLOW}{msg}{C.RESET}", file=sys.stderr)
+    except Exception:
+        pass
     return servers
 
 
@@ -9003,7 +9138,7 @@ def _load_mcp_servers(config):
 # ════════════════════════════════════════════════════════════════════════════════
 
 class ExtensionManager:
-    """Manage community extensions (skills, agents, MCP configs) from GitHub repos.
+    """Manage community extensions (skills and MCP configs) from GitHub repos.
 
     Extensions are installed to ~/.config/eve-cli/extensions/<name>/ and must
     contain an extension.json manifest file.
@@ -9024,8 +9159,8 @@ class ExtensionManager:
             return False, f"Invalid extension name: '{name}' (must be alphanumeric/hyphen, 1-64 chars)"
 
         ext_type = data.get("type", "")
-        if ext_type not in ("skill", "agent", "mcp", "mixed"):
-            return False, f"Invalid type: '{ext_type}' (must be skill, agent, mcp, or mixed)"
+        if ext_type not in ("skill", "mcp", "mixed"):
+            return False, f"Invalid type: '{ext_type}' (must be skill, mcp, or mixed)"
 
         files = data.get("files", [])
         if not isinstance(files, list) or not files:
@@ -9044,6 +9179,17 @@ class ExtensionManager:
                 return False, f"Disallowed file type: '{fpath}' (allowed: {self._ALLOWED_FILE_EXTS})"
 
         return True, ""
+
+    def _resolve_extension_source_path(self, root_dir, relpath):
+        """Resolve a cloned extension file and reject symlink/path escapes."""
+        normalized = os.path.normpath(relpath)
+        if normalized.startswith("..") or os.path.isabs(normalized):
+            raise OSError(f"path escape detected: {relpath}")
+        parts = [part for part in normalized.replace("\\", "/").split("/") if part and part != "."]
+        resolved = _resolve_repo_storage_path(root_dir, *parts)
+        if not os.path.isfile(resolved):
+            raise OSError(f"missing file: {relpath}")
+        return resolved
 
     def _load_trusted(self):
         """Load trusted extensions list."""
@@ -9097,9 +9243,10 @@ class ExtensionManager:
                 return False, f"git clone failed: {result.stderr.strip()}"
 
             # Read and validate manifest
-            manifest_path = os.path.join(tmp_dir, "extension.json")
-            if not os.path.isfile(manifest_path):
-                return False, "No extension.json found in repository"
+            try:
+                manifest_path = self._resolve_extension_source_path(tmp_dir, "extension.json")
+            except OSError as e:
+                return False, f"Invalid extension layout: {e}"
 
             with open(manifest_path, encoding="utf-8", errors="replace") as f:
                 manifest = json.load(f)
@@ -9132,15 +9279,20 @@ class ExtensionManager:
                 except (EOFError, KeyboardInterrupt):
                     return False, "Installation cancelled."
 
+            file_sources = []
+            for fpath in manifest.get("files", []):
+                try:
+                    src = self._resolve_extension_source_path(tmp_dir, fpath)
+                except OSError as e:
+                    return False, f"Invalid extension file '{fpath}': {e}"
+                file_sources.append((fpath, src))
+
             # Copy validated files to extensions directory
             os.makedirs(dest_dir, exist_ok=True)
             # Copy manifest
             shutil.copy2(manifest_path, os.path.join(dest_dir, "extension.json"))
             # Copy listed files
-            for fpath in manifest.get("files", []):
-                src = os.path.join(tmp_dir, fpath)
-                if not os.path.isfile(src):
-                    continue
+            for fpath, src in file_sources:
                 dst = os.path.join(dest_dir, fpath)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst)
@@ -9307,7 +9459,12 @@ class ExtensionManager:
                     with open(mcp_path, encoding="utf-8", errors="replace") as f:
                         mcp_data = json.load(f)
                     if isinstance(mcp_data, dict):
-                        for sname, sconfig in mcp_data.items():
+                        server_map = mcp_data.get("mcpServers", mcp_data)
+                        if not isinstance(server_map, dict):
+                            continue
+                        for sname, sconfig in server_map.items():
+                            if not isinstance(sconfig, dict) or "command" not in sconfig:
+                                continue
                             servers[f"ext_{entry}_{sname}"] = sconfig
                 except (json.JSONDecodeError, OSError):
                     pass

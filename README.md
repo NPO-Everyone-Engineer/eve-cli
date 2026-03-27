@@ -91,7 +91,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 - **プロジェクトコンテキスト自動学習** — 言語・FW・リンター・テストFW を自動検出してキャッシュ、初回から文脈を理解
 - **コードレビュー** — `/review` コマンドでセキュリティ・パフォーマンス・保守性の構造化レビュー
 - **Docker サンドボックス** — `--sandbox docker` で Bash コマンドをコンテナ内で安全に実行
-- **Extensions** — `eve-cli install <github-url>` でコミュニティ製スキル・エージェントを追加
+- **Extensions** — `eve-cli install <github-url>` でコミュニティ製スキル・MCP 設定を追加
 - GitHub 連携
 - Hooks / Skills / MCP
 - コードインテリジェンス
