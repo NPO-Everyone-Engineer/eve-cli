@@ -271,7 +271,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.21.0"
+__version__ = "2.22.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1176,6 +1176,9 @@ class Config:
         self.sandbox = None             # --sandbox (docker/podman/auto)
         self.sandbox_image = "python:3-slim"  # --sandbox-image
         self.sandbox_no_network = False  # --sandbox-no-network
+        self.output_schema = None       # --output-schema (structured JSON output)
+        self.auto_mode = False          # -a/--auto-mode (sidecar permission classifier)
+        self.mcp_server = False         # --mcp-server (run as MCP server)
 
         # Channels
         self.channels = []  # list of enabled channel names e.g. ["webhook", "discord"]
@@ -1475,6 +1478,15 @@ class Config:
                             help="Disable network access in sandbox containers")
         parser.add_argument("--channels", default="", metavar="NAMES",
                             help="Enable external channels (comma-separated): webhook, discord, slack")
+        # Structured output schema for CI/CD
+        parser.add_argument("--output-schema", metavar="SCHEMA",
+                            help="JSON schema for structured output (file path or inline JSON). Use with --output-format json")
+        # Auto mode (sidecar-based permission classification)
+        parser.add_argument("-a", "--auto-mode", action="store_true", default=False,
+                            help="Auto-approve safe tool calls using sidecar model classification")
+        # MCP server mode
+        parser.add_argument("--mcp-server", action="store_true", default=False,
+                            help="Run as MCP server (JSON-RPC 2.0 over stdio)")
         args = parser.parse_args(argv)
 
         if args.prompt:
@@ -1610,6 +1622,36 @@ class Config:
         # Channels
         if args.channels:
             self.channels = [c.strip().lower() for c in args.channels.split(",") if c.strip()]
+        # Output schema
+        if args.output_schema:
+            self.output_schema = self._load_output_schema(args.output_schema)
+        # Auto mode
+        if args.auto_mode:
+            self.auto_mode = True
+        # MCP server mode
+        if args.mcp_server:
+            self.mcp_server = True
+
+    def _load_output_schema(self, schema_arg):
+        """Load output schema from inline JSON string or file path."""
+        schema_arg = schema_arg.strip()
+        if schema_arg.startswith("{"):
+            try:
+                return json.loads(schema_arg)
+            except json.JSONDecodeError as e:
+                print(f"Error: Invalid inline JSON schema: {e}", file=sys.stderr)
+                sys.exit(1)
+        # Treat as file path
+        path = os.path.expanduser(schema_arg)
+        if not os.path.isfile(path):
+            print(f"Error: Schema file not found: {path}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Error: Could not load schema file: {e}", file=sys.stderr)
+            sys.exit(1)
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -2744,6 +2786,256 @@ def _run_code_review(config, agent, session, tui, target=None):
         print(f"  {C.RED}Review failed: {e}{C.RESET}")
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# Issue → PR + Self-Review Workflow
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _slugify(text, max_len=40):
+    """Convert text to a URL-safe branch slug."""
+    slug = re.sub(r'[^a-z0-9]+', '-', text.lower().strip())
+    slug = slug.strip('-')
+    return slug[:max_len].rstrip('-')
+
+
+def _parse_review_severity(review_text):
+    """Parse code review output for severity counts."""
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for line in review_text.split("\n"):
+        lower = line.lower()
+        if "| critical |" in lower or "|critical|" in lower:
+            counts["critical"] += 1
+        elif "| high |" in lower or "|high|" in lower:
+            counts["high"] += 1
+        elif "| medium |" in lower or "|medium|" in lower:
+            counts["medium"] += 1
+        elif "| low |" in lower or "|low|" in lower:
+            counts["low"] += 1
+    return counts
+
+
+def _issue_to_pr(config, agent, session, tui, issue_number):
+    """Automated workflow: GitHub Issue -> branch -> implement -> self-review -> PR.
+
+    Steps:
+    1. Pre-flight checks (gh CLI, clean git state)
+    2. Fetch issue details
+    3. Create feature branch
+    4. Let agent implement the solution
+    5. Self-review with fix loop (max 3 iterations)
+    6. Create PR linking the issue
+    7. Comment on issue with PR link
+    """
+    cwd = config.cwd
+
+    # ── Pre-flight checks ──
+    if not shutil.which("gh"):
+        print(f"  {C.RED}Error: gh CLI not found. Install: https://cli.github.com/{C.RESET}")
+        return
+    # Check git repo
+    try:
+        r = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                           capture_output=True, text=True, cwd=cwd, timeout=5)
+        if r.returncode != 0:
+            print(f"  {C.RED}Error: Not inside a git repository.{C.RESET}")
+            return
+    except Exception as e:
+        print(f"  {C.RED}Error: git check failed: {e}{C.RESET}")
+        return
+    # Check clean working tree
+    try:
+        r = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, cwd=cwd, timeout=10)
+        if r.stdout.strip():
+            print(f"  {C.YELLOW}Warning: Working tree has uncommitted changes.{C.RESET}")
+            print(f"  {C.DIM}Consider committing or stashing before /issue.{C.RESET}")
+            if tui and hasattr(tui, 'ask_yes_no'):
+                if not tui.ask_yes_no("Continue anyway?"):
+                    return
+    except Exception:
+        pass
+
+    # ── Fetch issue ──
+    print(f"  {C.CYAN}Fetching issue #{issue_number}...{C.RESET}")
+    ok, out, err = _run_gh_command(
+        ["issue", "view", str(issue_number), "--json", "title,body,labels,comments,state"],
+        cwd=cwd, timeout=15)
+    if not ok:
+        print(f"  {C.RED}Error: Could not fetch issue #{issue_number}: {err}{C.RESET}")
+        return
+    try:
+        issue_data = json.loads(out)
+    except json.JSONDecodeError:
+        print(f"  {C.RED}Error: Invalid JSON from gh CLI{C.RESET}")
+        return
+    issue_title = issue_data.get("title", f"Issue {issue_number}")
+    issue_body = issue_data.get("body", "") or ""
+    issue_state = issue_data.get("state", "")
+    labels = [lbl.get("name", "") for lbl in issue_data.get("labels", [])]
+    comments = issue_data.get("comments", [])
+    comment_text = ""
+    for c in comments[:5]:  # Max 5 comments for context
+        author = c.get("author", {}).get("login", "unknown")
+        body = c.get("body", "")
+        if body:
+            comment_text += f"\n[{author}]: {body[:500]}\n"
+
+    if issue_state == "CLOSED":
+        print(f"  {C.YELLOW}Warning: Issue #{issue_number} is already closed.{C.RESET}")
+
+    print(f"  {C.GREEN}Issue: {issue_title}{C.RESET}")
+    if labels:
+        print(f"  {C.DIM}Labels: {', '.join(labels)}{C.RESET}")
+
+    # ── Create branch ──
+    slug = _slugify(issue_title)
+    branch_name = f"issue-{issue_number}-{slug}" if slug else f"issue-{issue_number}"
+    # Ensure we're on the default branch first
+    try:
+        subprocess.run(["git", "checkout", "main"], capture_output=True, text=True, cwd=cwd, timeout=10)
+        subprocess.run(["git", "pull", "--ff-only"], capture_output=True, text=True, cwd=cwd, timeout=30)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["git", "checkout", "-b", branch_name],
+                           capture_output=True, text=True, cwd=cwd, timeout=10)
+        if r.returncode != 0:
+            # Branch may already exist — try switching to it
+            r2 = subprocess.run(["git", "checkout", branch_name],
+                                capture_output=True, text=True, cwd=cwd, timeout=10)
+            if r2.returncode != 0:
+                print(f"  {C.RED}Error: Could not create/switch to branch '{branch_name}': {r.stderr}{C.RESET}")
+                return
+            print(f"  {C.YELLOW}Switched to existing branch '{branch_name}'{C.RESET}")
+        else:
+            print(f"  {C.GREEN}Created branch: {branch_name}{C.RESET}")
+    except Exception as e:
+        print(f"  {C.RED}Error creating branch: {e}{C.RESET}")
+        return
+
+    # ── Let agent implement the solution ──
+    print(f"  {C.CYAN}Starting implementation...{C.RESET}")
+    impl_prompt = (
+        f"# Task: Implement solution for GitHub Issue #{issue_number}\n\n"
+        f"## Issue Title\n{issue_title}\n\n"
+        f"## Issue Description\n{issue_body[:3000]}\n\n"
+    )
+    if labels:
+        impl_prompt += f"## Labels\n{', '.join(labels)}\n\n"
+    if comment_text:
+        impl_prompt += f"## Comments\n{comment_text[:2000]}\n\n"
+    impl_prompt += (
+        "## Instructions\n"
+        "1. Read the relevant code files to understand the codebase.\n"
+        "2. Implement the changes described in the issue.\n"
+        "3. Make sure all changes are properly saved.\n"
+        "4. Run any relevant tests if they exist.\n"
+        "5. Commit your changes with a descriptive message.\n"
+    )
+    session.add_user_message(impl_prompt)
+    try:
+        agent.run(impl_prompt)
+    except Exception as e:
+        print(f"  {C.RED}Implementation failed: {e}{C.RESET}")
+        return
+
+    # ── Self-review loop ──
+    print(f"\n  {C.CYAN}Running self-review...{C.RESET}")
+    max_review_iterations = 3
+    for review_iter in range(max_review_iterations):
+        diff, desc = _get_review_diff(cwd)
+        if diff is None or not diff.strip():
+            print(f"  {C.YELLOW}No changes to review.{C.RESET}")
+            break
+
+        review_prompt = (
+            f"{_REVIEW_SYSTEM_PROMPT}\n\n"
+            f"## Diff to Review ({desc})\n"
+            f"```diff\n{diff[:50000]}\n```\n\n"
+            f"Analyze this diff and produce the structured review table."
+        )
+        session.add_user_message(review_prompt)
+        try:
+            agent.run(review_prompt)
+        except Exception as e:
+            print(f"  {C.YELLOW}Review iteration {review_iter + 1} failed: {e}{C.RESET}")
+            break
+
+        # Get the review output
+        review_text = ""
+        for msg in reversed(session.messages):
+            if msg.get("role") == "assistant":
+                review_text = msg.get("content", "")
+                break
+
+        severity = _parse_review_severity(review_text)
+        critical_high = severity["critical"] + severity["high"]
+        if critical_high == 0:
+            print(f"  {C.GREEN}Self-review passed (no critical/high issues).{C.RESET}")
+            break
+        if review_iter < max_review_iterations - 1:
+            print(f"  {C.YELLOW}Found {critical_high} critical/high issues. Fixing (attempt {review_iter + 2}/{max_review_iterations})...{C.RESET}")
+            fix_prompt = (
+                f"The code review found {severity['critical']} critical and {severity['high']} high severity issues.\n"
+                f"Please fix all critical and high severity issues identified in the review above.\n"
+                f"After fixing, commit the changes."
+            )
+            session.add_user_message(fix_prompt)
+            try:
+                agent.run(fix_prompt)
+            except Exception as e:
+                print(f"  {C.YELLOW}Fix attempt failed: {e}{C.RESET}")
+                break
+        else:
+            print(f"  {C.YELLOW}Warning: {critical_high} critical/high issues remain after {max_review_iterations} review iterations.{C.RESET}")
+
+    # ── Create PR ──
+    print(f"\n  {C.CYAN}Creating pull request...{C.RESET}")
+    # Push branch
+    try:
+        r = subprocess.run(["git", "push", "-u", "origin", branch_name],
+                           capture_output=True, text=True, cwd=cwd, timeout=60)
+        if r.returncode != 0:
+            print(f"  {C.RED}Error pushing branch: {r.stderr}{C.RESET}")
+            return
+        print(f"  {C.GREEN}Pushed to origin/{branch_name}{C.RESET}")
+    except Exception as e:
+        print(f"  {C.RED}Error pushing: {e}{C.RESET}")
+        return
+
+    # Generate PR body
+    pr_title = f"Fix #{issue_number}: {issue_title}"
+    if len(pr_title) > 72:
+        pr_title = pr_title[:69] + "..."
+    pr_body = (
+        f"## Summary\n\n"
+        f"Closes #{issue_number}\n\n"
+        f"Automated implementation for: **{issue_title}**\n\n"
+        f"## Changes\n\n"
+        f"See commits for detailed changes.\n\n"
+        f"## Self-Review\n\n"
+        f"This PR was auto-reviewed before submission.\n"
+    )
+    ok, pr_out, pr_err = _run_gh_command(
+        ["pr", "create", "--title", pr_title, "--body", pr_body, "--head", branch_name],
+        cwd=cwd, timeout=30)
+    if not ok:
+        print(f"  {C.RED}Error creating PR: {pr_err}{C.RESET}")
+        return
+
+    # Extract PR URL from output
+    pr_url = pr_out.strip().split("\n")[-1] if pr_out else ""
+    print(f"  {C.GREEN}PR created: {pr_url}{C.RESET}")
+
+    # ── Comment on issue ──
+    if pr_url:
+        _run_gh_command(
+            ["issue", "comment", str(issue_number), "--body",
+             f"Automated PR created: {pr_url}"],
+            cwd=cwd, timeout=15)
+        print(f"  {C.GREEN}Commented on issue #{issue_number} with PR link.{C.RESET}")
+
+    print(f"\n  {C.GREEN}Done! Issue #{issue_number} → PR: {pr_url}{C.RESET}")
+
+
 def _build_system_prompt(config):
     """Build system prompt with environment info and OS-specific hints."""
     cwd = config.cwd
@@ -3275,6 +3567,22 @@ Adjust explanation depth and vocabulary based on level:
 - Level 4-5: Avoid jargon, use analogies, explain everything thoroughly
 
 Always use Japanese for explanations when the user writes in Japanese.
+"""
+
+    # Output schema instruction (for --output-schema)
+    if getattr(config, 'output_schema', None):
+        schema_json = json.dumps(config.output_schema, indent=2, ensure_ascii=False)
+        prompt += f"""
+# Structured Output Mode
+Your FINAL response in the conversation must be a valid JSON object matching this schema:
+```json
+{schema_json}
+```
+
+IMPORTANT rules for structured output:
+- Your FINAL message must contain ONLY the JSON object — no markdown fences, no explanation.
+- You may use tools and provide intermediate text, but your LAST response must be the JSON.
+- Ensure all required fields are present and types are correct.
 """
 
     return prompt
@@ -4565,6 +4873,122 @@ class HeadlessOutputCollector:
                 "tool_calls": self._tool_call_count,
                 "events": self._events,
             }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Structured Output Schema Helpers
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _extract_json_from_response(text):
+    """Extract JSON object from assistant response text.
+
+    Tries raw parse first, then looks for ```json fenced blocks.
+    Returns parsed dict/list or None.
+    """
+    if not text:
+        return None
+    text = text.strip()
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Try extracting from ```json ... ``` block
+    m = re.search(r'```(?:json)?\s*\n?([\s\S]*?)\n?```', text)
+    if m:
+        try:
+            return json.loads(m.group(1).strip())
+        except (json.JSONDecodeError, ValueError):
+            pass
+    # Try finding first { ... } or [ ... ] span
+    for opener, closer in [("{", "}"), ("[", "]")]:
+        start = text.find(opener)
+        if start >= 0:
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(text)):
+                c = text[i]
+                if esc:
+                    esc = False
+                    continue
+                if c == "\\":
+                    esc = True
+                    continue
+                if c == '"' and not esc:
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if c == opener:
+                    depth += 1
+                elif c == closer:
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:i + 1])
+                        except (json.JSONDecodeError, ValueError):
+                            break
+    return None
+
+
+_SCHEMA_TYPE_MAP = {
+    "string": str,
+    "number": (int, float),
+    "integer": int,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+    "null": type(None),
+}
+
+
+def _validate_against_schema(data, schema):
+    """Basic JSON schema validation without external dependencies.
+
+    Checks type, required, and properties (one level deep).
+    Returns (valid: bool, errors: list[str]).
+    """
+    errors = []
+    if not isinstance(schema, dict):
+        return True, []
+
+    # Type check
+    expected_type = schema.get("type")
+    if expected_type:
+        py_types = _SCHEMA_TYPE_MAP.get(expected_type)
+        if py_types and not isinstance(data, py_types):
+            errors.append(f"Expected type '{expected_type}', got '{type(data).__name__}'")
+            return False, errors
+
+    # Required fields (only for objects)
+    if isinstance(data, dict):
+        for field in schema.get("required", []):
+            if field not in data:
+                errors.append(f"Missing required field: '{field}'")
+
+        # Property type checks (one level)
+        props = schema.get("properties", {})
+        for key, prop_schema in props.items():
+            if key in data:
+                prop_type = prop_schema.get("type")
+                if prop_type:
+                    py_types = _SCHEMA_TYPE_MAP.get(prop_type)
+                    if py_types and not isinstance(data[key], py_types):
+                        errors.append(f"Field '{key}': expected '{prop_type}', got '{type(data[key]).__name__}'")
+
+    # Array items type check
+    if isinstance(data, list) and "items" in schema:
+        item_type = schema["items"].get("type")
+        if item_type:
+            py_types = _SCHEMA_TYPE_MAP.get(item_type)
+            if py_types:
+                for i, item in enumerate(data):
+                    if not isinstance(item, py_types):
+                        errors.append(f"Item [{i}]: expected '{item_type}', got '{type(item).__name__}'")
+                        break  # Report first error only
+
+    return len(errors) == 0, errors
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -8132,6 +8556,138 @@ class MCPClient:
         return "\n".join(texts) if texts else json.dumps(result)
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# MCP Server Mode — expose eve-coder tools via JSON-RPC 2.0 over stdio
+# ════════════════════════════════════════════════════════════════════════════════
+
+class MCPServer:
+    """Run eve-coder as an MCP server, exposing built-in tools over JSON-RPC 2.0 stdio."""
+
+    EXPOSED_TOOLS = frozenset({
+        "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch",
+    })
+
+    def __init__(self, config):
+        self.config = config
+        self.registry = ToolRegistry()
+        self.registry.register_defaults()
+
+    def run(self):
+        """Main event loop: read JSON-RPC requests from stdin, write responses to stdout."""
+        # Disable any buffering on stdout for clean JSON-RPC
+        import io as _io
+        if hasattr(sys.stdout, 'buffer'):
+            sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError:
+                self._send_error(None, -32700, "Parse error")
+                continue
+            req_id = request.get("id")
+            method = request.get("method", "")
+            params = request.get("params", {})
+            # Notifications (no id) — acknowledge silently
+            if req_id is None:
+                if method == "notifications/initialized":
+                    pass  # No response needed for notifications
+                continue
+            if method == "initialize":
+                self._handle_initialize(req_id, params)
+            elif method == "tools/list":
+                self._handle_tools_list(req_id)
+            elif method == "tools/call":
+                self._handle_tools_call(req_id, params)
+            else:
+                self._send_error(req_id, -32601, f"Method not found: {method}")
+
+    def _handle_initialize(self, req_id, params):
+        """Respond with server capabilities."""
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {},
+            },
+            "serverInfo": {
+                "name": "eve-coder",
+                "version": __version__,
+            },
+        }
+        self._send_response(req_id, result)
+
+    def _handle_tools_list(self, req_id):
+        """Return available tools in MCP schema format."""
+        tools = []
+        for schema in self.registry.get_schemas():
+            func = schema.get("function", {})
+            name = func.get("name", "")
+            if name not in self.EXPOSED_TOOLS:
+                continue
+            tools.append({
+                "name": name,
+                "description": func.get("description", ""),
+                "inputSchema": func.get("parameters", {"type": "object", "properties": {}}),
+            })
+        self._send_response(req_id, {"tools": tools})
+
+    def _handle_tools_call(self, req_id, params):
+        """Execute a tool and return the result."""
+        tool_name = params.get("name", "")
+        arguments = params.get("arguments", {})
+        if tool_name not in self.EXPOSED_TOOLS:
+            self._send_error(req_id, -32602, f"Tool not exposed: {tool_name}")
+            return
+        tool = self.registry.get(tool_name)
+        if not tool:
+            self._send_error(req_id, -32602, f"Tool not found: {tool_name}")
+            return
+        try:
+            result = tool.execute(arguments)
+            result_text = str(result) if result is not None else ""
+            is_error = False
+            if isinstance(result, ToolResult):
+                result_text = result.output
+                is_error = result.is_error
+            self._send_response(req_id, {
+                "content": [{"type": "text", "text": result_text}],
+                "isError": is_error,
+            })
+        except Exception as e:
+            self._send_response(req_id, {
+                "content": [{"type": "text", "text": f"Tool execution error: {e}"}],
+                "isError": True,
+            })
+
+    def _send_response(self, req_id, result):
+        """Write a JSON-RPC success response."""
+        msg = {"jsonrpc": "2.0", "id": req_id, "result": result}
+        try:
+            print(json.dumps(msg, ensure_ascii=False), flush=True)
+        except Exception:
+            pass
+
+    def _send_error(self, req_id, code, message):
+        """Write a JSON-RPC error response."""
+        msg = {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+        try:
+            print(json.dumps(msg, ensure_ascii=False), flush=True)
+        except Exception:
+            pass
+
+
+def _run_mcp_server(config):
+    """Entry point for MCP server mode."""
+    config.yes_mode = True  # In server mode, the MCP client manages permissions
+    server = MCPServer(config)
+    try:
+        server.run()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+
 class MCPTool(Tool):
     """Wraps an MCP server tool as a eve-coder tool."""
 
@@ -8197,6 +8753,18 @@ def _compute_repo_hashes(config, paths):
         if digest:
             hashes[_repo_relpath(config, real)] = digest
     return hashes
+
+
+def _path_within_root(path, root):
+    """Return True when path resolves inside root (or equals root)."""
+    if not path or not root:
+        return False
+    try:
+        real_path = os.path.realpath(path)
+        real_root = os.path.realpath(root)
+    except (OSError, ValueError):
+        return False
+    return real_path == real_root or real_path.startswith(real_root + os.sep)
 
 
 def _get_repo_scope_hashes(entry, scope):
@@ -8699,6 +9267,7 @@ class ExtensionManager:
                     skills[qualified_name] = {
                         "content": content,
                         "skill_dir": os.path.dirname(full_path),
+                        "path": full_path,
                     }
                 except OSError:
                     pass
@@ -8859,7 +9428,7 @@ def _load_skills(config):
                     with open(fpath, encoding="utf-8") as f:
                         content = f.read(50000)
                     name = entry[:-3]  # remove .md
-                    skills[name] = {"content": content, "skill_dir": skill_dir}
+                    skills[name] = {"content": content, "skill_dir": skill_dir, "path": fpath}
                 except (OSError, UnicodeDecodeError):
                     pass
         except OSError:
@@ -8893,7 +9462,7 @@ def _expand_skill_variables(content, arguments="", skill_dir="", cwd=""):
     return result
 
 
-def _expand_shell_injections(content, cwd=""):
+def _expand_shell_injections(content, cwd="", *, allow_commands=False, source_name="content"):
     """Expand !`command` shell injection patterns in command/skill content.
 
     Replaces each !`command` with the stdout of running the command.
@@ -8902,7 +9471,14 @@ def _expand_shell_injections(content, cwd=""):
     _SHELL_INJECT_RE = re.compile(r'!\`([^`]+)\`')
     matches = list(_SHELL_INJECT_RE.finditer(content))
     if not matches:
-        return content
+        return content, None
+    if not allow_commands:
+        blocked = matches[0].group(1).strip()
+        preview = blocked[:120] + ("..." if len(blocked) > 120 else "")
+        return None, (
+            f"Error: !`command` expansion is blocked in {source_name} for security. "
+            f"Use explicit tool calls instead. Blocked command: {preview}"
+        )
     result = content
     count = 0
     for match in reversed(matches):  # reverse to preserve offsets
@@ -8929,7 +9505,7 @@ def _expand_shell_injections(content, cwd=""):
             output = f"(command failed: {e})"
         result = result[:match.start()] + output + result[match.end():]
         count += 1
-    return result
+    return result, None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -11118,6 +11694,9 @@ class PermissionMgr:
 
     def __init__(self, config):
         self.yes_mode = config.yes_mode
+        self.auto_mode = getattr(config, 'auto_mode', False)
+        self._sidecar_client = None   # Set externally after OllamaClient init
+        self._sidecar_model = None    # Set externally after sidecar model selection
         self.rules = {}  # tool_name -> "allow" | "deny"
         self._session_allows = set()  # remembered "allow" decisions this session
         self._session_denies = set()  # remembered "deny" decisions this session
@@ -11375,6 +11954,17 @@ class PermissionMgr:
         if self.yes_mode:
             self._set_last_decision(True, "yes-mode", f"yes_mode enabled for {tool_name}.", "session")
             return True
+        # Auto mode: use sidecar model to classify tool calls
+        if self.auto_mode and tool_name not in self.SAFE_TOOLS:
+            if tool_name in self.ASK_TOOLS or tool_name in self.NETWORK_TOOLS:
+                allowed, reason = self._classify_with_sidecar(tool_name, params)
+                if allowed is not None:
+                    action = "auto-allowed" if allowed else "auto-denied"
+                    self._set_last_decision(allowed, "auto-mode",
+                        f"[auto] {tool_name}: {reason}" if reason else f"[auto] {tool_name}: {action}",
+                        "session")
+                    return allowed
+                # Sidecar unavailable — fall through to user prompt
         if tool_name in self.SAFE_TOOLS:
             self._set_last_decision(True, "safe-tool", f"{tool_name} is always allowed.", "runtime")
             return True
@@ -11422,6 +12012,60 @@ class PermissionMgr:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
         except OSError:
             pass
+
+    def _classify_with_sidecar(self, tool_name, params):
+        """Use sidecar model to classify a tool call as safe or unsafe.
+
+        Returns (allowed: bool, reason: str) or (None, "") if sidecar unavailable.
+        """
+        if not self._sidecar_client or not self._sidecar_model:
+            return None, ""
+        # Build compact param summary (truncate for speed)
+        param_str = json.dumps(params, ensure_ascii=False)
+        if len(param_str) > 500:
+            param_str = param_str[:500] + "..."
+        classify_prompt = [
+            {"role": "system", "content": (
+                "You are a security classifier for CLI tool calls.\n"
+                "Classify as ALLOW or DENY.\n"
+                "ALLOW = read-only, non-destructive, clearly benign operations "
+                "(e.g. listing files, reading content, searching, simple writes to non-critical files)\n"
+                "DENY = destructive, critical system file modification, package install with sudo, "
+                "sensitive data access, network calls to unknown hosts\n"
+                "First line: ALLOW or DENY\n"
+                "Second line: one-sentence reason"
+            )},
+            {"role": "user", "content": f"Tool: {tool_name}\nArguments: {param_str}"},
+        ]
+        try:
+            resp = self._sidecar_client.chat(
+                model=self._sidecar_model,
+                messages=classify_prompt,
+                tools=None,
+                stream=False,
+            )
+            # Extract content from response
+            content = ""
+            choices = resp.get("choices", [])
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+            if not content:
+                content = resp.get("message", {}).get("content", "")
+            if not content:
+                return None, ""
+            # Strip <think> blocks (Qwen reasoning traces)
+            content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+            lines = content.strip().split("\n", 1)
+            decision_word = lines[0].strip().upper()
+            reason = lines[1].strip() if len(lines) > 1 else ""
+            if "ALLOW" in decision_word:
+                return True, reason
+            elif "DENY" in decision_word:
+                return False, reason
+            # Ambiguous response — treat as unavailable
+            return None, ""
+        except Exception:
+            return None, ""
 
     def session_allow(self, tool_name):
         """Allow a tool for the rest of this session, and persist if safe."""
@@ -14981,6 +15625,11 @@ class Agent:
                         ))
                         self.tui.show_tool_result(tool_name, "Permission denied", True)
                         continue
+                    # Show auto-mode classification result
+                    if (self.permissions.auto_mode and self.permissions._last_decision
+                            and self.permissions._last_decision.get("source") == "auto-mode"):
+                        _auto_reason = self.permissions._last_decision.get("reason", "")
+                        _p(f"  {C.DIM}{_auto_reason}{C.RESET}")
                     # PreToolUse hook: allow hooks to deny tool execution after approval
                     if self.hook_mgr and self.hook_mgr.has_hooks:
                         _hook_result = self.hook_mgr.fire_pre_tool(tool_name, tool_params)
@@ -15873,6 +16522,11 @@ def main():
     # Parse config
     config = Config().load()
 
+    # MCP server mode: early dispatch (no Ollama, no TUI needed)
+    if config.mcp_server:
+        _run_mcp_server(config)
+        sys.exit(0)
+
     # Validate loop mode arguments
     if config.loop_mode and not config.prompt:
         print(f"{C.RED}{t('errors.loop_requires_prompt', default='Error: --loop can only be used with -p/--prompt')}{C.RESET}")
@@ -16088,6 +16742,10 @@ def main():
     if config.sandbox:
         registry.register(BashTool(cwd=config.cwd, config=config))
     permissions = PermissionMgr(config)
+    # Wire auto-mode sidecar references
+    if config.auto_mode and client:
+        permissions._sidecar_client = client
+        permissions._sidecar_model = config.sidecar_model or config.model
     registry.register(SubAgentTool(config, client, registry, permissions, tui))
     coordinator = MultiAgentCoordinator(config, client, registry, permissions, tui)
     registry.register(ParallelAgentTool(coordinator))
@@ -16380,6 +17038,68 @@ def main():
                     "session_id": session.session_id,
                     "exit_code": exit_code,
                 }
+
+            # --output-schema: validate and extract structured output
+            if config.output_schema:
+                _raw_content = _output.get("content", "")
+                _parsed = _extract_json_from_response(_raw_content)
+                _schema_valid = False
+                if _parsed is not None:
+                    _valid, _errs = _validate_against_schema(_parsed, config.output_schema)
+                    if _valid:
+                        _schema_valid = True
+                        _output["structured_output"] = _parsed
+                    else:
+                        # Retry once: ask agent to fix the output
+                        _fix_prompt = (
+                            f"Your previous response did not match the required JSON schema.\n"
+                            f"Errors: {'; '.join(_errs)}\n"
+                            f"Schema: {json.dumps(config.output_schema, ensure_ascii=False)}\n"
+                            f"Please output ONLY a corrected JSON object."
+                        )
+                        try:
+                            session.add_user_message(_fix_prompt)
+                            agent.run(_fix_prompt)
+                            _retry_content = ""
+                            for _msg in reversed(session.messages):
+                                if _msg.get("role") == "assistant":
+                                    _retry_content = _msg.get("content", "")
+                                    break
+                            _retry_parsed = _extract_json_from_response(_retry_content)
+                            if _retry_parsed is not None:
+                                _v2, _e2 = _validate_against_schema(_retry_parsed, config.output_schema)
+                                if _v2:
+                                    _schema_valid = True
+                                    _output["structured_output"] = _retry_parsed
+                                    _output["content"] = _retry_content
+                        except Exception:
+                            pass
+                else:
+                    # No JSON found at all — try retry
+                    _fix_prompt = (
+                        f"Your response was not valid JSON.\n"
+                        f"Schema: {json.dumps(config.output_schema, ensure_ascii=False)}\n"
+                        f"Please output ONLY a valid JSON object matching the schema."
+                    )
+                    try:
+                        session.add_user_message(_fix_prompt)
+                        agent.run(_fix_prompt)
+                        _retry_content = ""
+                        for _msg in reversed(session.messages):
+                            if _msg.get("role") == "assistant":
+                                _retry_content = _msg.get("content", "")
+                                break
+                        _retry_parsed = _extract_json_from_response(_retry_content)
+                        if _retry_parsed is not None:
+                            _v2, _e2 = _validate_against_schema(_retry_parsed, config.output_schema)
+                            if _v2:
+                                _schema_valid = True
+                                _output["structured_output"] = _retry_parsed
+                                _output["content"] = _retry_content
+                    except Exception:
+                        pass
+                _output["schema_valid"] = _schema_valid
+
             print(json.dumps(_output, ensure_ascii=False))
         sys.exit(exit_code)
 
@@ -17083,6 +17803,18 @@ def main():
                     parts = user_input.split(maxsplit=1)
                     review_target = parts[1].strip() if len(parts) > 1 else None
                     _run_code_review(config, agent, session, tui, review_target)
+                    continue
+
+                elif cmd == "/issue":
+                    # Issue → PR automation: /issue <number>
+                    parts = user_input.split(maxsplit=1)
+                    issue_arg = parts[1].strip() if len(parts) > 1 else ""
+                    if not issue_arg or not issue_arg.split()[0].isdigit():
+                        print(f"  {C.CYAN}/issue <number>{C.RESET} — Fetch GitHub issue, implement, self-review, and create PR")
+                        print(f"  {C.DIM}Example: /issue 42{C.RESET}")
+                        continue
+                    issue_num = int(issue_arg.split()[0])
+                    _issue_to_pr(config, agent, session, tui, issue_num)
                     continue
 
                 elif cmd == "/gh":
@@ -17974,8 +18706,16 @@ Review this code for:
                     for i, arg_val in enumerate(_arg_list, start=1):
                         cmd_body = cmd_body.replace(f"${i}", arg_val)
 
-                    # Expand !`command` shell injections
-                    cmd_body = _expand_shell_injections(cmd_body, cwd=config.cwd)
+                    # Allow shell expansion only for user-owned global command files.
+                    cmd_body, shell_expand_error = _expand_shell_injections(
+                        cmd_body,
+                        cwd=config.cwd,
+                        allow_commands=_path_within_root(cmd_info.get("path"), config.config_dir),
+                        source_name=f"custom command '{cmd_name}'",
+                    )
+                    if shell_expand_error:
+                        print(f"{C.RED}{shell_expand_error}{C.RESET}")
+                        continue
 
                     # Get allowed tools from frontmatter if specified
                     _allowed_tools = None
@@ -18334,8 +19074,16 @@ Review this code for:
                             _skill_info["content"], _skill_args,
                             skill_dir=_skill_info["skill_dir"],
                             cwd=config.cwd)
-                        # Expand !`command` shell injections
-                        _skill_content = _expand_shell_injections(_skill_content, cwd=config.cwd)
+                        # Allow shell expansion only for user-owned global/extension skill files.
+                        _skill_content, shell_expand_error = _expand_shell_injections(
+                            _skill_content,
+                            cwd=config.cwd,
+                            allow_commands=_path_within_root(_skill_info.get("path"), config.config_dir),
+                            source_name=f"skill '{_skill_name}'",
+                        )
+                        if shell_expand_error:
+                            print(f"{C.RED}{shell_expand_error}{C.RESET}")
+                            continue
                         # Inject as user message and fall through to normal agent processing
                         user_input = _skill_content
                     else:
