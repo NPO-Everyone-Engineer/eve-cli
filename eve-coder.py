@@ -271,7 +271,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.22.0"
+__version__ = "2.23.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1141,6 +1141,7 @@ class Config:
         self._cli_context_window_set = False
         self.think_mode = None          # None=auto, True=force on, False=force off
         self._cli_think_mode_set = False
+        self.thinking_budget = None     # --thinking-budget (max thinking tokens)
 
         # RAG options
         self.rag = False
@@ -1407,6 +1408,8 @@ class Config:
                             help="Force enable thinking mode (Qwen3 / reasoning models)")
         parser.add_argument("--no-think", action="store_true", default=False,
                             help="Force disable thinking mode")
+        parser.add_argument("--thinking-budget", type=int, default=None, metavar="TOKENS",
+                            help="Max thinking tokens for reasoning models (e.g., 8000)")
         parser.add_argument(
             "--max-agent-steps",
             type=int,
@@ -1523,6 +1526,10 @@ class Config:
         elif args.no_think:
             self.think_mode = False
             self._cli_think_mode_set = True
+        if args.thinking_budget is not None:
+            self.thinking_budget = args.thinking_budget
+            if self.think_mode is None:
+                self.think_mode = True  # force thinking on if budget is set
         if args.max_agent_steps is not None:
             parsed = self._normalize_max_agent_steps(args.max_agent_steps, emit_errors=True)
             if parsed is not None:
@@ -3569,6 +3576,16 @@ Adjust explanation depth and vocabulary based on level:
 Always use Japanese for explanations when the user writes in Japanese.
 """
 
+    # Evolution engine: inject learned behaviors into prompt
+    try:
+        _evo = EvolutionEngine(config.config_dir)
+        _evo.decay_insights()
+        _evo_text = _evo.format_for_prompt()
+        if _evo_text:
+            prompt += "\n" + _evo_text
+    except Exception:
+        pass
+
     # Output schema instruction (for --output-schema)
     if getattr(config, 'output_schema', None):
         schema_json = json.dumps(config.output_schema, indent=2, ensure_ascii=False)
@@ -3632,6 +3649,7 @@ class OllamaClient:
         self.temperature = config.temperature
         self.context_window = config.context_window
         self.think_mode = getattr(config, 'think_mode', None)
+        self.thinking_budget = getattr(config, 'thinking_budget', None)
         self.debug = config.debug
         self.timeout = 300
         self._supports_tool_streaming = None  # None=untested, True/False=detected
@@ -4059,6 +4077,10 @@ class OllamaClient:
         # Explicitly control thinking mode for Ollama 0.6.5+ (Qwen3 / reasoning models)
         if self.think_mode is not None:
             payload["think"] = self.think_mode
+        # Thinking budget: limit thinking tokens (Ollama 0.7+)
+        if self.thinking_budget is not None:
+            payload["think"] = True
+            payload.setdefault("options", {})["thinking_budget"] = self.thinking_budget
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -8683,17 +8705,69 @@ class MCPClient:
 # MCP Server Mode — expose eve-coder tools via JSON-RPC 2.0 over stdio
 # ════════════════════════════════════════════════════════════════════════════════
 
+class _MCPChatTool:
+    """Synthetic tool for MCP server mode: send a prompt to the AI model."""
+
+    name = "Chat"
+
+    def get_schema(self):
+        return {
+            "type": "function",
+            "function": {
+                "name": "Chat",
+                "description": "Send a prompt to the AI model and get a text response",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string", "description": "The prompt to send"},
+                        "model": {"type": "string", "description": "Optional model override"},
+                    },
+                    "required": ["prompt"],
+                },
+            },
+        }
+
+    def __init__(self, config, client):
+        self._config = config
+        self._client = client
+
+    def execute(self, params):
+        prompt = params.get("prompt", "")
+        model = params.get("model") or self._config.model
+        if not prompt:
+            return "Error: prompt is required"
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            resp = self._client.chat(model=model, messages=messages, tools=None, stream=False)
+            choices = resp.get("choices", [])
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+            else:
+                content = resp.get("message", {}).get("content", "")
+            # Strip thinking blocks
+            content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+            return content or "(empty response)"
+        except Exception as e:
+            return f"Chat error: {e}"
+
+
 class MCPServer:
     """Run eve-coder as an MCP server, exposing built-in tools over JSON-RPC 2.0 stdio."""
 
     EXPOSED_TOOLS = frozenset({
-        "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch",
+        "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Chat",
     })
 
-    def __init__(self, config):
+    def __init__(self, config, client=None):
         self.config = config
         self.registry = ToolRegistry()
         self.registry.register_defaults()
+        # Register Chat tool if Ollama client is available
+        if client:
+            self.registry.register(_MCPChatTool(config, client))
 
     def run(self):
         """Main event loop: read JSON-RPC requests from stdin, write responses to stdout."""
@@ -8804,7 +8878,14 @@ class MCPServer:
 def _run_mcp_server(config):
     """Entry point for MCP server mode."""
     config.yes_mode = True  # In server mode, the MCP client manages permissions
-    server = MCPServer(config)
+    # Try to create OllamaClient for Chat tool support
+    client = None
+    if config.model:
+        try:
+            client = OllamaClient(config)
+        except Exception:
+            pass  # Chat tool won't be available
+    server = MCPServer(config, client=client)
     try:
         server.run()
     except (KeyboardInterrupt, EOFError):
@@ -9131,6 +9212,47 @@ def _load_mcp_servers(config):
     except Exception:
         pass
     return servers
+
+
+def _save_mcp_config(path, data):
+    """Safely write MCP server configuration to a JSON file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def _init_mcp_clients(config, registry, permissions):
+    """Initialize MCP server connections and register their tools. Returns client list."""
+    clients = []
+    mcp_server_configs = _load_mcp_servers(config)
+    for srv_name, srv_config in mcp_server_configs.items():
+        try:
+            mcp = MCPClient(
+                name=srv_name,
+                command=srv_config["command"],
+                args=srv_config.get("args", []),
+                env=srv_config.get("env", {}),
+            )
+            mcp.start()
+            mcp.initialize()
+            tools = mcp.list_tools()
+            for tool_schema in tools:
+                mcp_tool = MCPTool(mcp, tool_schema)
+                registry.register(mcp_tool)
+                permissions.ASK_TOOLS.add(mcp_tool.name)
+            clients.append(mcp)
+            if config.debug:
+                print(f"{C.DIM}[debug] MCP '{srv_name}': {len(tools)} tools registered{C.RESET}", file=sys.stderr)
+        except Exception as e:
+            print(f"{C.YELLOW}Warning: MCP server '{srv_name}' failed: {e}{C.RESET}", file=sys.stderr)
+    return clients
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -12916,6 +13038,203 @@ class Memory:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# EvolutionEngine — Self-learning system that improves with usage
+# ════════════════════════════════════════════════════════════════════════════════
+
+class EvolutionEngine:
+    """Track interaction patterns and build statistical insights.
+
+    Stores data in ~/.config/eve-cli/evolution.json.
+    Every INSIGHT_INTERVAL sessions, uses the sidecar model to generate
+    actionable insights that are injected into the system prompt.
+    """
+
+    MAX_INSIGHTS = 10
+    INSIGHT_DECAY_DAYS = 30
+    INSIGHT_INTERVAL = 10  # generate insights every N sessions
+
+    def __init__(self, config_dir):
+        self._file = os.path.join(config_dir, "evolution.json")
+        self._data = self._load()
+        self._session_tool_calls = []
+
+    def _load(self):
+        if os.path.isfile(self._file) and not os.path.islink(self._file):
+            try:
+                with open(self._file, encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return self._default_data()
+
+    @staticmethod
+    def _default_data():
+        return {
+            "version": 1, "total_sessions": 0, "total_tool_calls": 0,
+            "tool_stats": {}, "error_patterns": {}, "workflow_patterns": [],
+            "user_preferences": {}, "insights": [], "last_updated": None,
+        }
+
+    def _save(self):
+        self._data["last_updated"] = datetime.now().isoformat()
+        try:
+            os.makedirs(os.path.dirname(self._file), exist_ok=True)
+            tmp = self._file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._file)
+        except OSError:
+            pass
+
+    # ── Recording ──
+
+    def record_tool_call(self, tool_name, success, duration=0.0):
+        stats = self._data.setdefault("tool_stats", {})
+        entry = stats.setdefault(tool_name, {"success": 0, "fail": 0, "avg_time": 0.0, "_total_time": 0.0})
+        if success:
+            entry["success"] += 1
+        else:
+            entry["fail"] += 1
+        entry["_total_time"] = entry.get("_total_time", 0.0) + duration
+        total = entry["success"] + entry["fail"]
+        entry["avg_time"] = round(entry["_total_time"] / max(total, 1), 2)
+        self._data["total_tool_calls"] = self._data.get("total_tool_calls", 0) + 1
+        self._session_tool_calls.append(tool_name)
+
+    def record_error(self, error_type, auto_fixed=False):
+        patterns = self._data.setdefault("error_patterns", {})
+        entry = patterns.setdefault(error_type, {"count": 0, "auto_fixed": 0, "manual_fixed": 0})
+        entry["count"] += 1
+        if auto_fixed:
+            entry["auto_fixed"] += 1
+        else:
+            entry["manual_fixed"] += 1
+
+    def record_session_end(self, file_types=None):
+        self._data["total_sessions"] = self._data.get("total_sessions", 0) + 1
+        self._update_workflow_patterns()
+        if file_types:
+            prefs = self._data.setdefault("user_preferences", {})
+            existing = set(prefs.get("common_file_types", []))
+            existing.update(file_types)
+            prefs["common_file_types"] = sorted(existing)[:20]
+        self._save()
+
+    def _update_workflow_patterns(self):
+        calls = self._session_tool_calls
+        if len(calls) < 3:
+            self._session_tool_calls = []
+            return
+        patterns = self._data.setdefault("workflow_patterns", [])
+        for i in range(len(calls) - 2):
+            seq = calls[i:i + 3]
+            found = False
+            for p in patterns:
+                if p.get("sequence") == seq:
+                    p["count"] = p.get("count", 0) + 1
+                    found = True
+                    break
+            if not found:
+                patterns.append({"sequence": seq, "count": 1})
+        patterns.sort(key=lambda p: p.get("count", 0), reverse=True)
+        self._data["workflow_patterns"] = patterns[:20]
+        self._session_tool_calls = []
+
+    # ── Insight Generation ──
+
+    def should_generate_insights(self):
+        total = self._data.get("total_sessions", 0)
+        return total > 0 and total % self.INSIGHT_INTERVAL == 0
+
+    def generate_insights(self, client, model):
+        summary = json.dumps({
+            "tool_stats": self._data.get("tool_stats", {}),
+            "error_patterns": self._data.get("error_patterns", {}),
+            "workflow_patterns": self._data.get("workflow_patterns", [])[:10],
+            "user_preferences": self._data.get("user_preferences", {}),
+            "total_sessions": self._data.get("total_sessions", 0),
+        }, ensure_ascii=False)[:3000]
+        prompt = [
+            {"role": "system", "content": (
+                "Analyze this CLI agent usage data and generate 3-5 actionable insights.\n"
+                "Each insight should be a plain text rule to help the AI assistant work more effectively.\n"
+                "Format: one insight per line, starting with a confidence score (0.0-1.0).\n"
+                "Example: 0.85 User prefers to run tests after editing Python files\n"
+                "Write in the same language the user commonly uses (check user_preferences)."
+            )},
+            {"role": "user", "content": summary},
+        ]
+        try:
+            resp = client.chat(model=model, messages=prompt, tools=None, stream=False)
+            content = ""
+            choices = resp.get("choices", [])
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+            if not content:
+                content = resp.get("message", {}).get("content", "")
+            content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+            new_insights = []
+            for line in content.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.match(r'^(0\.\d+|1\.0)\s+(.+)', line)
+                if m:
+                    new_insights.append({
+                        "text": m.group(2).strip(),
+                        "confidence": float(m.group(1)),
+                        "created": datetime.now().strftime("%Y-%m-%d"),
+                    })
+            if new_insights:
+                self._data["insights"] = new_insights[:self.MAX_INSIGHTS]
+                self._save()
+        except Exception:
+            pass
+
+    def decay_insights(self):
+        today = datetime.now()
+        for insight in self._data.get("insights", []):
+            created = insight.get("created", "")
+            try:
+                created_dt = datetime.strptime(created, "%Y-%m-%d")
+                age_days = (today - created_dt).days
+                if age_days > self.INSIGHT_DECAY_DAYS:
+                    decay = max(0.1, 1.0 - (age_days - self.INSIGHT_DECAY_DAYS) * 0.01)
+                    insight["confidence"] = round(insight["confidence"] * decay, 2)
+            except (ValueError, TypeError):
+                pass
+        self._data["insights"] = [
+            i for i in self._data.get("insights", []) if i.get("confidence", 0) >= 0.2
+        ]
+
+    # ── Prompt Integration ──
+
+    def format_for_prompt(self, max_chars=800):
+        insights = sorted(
+            self._data.get("insights", []),
+            key=lambda i: i.get("confidence", 0), reverse=True
+        )[:5]
+        if not insights and not self._data.get("tool_stats"):
+            return ""
+        lines = ["# Learned Behaviors (auto-generated from usage patterns)"]
+        for ins in insights:
+            lines.append(f"- [{ins.get('confidence', 0):.0%}] {ins.get('text', '')}")
+        # Add tool failure warnings
+        for name, s in self._data.get("tool_stats", {}).items():
+            total = s.get("success", 0) + s.get("fail", 0)
+            if total > 10 and s.get("fail", 0) / total > 0.15:
+                lines.append(f"- Tool '{name}' has high failure rate ({s['fail']}/{total}). Check parameters carefully.")
+        result = "\n".join(lines) + "\n"
+        return result[:max_chars]
+
+    # ── Commands ──
+
+    def reset(self):
+        self._data = self._default_data()
+        self._save()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Session — Conversation history management
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -15276,6 +15595,11 @@ class Agent:
         self.hook_mgr = hook_mgr
         self.code_intel = code_intel
         self.output_collector = output_collector  # HeadlessOutputCollector for CI/CD
+        # Evolution engine for self-learning
+        try:
+            self._evolution = EvolutionEngine(config.config_dir)
+        except Exception:
+            self._evolution = None
         self._interrupted = threading.Event()
         self._tui_lock = threading.Lock()
         self._plan_mode = False
@@ -15621,26 +15945,63 @@ class Agent:
                            f"({pct}% ctx){C.RESET}")
                 self.session._just_compacted = False
 
-                # Handle empty response from local LLM (retry with backoff, max 3)
+                # Handle empty response from local LLM (smart retry cascade)
                 if not text and not tool_calls and iteration < self.max_iterations - 1:
                     _empty_retries += 1
-                    # If model produced thinking but no output, nudge it to respond
+                    # Step 0: Thinking-only nudge
                     if _had_thinking and _empty_retries <= 2:
                         self.session.add_user_message(
                             "[SYSTEM] Your thinking completed but you produced no visible output. "
                             "Please provide your response or call a tool now."
                         )
                         if self.config.debug:
-                            print(f"{C.DIM}[debug] Thinking-only response — nudging model to produce output{C.RESET}", file=sys.stderr)
+                            print(f"{C.DIM}[debug] Thinking-only response — nudging model{C.RESET}", file=sys.stderr)
                         continue
+                    # Step 1: Auto-compact if context is >70% full
+                    if _empty_retries == 1:
+                        _usage_pct = self.session.get_token_estimate() / max(self.config.context_window, 1)
+                        if _usage_pct > 0.70:
+                            _p(f"  {C.DIM}[auto-compact: context was {int(_usage_pct*100)}% full]{C.RESET}")
+                            self.session.compact_if_needed(force=True)
+                            continue
+                    # Step 2: Retry with slightly higher temperature
+                    if _empty_retries == 2:
+                        if not hasattr(self, '_orig_temperature'):
+                            self._orig_temperature = self.client.temperature
+                        self.client.temperature = min(self._orig_temperature + 0.3, 1.5)
+                        _p(f"  {C.DIM}[retry with temperature {self.client.temperature:.1f}]{C.RESET}")
+                        time.sleep(0.5)
+                        continue
+                    # Step 3: Sidecar model fallback
+                    if _empty_retries == 3 and self.config.sidecar_model and self.config.sidecar_model != self.config.model:
+                        if not hasattr(self, '_orig_model'):
+                            self._orig_model = self.config.model
+                        self.config.model = self.config.sidecar_model
+                        _p(f"  {C.DIM}[fallback to sidecar: {self.config.sidecar_model}]{C.RESET}")
+                        time.sleep(0.5)
+                        continue
+                    # Step 4: Give up with actionable suggestions
                     if _empty_retries > 3:
-                        _p(f"\n{C.YELLOW}AI から空のレスポンスが返されました（モデルが過負荷または非互換の可能性があります）。(The AI returned empty responses - the model may be overloaded or incompatible){C.RESET}")
-                        _p(f"{C.DIM}Try rephrasing, or switch models with: /model <name>{C.RESET}")
+                        # Restore original settings
+                        if hasattr(self, '_orig_temperature'):
+                            self.client.temperature = self._orig_temperature
+                        if hasattr(self, '_orig_model'):
+                            self.config.model = self._orig_model
+                        _p(f"\n{C.YELLOW}AI から空のレスポンスが返されました（4回リトライ後も失敗）{C.RESET}")
+                        _p(f"{C.DIM}対処法:{C.RESET}")
+                        _p(f"{C.DIM}  1. /compact — コンテキストを圧縮{C.RESET}")
+                        _p(f"{C.DIM}  2. /model <name> — 別モデルに切替{C.RESET}")
+                        _p(f"{C.DIM}  3. リクエストを簡潔に書き直す{C.RESET}")
                         break
-                    if self.config.debug:
-                        print(f"{C.DIM}[debug] Empty response (retry {_empty_retries}/3), backing off...{C.RESET}", file=sys.stderr)
-                    time.sleep(_empty_retries * 0.5)  # exponential-ish backoff
+                    time.sleep(_empty_retries * 0.5)
                     continue
+                # Restore temperature/model if they were modified during retries
+                if hasattr(self, '_orig_temperature'):
+                    self.client.temperature = self._orig_temperature
+                    del self._orig_temperature
+                if hasattr(self, '_orig_model'):
+                    self.config.model = self._orig_model
+                    del self._orig_model
 
                 # 3. Add to history
                 self.session.add_assistant_message(text, tool_calls if tool_calls else None)
@@ -15887,6 +16248,9 @@ class Agent:
                             self.tui.show_tool_result(tool_name, output, is_error=_is_err,
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
+                            # Evolution: record tool call outcome
+                            if self._evolution:
+                                self._evolution.record_tool_call(tool_name, not _is_err, _tool_dur)
                             # Headless output collector (sequential path)
                             if self.output_collector:
                                 self.output_collector.tool_call(tool_name, tool_params)
@@ -16908,29 +17272,7 @@ def main():
     registry.register(ParallelAgentTool(coordinator))
 
     # Initialize MCP servers
-    _mcp_clients = []
-    mcp_server_configs = _load_mcp_servers(config)
-    for srv_name, srv_config in mcp_server_configs.items():
-        try:
-            mcp = MCPClient(
-                name=srv_name,
-                command=srv_config["command"],
-                args=srv_config.get("args", []),
-                env=srv_config.get("env", {}),
-            )
-            mcp.start()
-            mcp.initialize()
-            tools = mcp.list_tools()
-            for tool_schema in tools:
-                mcp_tool = MCPTool(mcp, tool_schema)
-                registry.register(mcp_tool)
-                # MCP tools need permission checks
-                permissions.ASK_TOOLS.add(mcp_tool.name)
-            _mcp_clients.append(mcp)
-            if config.debug:
-                print(f"{C.DIM}[debug] MCP '{srv_name}': {len(tools)} tools registered{C.RESET}", file=sys.stderr)
-        except Exception as e:
-            print(f"{C.YELLOW}Warning: MCP server '{srv_name}' failed: {e}{C.RESET}", file=sys.stderr)
+    _mcp_clients = _init_mcp_clients(config, registry, permissions)
 
     # Initialize hooks system
     hook_mgr = HookManager(config)
@@ -17972,6 +18314,135 @@ def main():
                         continue
                     issue_num = int(issue_arg.split()[0])
                     _issue_to_pr(config, agent, session, tui, issue_num)
+                    continue
+
+                elif cmd == "/evolve":
+                    # Evolution engine stats and insights
+                    _evo = EvolutionEngine(config.config_dir)
+                    _evo_parts = user_input.split(None, 1)
+                    _evo_sub = _evo_parts[1].strip() if len(_evo_parts) > 1 else ""
+                    if _evo_sub == "reset":
+                        _evo.reset()
+                        print(f"  {C.GREEN}Evolution data cleared.{C.RESET}")
+                    elif _evo_sub == "insights":
+                        _insights = _evo._data.get("insights", [])
+                        if not _insights:
+                            print(f"  {C.DIM}No insights yet. Insights are generated every {_evo.INSIGHT_INTERVAL} sessions.{C.RESET}")
+                        else:
+                            print(f"\n  {C.CYAN}Learned Insights:{C.RESET}")
+                            for _ins in sorted(_insights, key=lambda x: x.get("confidence", 0), reverse=True):
+                                _conf = _ins.get("confidence", 0)
+                                _bar = "█" * int(_conf * 10) + "░" * (10 - int(_conf * 10))
+                                print(f"  {_bar} {_conf:.0%}  {_ins.get('text', '')}  {C.DIM}({_ins.get('created', '')}){C.RESET}")
+                        print()
+                    else:
+                        _d = _evo._data
+                        print(f"\n  {C.CYAN}Evolution Stats:{C.RESET}")
+                        print(f"  Sessions: {_d.get('total_sessions', 0)}  |  Tool calls: {_d.get('total_tool_calls', 0)}")
+                        _ts = _d.get("tool_stats", {})
+                        if _ts:
+                            print(f"\n  {'Tool':<18} {'OK':>6} {'Fail':>6} {'Avg':>8}")
+                            print(f"  {'─'*18} {'─'*6} {'─'*6} {'─'*8}")
+                            for _tn, _s in sorted(_ts.items(), key=lambda x: x[1].get("success", 0), reverse=True)[:8]:
+                                print(f"  {_tn:<18} {_s.get('success',0):>6} {_s.get('fail',0):>6} {_s.get('avg_time',0):>7.1f}s")
+                        _wp = _d.get("workflow_patterns", [])[:5]
+                        if _wp:
+                            print(f"\n  {C.CYAN}Common Patterns:{C.RESET}")
+                            for _p in _wp:
+                                print(f"  {' → '.join(_p.get('sequence',[]))} (x{_p.get('count',0)})")
+                        _ins = _d.get("insights", [])
+                        if _ins:
+                            print(f"\n  {C.CYAN}Active Insights:{C.RESET} {len(_ins)} (use /evolve insights for details)")
+                        print()
+                    continue
+
+                elif cmd == "/mcp":
+                    # MCP server management: /mcp [list|add|remove|reload]
+                    parts = user_input.split()
+                    sub = parts[1] if len(parts) > 1 else "list"
+                    if sub == "list":
+                        srv_configs = _load_mcp_servers(config)
+                        if not srv_configs:
+                            print(f"  {C.DIM}No MCP servers configured.{C.RESET}")
+                            print(f"  {C.DIM}Add one: /mcp add <name> <command> [args...]{C.RESET}")
+                        else:
+                            print(f"\n  {'Name':<20} {'Command':<25} {'Status'}")
+                            print(f"  {'─'*20} {'─'*25} {'─'*10}")
+                            for name, srv in srv_configs.items():
+                                cmd_str = srv.get("command", "?")
+                                args_str = " ".join(srv.get("args", []))[:30]
+                                alive = any(c.name == name and c._proc and c._proc.poll() is None for c in _mcp_clients)
+                                status = f"{C.GREEN}running{C.RESET}" if alive else f"{C.DIM}stopped{C.RESET}"
+                                print(f"  {name:<20} {cmd_str} {args_str:<20} {status}")
+                        print()
+                    elif sub == "add" and len(parts) >= 4:
+                        _is_project = "--project" in parts
+                        _add_parts = [p for p in parts[2:] if p != "--project"]
+                        _srv_name = _add_parts[0]
+                        _srv_cmd = _add_parts[1]
+                        _srv_args = _add_parts[2:] if len(_add_parts) > 2 else []
+                        if _is_project:
+                            _mcp_path = os.path.join(config.cwd, ".eve-cli", "mcp.json")
+                        else:
+                            _mcp_path = os.path.join(config.config_dir, "mcp.json")
+                        try:
+                            _existing = {}
+                            if os.path.isfile(_mcp_path):
+                                with open(_mcp_path, encoding="utf-8") as f:
+                                    _existing = json.load(f)
+                            _servers = _existing.setdefault("mcpServers", {})
+                            _servers[_srv_name] = {"command": _srv_cmd, "args": _srv_args}
+                            _save_mcp_config(_mcp_path, _existing)
+                            scope = "project" if _is_project else "global"
+                            print(f"  {C.GREEN}Added MCP server '{_srv_name}' ({scope}). Use /mcp reload to activate.{C.RESET}")
+                        except Exception as e:
+                            print(f"  {C.RED}Error saving MCP config: {e}{C.RESET}")
+                    elif sub == "remove" and len(parts) >= 3:
+                        _srv_name = parts[2]
+                        _removed = False
+                        for _mcp_path in [os.path.join(config.config_dir, "mcp.json"),
+                                          os.path.join(config.cwd, ".eve-cli", "mcp.json")]:
+                            if not os.path.isfile(_mcp_path):
+                                continue
+                            try:
+                                with open(_mcp_path, encoding="utf-8") as f:
+                                    _existing = json.load(f)
+                                if _srv_name in _existing.get("mcpServers", {}):
+                                    del _existing["mcpServers"][_srv_name]
+                                    _save_mcp_config(_mcp_path, _existing)
+                                    _removed = True
+                                    break
+                            except Exception:
+                                pass
+                        # Stop running client
+                        for c in _mcp_clients:
+                            if c.name == _srv_name and c._proc:
+                                try:
+                                    c._proc.terminate()
+                                except Exception:
+                                    pass
+                        if _removed:
+                            print(f"  {C.GREEN}Removed MCP server '{_srv_name}'. Use /mcp reload to apply.{C.RESET}")
+                        else:
+                            print(f"  {C.YELLOW}MCP server '{_srv_name}' not found in config.{C.RESET}")
+                    elif sub == "reload":
+                        # Stop all existing clients
+                        for c in _mcp_clients:
+                            if c._proc:
+                                try:
+                                    c._proc.terminate()
+                                except Exception:
+                                    pass
+                        _mcp_clients.clear()
+                        # Re-initialize
+                        _mcp_clients.extend(_init_mcp_clients(config, registry, permissions))
+                        print(f"  {C.GREEN}MCP servers reloaded: {len(_mcp_clients)} active.{C.RESET}")
+                    else:
+                        print(f"  {C.CYAN}/mcp{C.RESET}                List configured MCP servers")
+                        print(f"  {C.CYAN}/mcp add{C.RESET} <name> <cmd> [args...]  Add MCP server")
+                        print(f"  {C.CYAN}/mcp add --project{C.RESET} <name> <cmd>  Add to project config")
+                        print(f"  {C.CYAN}/mcp remove{C.RESET} <name>  Remove MCP server")
+                        print(f"  {C.CYAN}/mcp reload{C.RESET}        Restart all MCP servers")
                     continue
 
                 elif cmd == "/gh":
@@ -19386,6 +19857,18 @@ Review this code for:
         _active_scroll_region = None
     # Save on exit
     session.save()
+    # Evolution: record session end and optionally generate insights
+    try:
+        _evo = EvolutionEngine(config.config_dir)
+        if hasattr(agent, '_evolution') and agent._evolution:
+            _evo = agent._evolution
+        _evo.record_session_end()
+        if _evo.should_generate_insights() and client:
+            _sidecar = config.sidecar_model or config.model
+            if _sidecar:
+                _evo.generate_insights(client, _sidecar)
+    except Exception:
+        pass
     # Save readline history on exit (moved from per-input to exit-only)
     if HAS_READLINE:
         try:
