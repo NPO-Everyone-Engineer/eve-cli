@@ -271,7 +271,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.23.1"
+__version__ = "2.24.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -16858,6 +16858,28 @@ def _build_footer_status(config, pct, plan_mode=False):
             f"\033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m")
 
 
+def _merge_claude_md(existing, generated):
+    """Merge generated CLAUDE.md into existing, preserving user content.
+
+    Appends only sections (## headings) from *generated* that do not already
+    appear in *existing*.  User-written content is never removed or reordered.
+    """
+    import re as _re
+    _heading_re = _re.compile(r'^##\s+(.+)$', _re.MULTILINE)
+    existing_headings = {m.group(1).strip().lower() for m in _heading_re.finditer(existing)}
+    # Split generated into sections (## ...)
+    gen_sections = _re.split(r'(?=^## )', generated, flags=_re.MULTILINE)
+    appended = []
+    for section in gen_sections:
+        m = _heading_re.match(section)
+        if m and m.group(1).strip().lower() not in existing_headings:
+            appended.append(section.rstrip())
+    if not appended:
+        return existing
+    merged = existing.rstrip() + "\n\n" + "\n\n".join(appended) + "\n"
+    return merged
+
+
 def _generate_project_claude_md(cwd):
     """Analyze codebase and generate a useful CLAUDE.md template."""
     proj_name = os.path.basename(cwd)
@@ -17018,6 +17040,26 @@ def _generate_project_claude_md(cwd):
     lines.append("- Follow existing code style and conventions")
     lines.append("- Write tests for new features")
     lines.append("- Use absolute paths for file operations")
+    lines.append("")
+    lines.append("## Design Quality Rules")
+    lines.append("")
+    lines.append("### Before Writing Code")
+    lines.append("- ALWAYS read the target file and related files (callers, tests) BEFORE editing")
+    lines.append("- Identify existing patterns, naming conventions, and error handling style")
+    lines.append("- For tasks touching 2+ files: state your plan before implementing")
+    lines.append("")
+    lines.append("### Implementation Standards")
+    lines.append("- One function = one responsibility. Keep functions under 30 lines")
+    lines.append("- Use clear, descriptive names: `validate_user_input()` not `proc(d)`")
+    lines.append("- Do NOT write more than 50 lines at once. Build incrementally:")
+    lines.append("  skeleton → flesh out → edge cases, verifying at each step")
+    lines.append("- Before implementing, list 3+ edge cases that could break the code")
+    lines.append("  (empty input, None, boundary values, Unicode, large data)")
+    lines.append("")
+    lines.append("### After Writing Code")
+    lines.append("- Run syntax check / linter before reporting completion")
+    lines.append("- Run tests if available; write tests for new features")
+    lines.append("- Re-read modified files to confirm correctness")
     lines.append("")
     return "\n".join(lines)
 
@@ -18937,17 +18979,38 @@ def main():
                     _root_claude = os.path.join(_init_cwd, "CLAUDE.md")
                     _eve_dir = os.path.join(_init_cwd, ".eve-cli")
                     _eve_claude = os.path.join(_eve_dir, "CLAUDE.md")
-                    # Check both locations
+                    # Determine target and existing content
+                    _existing_path = None
+                    _existing_content = ""
                     if os.path.exists(_root_claude):
-                        print(f"{C.YELLOW}CLAUDE.md already exists: {_root_claude}{C.RESET}")
+                        _existing_path = _root_claude
                     elif os.path.exists(_eve_claude):
-                        print(f"{C.YELLOW}CLAUDE.md already exists: {_eve_claude}{C.RESET}")
+                        _existing_path = _eve_claude
+                    if _existing_path:
+                        try:
+                            with open(_existing_path, encoding="utf-8", errors="replace") as f:
+                                _existing_content = f.read()
+                        except Exception:
+                            pass
+                    _new_content = _generate_project_claude_md(_init_cwd)
+                    if _existing_content:
+                        # Merge: keep existing content, append missing sections
+                        _merged = _merge_claude_md(_existing_content, _new_content)
+                        if _merged == _existing_content:
+                            print(f"{C.GREEN}CLAUDE.md is up to date: {_existing_path}{C.RESET}")
+                        else:
+                            try:
+                                with open(_existing_path, "w", encoding="utf-8") as f:
+                                    f.write(_merged)
+                                print(f"{C.GREEN}Updated {_existing_path}{C.RESET}")
+                                print(f"{C.DIM}Existing content preserved. Missing sections added.{C.RESET}")
+                            except Exception as e:
+                                print(f"{C.RED}Failed to update CLAUDE.md: {e}{C.RESET}")
                     else:
-                        content = _generate_project_claude_md(_init_cwd)
                         try:
                             os.makedirs(_eve_dir, exist_ok=True)
                             with open(_eve_claude, "w", encoding="utf-8") as f:
-                                f.write(content)
+                                f.write(_new_content)
                             print(f"{C.GREEN}Created {_eve_claude}{C.RESET}")
                             print(f"{C.DIM}Detected project info has been included.{C.RESET}")
                             print(f"{C.DIM}Edit this file to customize AI behavior for your project.{C.RESET}")
