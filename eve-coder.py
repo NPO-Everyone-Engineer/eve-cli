@@ -271,7 +271,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.23.0"
+__version__ = "2.23.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -3057,6 +3057,13 @@ If asked what model you are, answer truthfully: "{model_name}" running locally/v
 You EXECUTE tasks using tools and explain results clearly.
 IMPORTANT: Never output <think> or </think> tags in your responses. Use the function calling API exclusively — do not emit <tool_call> XML blocks.
 
+CRITICAL — DESIGN QUALITY:
+- ALWAYS read existing code BEFORE writing new code. Understand the project's patterns first.
+- Write functions that are small (≤30 lines), single-purpose, and clearly named.
+- Do NOT write more than 50 lines at once. Build incrementally: skeleton → flesh out → edge cases.
+- Before implementing, list 3+ edge cases that could break. Handle them explicitly.
+- Match existing code style exactly — naming, indentation, error handling patterns.
+
 CORE RULES:
 1. TOOL FIRST. Call a tool immediately — no explanation before the tool call.
 2. After tool result: give a clear, concise summary (2-3 sentences). No bullet points or numbered lists.
@@ -4002,9 +4009,9 @@ class OllamaClient:
 
         # Qwen3.5 / tier S-A optimized sampling
         if _tier in ("S", "A"):
-            merged["top_p"] = 0.85
-            merged["top_k"] = 40
-            merged["repeat_penalty"] = 1.05
+            merged["top_p"] = 0.8
+            merged["top_k"] = 30
+            merged["repeat_penalty"] = 1.1
         elif _tier == "B":
             merged["top_p"] = 0.9
 
@@ -4041,7 +4048,7 @@ class OllamaClient:
             # for other models lower to 0.3 to improve JSON reliability.
             _tier, _ = Config.get_model_tier(model)
             if _tier in ("S", "A") and self.think_mode is not False:
-                temp = min(self.temperature, 0.6)
+                temp = min(self.temperature, 0.4)
             else:
                 temp = min(self.temperature, 0.3)
             # Auto-detect streaming with tools (Ollama 0.5+ supports this)
