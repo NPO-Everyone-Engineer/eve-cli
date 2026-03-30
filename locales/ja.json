@@ -68,7 +68,13 @@
     "hook_blocked": "警告：フックがブロックされました（{error}）",
     "project_hooks_changed": "警告：プロジェクトフックファイルが信頼付与後に変更されました。",
     "repo_hooks_arbitrary": "警告：リポジトリフックは任意のコマンドを実行できます",
+    "project_hooks_found": "プロジェクトフックの信頼確認が必要です",
     "trusted_repo_changed": "警告：信頼されたリポジトリのコンテンツ（スコープ：'{scope}'）が変更されました。",
+    "project_instructions_trust_required": "プロジェクト指示ファイルの信頼確認が必要です",
+    "repo_instruction_injected": "リポジトリの指示ファイルはエージェントのプロンプトに注入されます。信頼できるリポジトリだけを許可してください。",
+    "project_skills_trust_required": "プロジェクトスキルの信頼確認が必要です",
+    "project_skills_injected": "プロジェクトスキルはエージェントのプロンプトに注入され、ツール利用に影響します。",
+    "repo_trust_unreadable": "[読み取れません]",
     "trusted_mcp_changed": "警告：信頼された MCP 設定または参照アセットが変更されました。",
     "mcp_json_load_failed": "警告：mcp.json を読み込めませんでした：{error}",
     "mcp_server_blocked": "警告：MCP サーバー '{name}' がブロックされました — コマンド '{cmd}' が allowlist にありません",
@@ -89,14 +95,21 @@
     "undo_successful": "元に戻しました",
     "file_written": "ファイルを書き込みました：{path}",
     "file_deleted": "ファイルを削除しました：{path}",
-    "command_executed": "コマンドを実行しました：{command}"
+    "command_executed": "コマンドを実行しました：{command}",
+    "repo_content_trusted": "リポジトリ内容を信頼しました（スコープ：{scope}）。",
+    "project_hooks_trusted": "プロジェクトフックを信頼しました。"
   },
   "prompts": {
     "confirm_write": "ファイル '{path}' に書き込みますか？",
     "confirm_command": "コマンド '{command}' を実行しますか？",
     "confirm_delete": "ファイル '{path}' を削除しますか？",
     "select_model": "使用するモデルを選択してください:",
-    "enter_message": "メッセージを入力してください（終了：/quit）:"
+    "enter_message": "メッセージを入力してください（終了：/quit）:",
+    "repo_trust_scope": "スコープ",
+    "repo_trust_repo": "リポジトリ",
+    "repo_trust_files": "ファイル",
+    "repo_trust_preview": "プレビュー",
+    "repo_trust_choices": "[y] 信頼する  [n] スキップ（デフォルト）"
   },
   "help": {
     "description": "EvE CLI — Everyone.Engineer コーディングエージェント（Ollama ローカル + クラウド）",

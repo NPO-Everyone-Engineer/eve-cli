@@ -3410,8 +3410,11 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
         should_load_project_instructions = _ensure_repo_scope_trusted(
             config,
             "instructions",
-            "Project Instructions Trust Required",
-            "Repo instruction files are injected into the agent prompt. Trust only repositories you control.",
+            t("warnings.project_instructions_trust_required", "Project Instructions Trust Required"),
+            t(
+                "warnings.repo_instruction_injected",
+                "Repo instruction files are injected into the agent prompt. Trust only repositories you control.",
+            ),
             project_instruction_paths,
             preview_paths=project_instruction_paths,
         )
@@ -9020,25 +9023,25 @@ def _prompt_repo_trust(config, scope, title, warning, hashes, preview_paths=None
 
     preview_paths = preview_paths or []
     print(f"\n{C.YELLOW}╭─ {title} ─{C.RESET}")
-    print(f"{C.YELLOW}│{C.RESET} Scope: {scope}")
-    print(f"{C.YELLOW}│{C.RESET} Repo: {_repo_key(config)}")
-    print(f"{C.YELLOW}│{C.RESET} Files:")
+    print(f"{C.YELLOW}│{C.RESET} {t('prompts.repo_trust_scope', 'Scope')}: {scope}")
+    print(f"{C.YELLOW}│{C.RESET} {t('prompts.repo_trust_repo', 'Repo')}: {_repo_key(config)}")
+    print(f"{C.YELLOW}│{C.RESET} {t('prompts.repo_trust_files', 'Files')}:")
     for rel in hashes.keys():
         print(f"{C.YELLOW}│{C.RESET}   {C.WHITE}{rel}{C.RESET}")
     if preview_paths:
         print(f"{C.YELLOW}│{C.RESET}")
         for fpath in preview_paths[:2]:
             rel = _repo_relpath(config, fpath)
-            print(f"{C.YELLOW}│{C.RESET} Preview: {C.WHITE}{rel}{C.RESET}")
+            print(f"{C.YELLOW}│{C.RESET} {t('prompts.repo_trust_preview', 'Preview')}: {C.WHITE}{rel}{C.RESET}")
             try:
                 with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                     for line in f.read(600).splitlines()[:6]:
                         print(f"{C.YELLOW}│{C.RESET} {C.DIM}{line}{C.RESET}")
             except OSError:
-                print(f"{C.YELLOW}│{C.RESET} {C.DIM}[unreadable]{C.RESET}")
+                print(f"{C.YELLOW}│{C.RESET} {C.DIM}{t('warnings.repo_trust_unreadable', '[unreadable]')}{C.RESET}")
     print(f"{C.YELLOW}│{C.RESET}")
     print(f"{C.YELLOW}│{C.RESET} {_ansi(chr(27)+'[38;5;196m')}{warning}{C.RESET}")
-    print(f"{C.YELLOW}│{C.RESET}  [y] Trust  [n] Skip (default)")
+    print(f"{C.YELLOW}│{C.RESET}  {t('prompts.repo_trust_choices', '[y] Trust  [n] Skip (default)')}")
     print(f"{C.YELLOW}╰──────────────────────────────────────────{C.RESET}")
     try:
         ans = input(f"  {C.YELLOW}? {C.RESET}").strip().lower()
@@ -9046,7 +9049,7 @@ def _prompt_repo_trust(config, scope, title, warning, hashes, preview_paths=None
         ans = ""
     if ans in ("y", "yes"):
         _remember_repo_scope_trust(config, scope, hashes)
-        print(f"{C.GREEN}Repo content trusted for scope: {scope}.{C.RESET}")
+        print(f"{C.GREEN}{t('info.repo_content_trusted', 'Repo content trusted for scope: {scope}.', scope=scope)}{C.RESET}")
         return True
     return False
 
@@ -9689,8 +9692,11 @@ def _load_skills(config):
         load_project_skills = _ensure_repo_scope_trusted(
             config,
             "skills",
-            "Project Skills Trust Required",
-            "Project skills are injected into the agent prompt and can influence tool usage.",
+            t("warnings.project_skills_trust_required", "Project Skills Trust Required"),
+            t(
+                "warnings.project_skills_injected",
+                "Project skills are injected into the agent prompt and can influence tool usage.",
+            ),
             project_skill_paths,
             preview_paths=project_skill_paths,
         )
@@ -12591,14 +12597,14 @@ class HookManager:
         try:
             with open(hooks_path, encoding="utf-8") as f:
                 content = f.read(2000)
-            print(f"\n{C.YELLOW}╭─ Project Hooks Found ───────────────────{C.RESET}")
+            print(f"\n{C.YELLOW}╭─ {t('warnings.project_hooks_found', 'Project Hooks Found')} ───────────────────{C.RESET}")
             print(f"{C.YELLOW}│{C.RESET} {C.WHITE}.eve-cli/hooks.json{C.RESET}")
             print(f"{C.YELLOW}│{C.RESET}")
             for line in content.split("\n")[:10]:
                 print(f"{C.YELLOW}│{C.RESET} {C.DIM}{line}{C.RESET}")
             print(f"{C.YELLOW}│{C.RESET}")
             print(f"{C.YELLOW}│{C.RESET} {_ansi(chr(27)+'[38;5;196m')}{t('warnings.repo_hooks_arbitrary', default='Warning: repo hooks can run arbitrary commands')}{C.RESET}")
-            print(f"{C.YELLOW}│{C.RESET}  [y] Trust  [n] Skip (default)")
+            print(f"{C.YELLOW}│{C.RESET}  {t('prompts.repo_trust_choices', '[y] Trust  [n] Skip (default)')}")
             print(f"{C.YELLOW}╰──────────────────────────────────────────{C.RESET}")
             ans = input(f"  {C.YELLOW}? {C.RESET}").strip().lower()
             if ans in ("y", "yes"):
@@ -12613,7 +12619,7 @@ class HookManager:
                 }
                 self._save_trusted_hooks(trusted)
                 self._load_hooks_file(hooks_path, is_project=True)
-                print(f"{C.GREEN}Project hooks trusted.{C.RESET}")
+                print(f"{C.GREEN}{t('info.project_hooks_trusted', 'Project hooks trusted.')}{C.RESET}")
         except (OSError, EOFError, KeyboardInterrupt):
             pass
 
