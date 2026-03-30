@@ -47,7 +47,7 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertAlmostEqual(self.cfg.temperature, 0.7)
 
     def test_default_context_window(self):
-        self.assertEqual(self.cfg.context_window, 32768)
+        self.assertEqual(self.cfg.context_window, 65536)
 
     def test_default_max_agent_steps(self):
         self.assertEqual(self.cfg.max_agent_steps, 100)
@@ -107,7 +107,7 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(Config.DEFAULT_OLLAMA_HOST, "http://localhost:11434")
         self.assertEqual(Config.DEFAULT_MAX_TOKENS, 8192)
         self.assertAlmostEqual(Config.DEFAULT_TEMPERATURE, 0.7)
-        self.assertEqual(Config.DEFAULT_CONTEXT_WINDOW, 32768)
+        self.assertEqual(Config.DEFAULT_CONTEXT_WINDOW, 65536)
         self.assertEqual(Config.DEFAULT_MAX_AGENT_STEPS, 100)
         self.assertEqual(Config.HARD_MAX_AGENT_STEPS, 200)
 
@@ -215,6 +215,14 @@ class TestParseConfigFile(unittest.TestCase):
         try:
             self.cfg._parse_config_file(path)
             self.assertEqual(self.cfg.ollama_host, "http://192.168.1.100:11434")
+        finally:
+            os.unlink(path)
+
+    def test_ollama_api_key(self):
+        path = self._write_config("OLLAMA_API_KEY = secret-token\n")
+        try:
+            self.cfg._parse_config_file(path)
+            self.assertEqual(self.cfg.ollama_api_key, "secret-token")
         finally:
             os.unlink(path)
 
@@ -455,6 +463,7 @@ class TestLoadEnv(unittest.TestCase):
         """Return a dict of env vars to remove for clean testing."""
         keys = [
             "OLLAMA_HOST", "EVE_CODER_MODEL", "EVE_CLI_MODEL",
+            "OLLAMA_API_KEY", "EVE_CLI_OLLAMA_API_KEY",
             "EVE_CODER_SIDECAR", "EVE_CLI_SIDECAR_MODEL",
             "EVE_CODER_MAX_AGENT_STEPS", "EVE_CLI_MAX_AGENT_STEPS",
             "EVE_CLI_PROFILE", "EVE_CODER_DEBUG", "EVE_CLI_DEBUG",
@@ -484,6 +493,18 @@ class TestLoadEnv(unittest.TestCase):
         with patch.dict(os.environ, env):
             self.cfg._load_env()
         self.assertEqual(self.cfg.model, "legacy-model")
+
+    def test_ollama_api_key_from_env(self):
+        env = self._make_env(OLLAMA_API_KEY="env-secret")
+        with patch.dict(os.environ, env):
+            self.cfg._load_env()
+        self.assertEqual(self.cfg.ollama_api_key, "env-secret")
+
+    def test_eve_cli_ollama_api_key_overrides_env(self):
+        env = self._make_env(OLLAMA_API_KEY="env-secret", EVE_CLI_OLLAMA_API_KEY="cli-secret")
+        with patch.dict(os.environ, env):
+            self.cfg._load_env()
+        self.assertEqual(self.cfg.ollama_api_key, "cli-secret")
 
     def test_eve_cli_model_overrides_legacy(self):
         env = self._make_env(EVE_CODER_MODEL="legacy-model", EVE_CLI_MODEL="new-model")
@@ -741,6 +762,53 @@ class TestLoadCliArgs(unittest.TestCase):
         self.assertEqual(self.cfg.ui_theme, "dandy")
         self.assertTrue(self.cfg.loop_mode)
         self.assertEqual(self.cfg.max_loop_iterations, 3)
+
+
+class TestOllamaHostValidation(unittest.TestCase):
+    def setUp(self):
+        self.cfg = Config()
+
+    def test_allows_localhost(self):
+        self.cfg.ollama_host = "http://localhost:11434"
+        self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.ollama_host, "http://localhost:11434")
+        self.assertTrue(self.cfg.uses_local_ollama())
+
+    def test_allows_ollama_cloud_and_strips_api_path(self):
+        self.cfg.ollama_host = "https://ollama.com/api"
+        self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.ollama_host, "https://ollama.com")
+        self.assertFalse(self.cfg.uses_local_ollama())
+
+    def test_allows_ollama_cloud_and_strips_v1_path(self):
+        self.cfg.ollama_host = "https://ollama.com/v1"
+        self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.ollama_host, "https://ollama.com")
+
+    def test_rejects_untrusted_remote_host(self):
+        self.cfg.ollama_host = "https://evil.example/api"
+        with patch("builtins.print"):
+            self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.ollama_host, Config.DEFAULT_OLLAMA_HOST)
+
+
+class TestOllamaClientHeaders(unittest.TestCase):
+    def test_check_connection_sends_auth_header(self):
+        cfg = Config()
+        cfg.ollama_host = "https://ollama.com"
+        cfg.ollama_api_key = "secret-token"
+        client = eve_coder.OllamaClient(cfg)
+
+        fake_resp = MagicMock()
+        fake_resp.read.return_value = b'{"models":[]}'
+
+        with patch("urllib.request.urlopen", return_value=fake_resp) as mock_urlopen:
+            ok, models = client.check_connection(retries=1)
+
+        self.assertTrue(ok)
+        self.assertEqual(models, [])
+        req = mock_urlopen.call_args[0][0]
+        self.assertEqual(req.get_header("Authorization"), "Bearer secret-token")
 
 
 class TestFullWidthSpaceHandling(unittest.TestCase):

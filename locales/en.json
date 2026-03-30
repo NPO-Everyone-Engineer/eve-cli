@@ -42,7 +42,7 @@
     "unknown_error": "Unknown error: {error}"
   },
   "warnings": {
-    "ollama_host_not_localhost": "Warning: OLLAMA_HOST '{hostname}' is not localhost. Resetting to localhost for security.",
+    "ollama_host_not_localhost": "Warning: OLLAMA_HOST '{hostname}' is not an allowed Ollama host. Resetting to localhost for security.",
     "file_read_failed": "Warning: Failed to read {fname}: {error}",
     "session_path_escape": "Warning: Session path escapes session directory — refusing write.",
     "hook_command_blocked": "Warning: Hook command '{base_cmd}' blocked (not in allowlist).",
@@ -168,6 +168,7 @@
     "description": "EvE CLI — Everyone.Engineer coding agent (Ollama Local + Cloud)",
     "prompt": "One-shot prompt (non-interactive)",
     "model": "Ollama model name",
+    "ollama_host": "Ollama host URL (for example: http://localhost:11434, https://ollama.com/api)",
     "max_agent_steps": "Max AI internal steps per request (default: {default}, max: {max})",
     "loop": "Loop mode: re-run prompt until --done-string appears",
     "rag": "RAG (Retrieval-Augmented Generation) mode",

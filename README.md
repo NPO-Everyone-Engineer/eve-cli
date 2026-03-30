@@ -171,12 +171,24 @@ eve-cli --model qwen3:8b
 MODEL=qwen3:8b
 SIDECAR_MODEL=qwen3:4b
 OLLAMA_HOST=http://localhost:11434
+CONTEXT_WINDOW=65536
 PROFILE=auto
 UI_THEME=normal
 ```
 
 `--model` のようなコマンドラインオプションは、その回の起動だけ上書きします。  
 長く使う設定は `config` に入れておくのがおすすめです。
+
+Ollama Cloud を使う場合は、`OLLAMA_HOST` を `https://ollama.com/api` にし、API キーを環境変数で渡します。
+
+```bash
+export OLLAMA_API_KEY=your-ollama-api-key
+eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
+```
+
+補足:
+- `eve-cli` は Ollama の native API を使うため、`OLLAMA_HOST` に `https://ollama.com` と `https://ollama.com/api` のどちらを入れても動くように正規化されます。
+- 最近の Ollama docs では `ollama launch pi --model ...` のような統合エージェント導線がありますが、`eve-cli` は引き続き Ollama API に直接つなぐ構成です。
 
 高度な設定項目は [高度な機能](docs/advanced.md) にまとめています。
 

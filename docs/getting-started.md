@@ -22,7 +22,7 @@ python3 --version
 
 ### Ollama とは？
 
-Ollama は、AI モデルをあなたの PC 上で動かすためのソフトウェアです。EvE CLI は Ollama を通じて AI を利用します。
+Ollama は、ローカルモデルとクラウドモデルの両方を扱える AI 実行基盤です。EvE CLI は Ollama の API を通じて AI を利用します。
 
 - 公式サイト: [ollama.com](https://ollama.com/)
 - 無料で使えます
@@ -56,10 +56,17 @@ chmod +x eve-coder.py eve-cli.sh
 ln -s $(pwd)/eve-cli.sh /usr/local/bin/eve-cli
 ```
 
-手動の場合は、別途 [Ollama のインストール](https://ollama.com/) と AI モデルのダウンロードが必要です：
+手動の場合は、別途 [Ollama のインストール](https://ollama.com/) が必要です。ローカルモデルを使うなら AI モデルのダウンロードも行ってください：
 
 ```bash
 ollama pull qwen3.5:9b
+```
+
+Ollama Cloud を使う場合は、ローカルにモデルを pull しなくても構いません。API キーを設定して `OLLAMA_HOST` を切り替えます：
+
+```bash
+export OLLAMA_API_KEY=your-ollama-api-key
+eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
 ```
 
 ---
@@ -154,6 +161,8 @@ eve-cli --model qwen3.5:14b
 メモリの確認方法：
 - **Mac**: 左上の Apple メニュー → 「この Mac について」
 - **Linux**: `free -h` コマンド
+
+コーディング用途では、`CONTEXT_WINDOW=65536` 以上を推奨します。EvE CLI の既定値も 64K に合わせています。
 
 ---
 

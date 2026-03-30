@@ -271,7 +271,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.24.0"
+__version__ = "2.25.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1109,12 +1109,15 @@ class Config:
     DEFAULT_SIDECAR = ""
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
-    DEFAULT_CONTEXT_WINDOW = 32768
+    DEFAULT_CONTEXT_WINDOW = 65536
     DEFAULT_MAX_AGENT_STEPS = 100
     HARD_MAX_AGENT_STEPS = 200
+    _LOCAL_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+    _CLOUD_OLLAMA_HOSTS = {"ollama.com", "www.ollama.com"}
 
     def __init__(self):
         self.ollama_host = self.DEFAULT_OLLAMA_HOST
+        self.ollama_api_key = ""
         self.model = self.DEFAULT_MODEL
         self.sidecar_model = self.DEFAULT_SIDECAR
         self.max_tokens = self.DEFAULT_MAX_TOKENS
@@ -1294,6 +1297,8 @@ class Config:
                         self._cli_sidecar_set = True
                     elif key == "OLLAMA_HOST" and val:
                         self.ollama_host = val
+                    elif key == "OLLAMA_API_KEY" and val:
+                        self.ollama_api_key = val
                     elif key == "PROFILE" and val:
                         self.profile = val
                     elif key == "MAX_TOKENS" and val:
@@ -1335,6 +1340,10 @@ class Config:
     def _load_env(self):
         if os.environ.get("OLLAMA_HOST"):
             self.ollama_host = os.environ["OLLAMA_HOST"]
+        if os.environ.get("OLLAMA_API_KEY"):
+            self.ollama_api_key = os.environ["OLLAMA_API_KEY"]
+        if os.environ.get("EVE_CLI_OLLAMA_API_KEY"):
+            self.ollama_api_key = os.environ["EVE_CLI_OLLAMA_API_KEY"]
         # EVE_CODER_* are legacy env vars; EVE_CLI_* take precedence (loaded second)
         if os.environ.get("EVE_CODER_MODEL"):
             self.model = os.environ["EVE_CODER_MODEL"]
@@ -1786,6 +1795,8 @@ class Config:
             self._cli_sidecar_set = True
         if prof.get("OLLAMA_HOST") and not self._cli_ollama_host_set:
             self.ollama_host = prof["OLLAMA_HOST"]
+        if prof.get("OLLAMA_API_KEY"):
+            self.ollama_api_key = prof["OLLAMA_API_KEY"]
         if prof.get("MAX_TOKENS") and not self._cli_max_tokens_set:
             try:
                 self.max_tokens = int(prof["MAX_TOKENS"])
@@ -1925,20 +1936,38 @@ class Config:
                 return tier, min_ram
         return None, None
 
-    def _validate_ollama_host(self):
+    @classmethod
+    def _is_allowed_ollama_host(cls, hostname):
+        host = (hostname or "").lower()
+        return host in cls._LOCAL_OLLAMA_HOSTS or host in cls._CLOUD_OLLAMA_HOSTS
+
+    @classmethod
+    def _is_local_ollama_host(cls, hostname):
+        return (hostname or "").lower() in cls._LOCAL_OLLAMA_HOSTS
+
+    def uses_local_ollama(self):
         parsed = urllib.parse.urlparse(self.ollama_host)
-        hostname = parsed.hostname or ""
-        allowed = {"localhost", "127.0.0.1", "::1", "[::1]"}
-        if hostname not in allowed:
-            msg = t('warnings.ollama_host_not_localhost', default=f"Warning: OLLAMA_HOST '{hostname}' is not localhost. Resetting to localhost for security.")
+        return self._is_local_ollama_host(parsed.hostname or "")
+
+    def _validate_ollama_host(self):
+        raw_host = (self.ollama_host or "").strip()
+        if "://" not in raw_host:
+            raw_host = "http://" + raw_host
+        parsed = urllib.parse.urlparse(raw_host)
+        hostname = (parsed.hostname or "").lower()
+        if not self._is_allowed_ollama_host(hostname):
+            msg = t('warnings.ollama_host_not_localhost', default=f"Warning: OLLAMA_HOST '{hostname}' is not an allowed Ollama host. Resetting to localhost for security.")
             print(f"{C.YELLOW}{msg}{C.RESET}", file=sys.stderr)
-            self.ollama_host = self.DEFAULT_OLLAMA_HOST
+            parsed = urllib.parse.urlparse(self.DEFAULT_OLLAMA_HOST)
+            hostname = parsed.hostname or ""
         # Strip credentials from URL to prevent leaking in banner/errors
-        if parsed.username or parsed.password:
-            clean = f"{parsed.scheme}://{parsed.hostname}"
-            if parsed.port:
-                clean += f":{parsed.port}"
-            self.ollama_host = clean
+        scheme = parsed.scheme or ("https" if hostname in self._CLOUD_OLLAMA_HOSTS else "http")
+        if hostname in self._CLOUD_OLLAMA_HOSTS:
+            scheme = "https"
+        clean = f"{scheme}://{parsed.hostname}"
+        if parsed.port:
+            clean += f":{parsed.port}"
+        self.ollama_host = clean
         self.ollama_host = self.ollama_host.rstrip("/")
         # Validate numeric settings with reasonable bounds
         if self.context_window <= 0 or self.context_window > 1_048_576:
@@ -3655,6 +3684,7 @@ class OllamaClient:
 
     def __init__(self, config):
         self.base_url = config.ollama_host
+        self.api_key = getattr(config, "ollama_api_key", "")
         self.max_tokens = config.max_tokens
         self.temperature = config.temperature
         self.context_window = config.context_window
@@ -3665,12 +3695,26 @@ class OllamaClient:
         self._supports_tool_streaming = None  # None=untested, True/False=detected
         self._response_cache = ResponseCache()
 
+    def _api_url(self, path):
+        return f"{self.base_url}{path}"
+
+    def _headers(self, *, json_body=False, extra=None):
+        headers = {}
+        if json_body:
+            headers["Content-Type"] = "application/json"
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        if extra:
+            headers.update(extra)
+        return headers
+
     def check_connection(self, retries=3):
         """Check if Ollama is reachable. Returns (ok, model_list)."""
-        url = f"{self.base_url}/api/tags"
+        url = self._api_url("/api/tags")
         for attempt in range(retries):
             try:
-                resp = urllib.request.urlopen(url, timeout=5)
+                req = urllib.request.Request(url, headers=self._headers())
+                resp = urllib.request.urlopen(req, timeout=5)
                 try:
                     data = json.loads(resp.read(10 * 1024 * 1024))  # 10MB cap
                 finally:
@@ -3689,8 +3733,9 @@ class OllamaClient:
         if self._supports_tool_streaming is not None:
             return self._supports_tool_streaming
         try:
-            url = f"{self.base_url}/api/version"
-            resp = urllib.request.urlopen(url, timeout=5)
+            url = self._api_url("/api/version")
+            req = urllib.request.Request(url, headers=self._headers())
+            resp = urllib.request.urlopen(req, timeout=5)
             try:
                 data = json.loads(resp.read(4096))
             finally:
@@ -3719,9 +3764,9 @@ class OllamaClient:
         try:
             body = json.dumps({"name": model}).encode("utf-8")
             req = urllib.request.Request(
-                f"{self.base_url}/api/show",
+                self._api_url("/api/show"),
                 data=body,
-                headers={"Content-Type": "application/json"},
+                headers=self._headers(json_body=True),
                 method="POST",
             )
             resp = urllib.request.urlopen(req, timeout=10)
@@ -3771,11 +3816,11 @@ class OllamaClient:
 
         Returns True on success, False on failure.
         """
-        url = f"{self.base_url}/api/pull"
+        url = self._api_url("/api/pull")
         body = json.dumps({"name": model_name}).encode("utf-8")
         req = urllib.request.Request(
             url, data=body,
-            headers={"Content-Type": "application/json"},
+            headers=self._headers(json_body=True),
             method="POST",
         )
         try:
@@ -4094,9 +4139,9 @@ class OllamaClient:
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            f"{self.base_url}/api/chat",
+            self._api_url("/api/chat"),
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers=self._headers(json_body=True),
             method="POST",
         )
 
@@ -4235,9 +4280,9 @@ class OllamaClient:
         try:
             body = json.dumps({"model": model, "text": text}).encode("utf-8")
             req = urllib.request.Request(
-                f"{self.base_url}/api/tokenize",
+                self._api_url("/api/tokenize"),
                 data=body,
-                headers={"Content-Type": "application/json"},
+                headers=self._headers(json_body=True),
                 method="POST",
             )
             resp = urllib.request.urlopen(req, timeout=5)
@@ -4352,13 +4397,16 @@ class RAGEngine:
         """Get embedding vector from Ollama. Tries /api/embed first, falls back to /api/embeddings."""
         model = self.config.rag_model
         host = self.config.ollama_host.rstrip("/")
+        headers = {"Content-Type": "application/json"}
+        if getattr(self.config, "ollama_api_key", ""):
+            headers["Authorization"] = f"Bearer {self.config.ollama_api_key}"
 
         # Try /api/embed (Ollama ≥ 0.4)
         try:
             url = f"{host}/api/embed"
             payload = json.dumps({"model": model, "input": text}).encode("utf-8")
             req = urllib.request.Request(url, data=payload,
-                                        headers={"Content-Type": "application/json"})
+                                        headers=headers)
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read())
                 return data["embeddings"][0]
@@ -4369,7 +4417,7 @@ class RAGEngine:
         url = f"{host}/api/embeddings"
         payload = json.dumps({"model": model, "prompt": text}).encode("utf-8")
         req = urllib.request.Request(url, data=payload,
-                                    headers={"Content-Type": "application/json"})
+                                    headers=headers)
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
             return data["embedding"]
@@ -17153,13 +17201,18 @@ def main():
     client = OllamaClient(config)
     ok, models = client.check_connection()
     if not ok:
-        print(f"\n{C.RED}Ollama (the local AI engine) is not running.{C.RESET}")
-        if platform.system() == "Darwin":
-            print(f"{C.DIM}Look for the llama icon in your menu bar, or open the Ollama app.{C.RESET}")
+        if config.uses_local_ollama():
+            print(f"\n{C.RED}Ollama (the local AI engine) is not running.{C.RESET}")
+            if platform.system() == "Darwin":
+                print(f"{C.DIM}Look for the llama icon in your menu bar, or open the Ollama app.{C.RESET}")
+            else:
+                print(f"{C.DIM}Start it by running this in another terminal:  ollama serve{C.RESET}")
         else:
-            print(f"{C.DIM}Start it by running this in another terminal:  ollama serve{C.RESET}")
-        # Try to auto-start Ollama on macOS and Linux
-        if shutil.which("ollama"):
+            print(f"\n{C.RED}Could not connect to the configured Ollama endpoint.{C.RESET}")
+            print(f"{C.DIM}Endpoint: {config.ollama_host}{C.RESET}")
+            print(f"{C.DIM}Check OLLAMA_HOST / OLLAMA_API_KEY, or use https://ollama.com/api for Ollama Cloud.{C.RESET}")
+        # Try to auto-start Ollama on macOS and Linux for local hosts only
+        if config.uses_local_ollama() and shutil.which("ollama"):
             try:
                 ans = "y" if config.yes_mode else input(
                     f"{_ansi(chr(27)+'[38;5;51m')}Try to start Ollama automatically? [Y/n]: {C.RESET}"
@@ -17201,30 +17254,36 @@ def main():
     model_ok = client.check_model(config.model, available_models=models)
 
     if not model_ok:
-        print(f"\n{C.YELLOW}The AI model '{config.model}' hasn't been downloaded yet.{C.RESET}")
-        if models:
-            print(f"{C.DIM}Models already downloaded: {', '.join(models)}{C.RESET}")
-        else:
-            print(f"{C.DIM}No models downloaded yet.{C.RESET}")
-        do_pull = False
-        if config.yes_mode:
-            do_pull = True
-        else:
-            try:
-                ans = input(f"{C.CYAN}Download '{config.model}' now? (may be several GB) [Y/n]: {C.RESET}").strip().lower()
-                do_pull = ans in ("", "y", "yes")
-            except (EOFError, KeyboardInterrupt):
-                print()
-        if do_pull:
-            print(f"{C.CYAN}Downloading {config.model}... (this may take a few minutes){C.RESET}")
-            if client.pull_model(config.model):
-                print(f"{C.GREEN}Download complete: {config.model}{C.RESET}")
-                model_ok = True
+        if config.uses_local_ollama():
+            print(f"\n{C.YELLOW}The AI model '{config.model}' hasn't been downloaded yet.{C.RESET}")
+            if models:
+                print(f"{C.DIM}Models already downloaded: {', '.join(models)}{C.RESET}")
             else:
-                print(f"{C.RED}Download failed. Try manually:  ollama pull {config.model}{C.RESET}")
-                sys.exit(1)
+                print(f"{C.DIM}No models downloaded yet.{C.RESET}")
+            do_pull = False
+            if config.yes_mode:
+                do_pull = True
+            else:
+                try:
+                    ans = input(f"{C.CYAN}Download '{config.model}' now? (may be several GB) [Y/n]: {C.RESET}").strip().lower()
+                    do_pull = ans in ("", "y", "yes")
+                except (EOFError, KeyboardInterrupt):
+                    print()
+            if do_pull:
+                print(f"{C.CYAN}Downloading {config.model}... (this may take a few minutes){C.RESET}")
+                if client.pull_model(config.model):
+                    print(f"{C.GREEN}Download complete: {config.model}{C.RESET}")
+                    model_ok = True
+                else:
+                    print(f"{C.RED}Download failed. Try manually:  ollama pull {config.model}{C.RESET}")
+                    sys.exit(1)
+            else:
+                print(f"{C.DIM}Skipping download. The AI may not work until the model is downloaded.{C.RESET}")
         else:
-            print(f"{C.DIM}Skipping download. The AI may not work until the model is downloaded.{C.RESET}")
+            print(f"\n{C.YELLOW}The AI model '{config.model}' is not available on the configured Ollama endpoint.{C.RESET}")
+            print(f"{C.DIM}Endpoint: {config.ollama_host}{C.RESET}")
+            print(f"{C.DIM}Check the model name, your Ollama Cloud access, and OLLAMA_API_KEY.{C.RESET}")
+            sys.exit(1)
 
     # Setup components
     system_prompt = _build_system_prompt(config)
