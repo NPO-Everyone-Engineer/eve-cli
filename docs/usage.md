@@ -12,6 +12,7 @@ EvE CLI の機能と使い方を詳しく解説します。
 - [入力方法](#入力方法)
 - [パーミッション（実行許可）](#パーミッション実行許可)
 - [安全性・復旧機能](#安全性復旧機能)
+- [診断・可視化コマンド](#診断可視化コマンド)
 - [コミットメッセージ自動生成](#コミットメッセージ自動生成)
 - [テスト生成](#テスト生成)
 - [GitHub 連携](#github-連携)
@@ -133,6 +134,34 @@ EvE CLI はファイル書き込みやコマンド実行の前に必ず確認を
 ファイル編集時に、変更前後の差分が色付きで表示されます：
 - 赤色（`-`）: 削除される行
 - 緑色（`+`）: 追加される行
+
+---
+
+## 診断・可視化コマンド
+
+設定や routing の状況を確認したいときは、以下の診断コマンドを使えます。
+
+| コマンド | 説明 |
+|---------|------|
+| `/doctor` | 設定、接続状態、trust 状態、runtime 概要をまとめて表示 |
+| `/tool-pool` | 現在利用可能なツールと permission 状態を表示 |
+| `/command-graph` | 直近の routing snapshot と候補ツールを表示 |
+| `/command-graph <依頼文>` | 指定した依頼文に対する想定 routing を表示 |
+| `/bootstrap-graph` | モデル接続、MCP、hooks、channels など起動パイプラインの状態を表示 |
+| `/usage` | セッションをまたいだ token 集計と推定 cost を表示 |
+| `/debug setup` | `/doctor` のエイリアス |
+| `/debug route` | 直近の routing snapshot を簡易表示 |
+
+### 使いどころ
+
+- `モデルに繋がらない` とき: `/doctor`
+- `なぜそのツールを使ったか見たい` とき: `/command-graph`
+- `どのツールが今 blocked か確認したい` とき: `/tool-pool`
+- `hooks / MCP / channel の読込状態を見たい` とき: `/bootstrap-graph`
+- `トークン消費と概算費用を見たい` とき: `/usage`
+
+`/usage` の cost は、`PROMPT_COST_PER_MTOK` / `COMPLETION_COST_PER_MTOK` または
+`EVE_CLI_PROMPT_COST_PER_MTOK` / `EVE_CLI_COMPLETION_COST_PER_MTOK` に設定した単価を元に計算されます。
 
 ---
 

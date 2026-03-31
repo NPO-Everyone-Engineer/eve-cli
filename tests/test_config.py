@@ -49,6 +49,12 @@ class TestConfigDefaults(unittest.TestCase):
     def test_default_context_window(self):
         self.assertEqual(self.cfg.context_window, 65536)
 
+    def test_default_prompt_cost_per_mtok(self):
+        self.assertEqual(self.cfg.prompt_cost_per_mtok, 0.0)
+
+    def test_default_completion_cost_per_mtok(self):
+        self.assertEqual(self.cfg.completion_cost_per_mtok, 0.0)
+
     def test_default_max_agent_steps(self):
         self.assertEqual(self.cfg.max_agent_steps, 100)
 
@@ -223,6 +229,15 @@ class TestParseConfigFile(unittest.TestCase):
         try:
             self.cfg._parse_config_file(path)
             self.assertEqual(self.cfg.ollama_api_key, "secret-token")
+        finally:
+            os.unlink(path)
+
+    def test_pricing_fields(self):
+        path = self._write_config("PROMPT_COST_PER_MTOK = 0.12\nCOMPLETION_COST_PER_MTOK = 0.34\n")
+        try:
+            self.cfg._parse_config_file(path)
+            self.assertEqual(self.cfg.prompt_cost_per_mtok, 0.12)
+            self.assertEqual(self.cfg.completion_cost_per_mtok, 0.34)
         finally:
             os.unlink(path)
 
@@ -464,6 +479,7 @@ class TestLoadEnv(unittest.TestCase):
         keys = [
             "OLLAMA_HOST", "EVE_CODER_MODEL", "EVE_CLI_MODEL",
             "OLLAMA_API_KEY", "EVE_CLI_OLLAMA_API_KEY",
+            "EVE_CLI_PROMPT_COST_PER_MTOK", "EVE_CLI_COMPLETION_COST_PER_MTOK",
             "EVE_CODER_SIDECAR", "EVE_CLI_SIDECAR_MODEL",
             "EVE_CODER_MAX_AGENT_STEPS", "EVE_CLI_MAX_AGENT_STEPS",
             "EVE_CLI_PROFILE", "EVE_CODER_DEBUG", "EVE_CLI_DEBUG",
@@ -505,6 +521,13 @@ class TestLoadEnv(unittest.TestCase):
         with patch.dict(os.environ, env):
             self.cfg._load_env()
         self.assertEqual(self.cfg.ollama_api_key, "cli-secret")
+
+    def test_pricing_from_env(self):
+        env = self._make_env(EVE_CLI_PROMPT_COST_PER_MTOK="0.25", EVE_CLI_COMPLETION_COST_PER_MTOK="0.75")
+        with patch.dict(os.environ, env):
+            self.cfg._load_env()
+        self.assertEqual(self.cfg.prompt_cost_per_mtok, 0.25)
+        self.assertEqual(self.cfg.completion_cost_per_mtok, 0.75)
 
     def test_eve_cli_model_overrides_legacy(self):
         env = self._make_env(EVE_CODER_MODEL="legacy-model", EVE_CLI_MODEL="new-model")

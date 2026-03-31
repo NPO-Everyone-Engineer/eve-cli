@@ -1110,6 +1110,8 @@ class Config:
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
     DEFAULT_CONTEXT_WINDOW = 65536
+    DEFAULT_PROMPT_COST_PER_MTOK = 0.0
+    DEFAULT_COMPLETION_COST_PER_MTOK = 0.0
     DEFAULT_MAX_AGENT_STEPS = 100
     HARD_MAX_AGENT_STEPS = 200
     _LOCAL_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
@@ -1123,6 +1125,8 @@ class Config:
         self.max_tokens = self.DEFAULT_MAX_TOKENS
         self.temperature = self.DEFAULT_TEMPERATURE
         self.context_window = self.DEFAULT_CONTEXT_WINDOW
+        self.prompt_cost_per_mtok = self.DEFAULT_PROMPT_COST_PER_MTOK
+        self.completion_cost_per_mtok = self.DEFAULT_COMPLETION_COST_PER_MTOK
         self.max_agent_steps = self.DEFAULT_MAX_AGENT_STEPS
         self.prompt = None          # -p one-shot prompt
         self.output_format = "text" # --output-format (text, json, stream-json)
@@ -1316,6 +1320,16 @@ class Config:
                             self.context_window = int(val)
                         except ValueError:
                             pass
+                    elif key == "PROMPT_COST_PER_MTOK" and val:
+                        try:
+                            self.prompt_cost_per_mtok = max(0.0, float(val))
+                        except ValueError:
+                            pass
+                    elif key == "COMPLETION_COST_PER_MTOK" and val:
+                        try:
+                            self.completion_cost_per_mtok = max(0.0, float(val))
+                        except ValueError:
+                            pass
                     elif key == "MAX_AGENT_STEPS" and val:
                         parsed = self._normalize_max_agent_steps(val)
                         if parsed is not None:
@@ -1365,6 +1379,16 @@ class Config:
                 self.max_agent_steps = parsed
         if os.environ.get("EVE_CLI_PROFILE"):
             self.profile = os.environ["EVE_CLI_PROFILE"]
+        if os.environ.get("EVE_CLI_PROMPT_COST_PER_MTOK"):
+            try:
+                self.prompt_cost_per_mtok = max(0.0, float(os.environ["EVE_CLI_PROMPT_COST_PER_MTOK"]))
+            except ValueError:
+                pass
+        if os.environ.get("EVE_CLI_COMPLETION_COST_PER_MTOK"):
+            try:
+                self.completion_cost_per_mtok = max(0.0, float(os.environ["EVE_CLI_COMPLETION_COST_PER_MTOK"]))
+            except ValueError:
+                pass
         if os.environ.get("EVE_CODER_DEBUG") == "1" or os.environ.get("EVE_CLI_DEBUG") == "1":
             self.debug = True
         if os.environ.get("EVE_CLI_MARKDOWN_RENDERER"):
@@ -1812,6 +1836,16 @@ class Config:
                 self.context_window = int(prof["CONTEXT_WINDOW"])
             except ValueError:
                 pass
+        if prof.get("PROMPT_COST_PER_MTOK"):
+            try:
+                self.prompt_cost_per_mtok = max(0.0, float(prof["PROMPT_COST_PER_MTOK"]))
+            except ValueError:
+                pass
+        if prof.get("COMPLETION_COST_PER_MTOK"):
+            try:
+                self.completion_cost_per_mtok = max(0.0, float(prof["COMPLETION_COST_PER_MTOK"]))
+            except ValueError:
+                pass
 
     def _get_effective_ram(self):
         """Get effective RAM in GB (system RAM or VRAM, whichever is larger)."""
@@ -1976,6 +2010,10 @@ class Config:
             self.max_tokens = self.DEFAULT_MAX_TOKENS
         if self.temperature < 0 or self.temperature > 2:
             self.temperature = self.DEFAULT_TEMPERATURE
+        if self.prompt_cost_per_mtok < 0:
+            self.prompt_cost_per_mtok = self.DEFAULT_PROMPT_COST_PER_MTOK
+        if self.completion_cost_per_mtok < 0:
+            self.completion_cost_per_mtok = self.DEFAULT_COMPLETION_COST_PER_MTOK
         # Validate model names — reject shell metacharacters / path traversal
         _SAFE_MODEL_RE = re.compile(r'^[a-zA-Z0-9_.:\-/]+$')
         for attr in ("model", "sidecar_model"):
@@ -11997,6 +12035,333 @@ class ToolRegistry:
         return self
 
 
+_ROUTE_RULES = {
+    "Read": [
+        (r"@[^\s]+|\.py\b|\.ts\b|\.tsx\b|\.js\b|\.md\b|\.json\b|file\b|ファイル", 3, "file reference or path mention"),
+        (r"\b(read|open|explain|show|inspect)\b|読んで|開いて|説明", 2, "read/explain intent"),
+    ],
+    "Grep": [
+        (r"\b(find|search|grep|where|contains|usage|reference|references)\b|検索|探し|参照|使われ", 3, "search/reference intent"),
+        (r"\b(route|endpoint|symbol|definition|def)\b|ルート|エンドポイント|定義", 2, "symbol or route lookup"),
+    ],
+    "Glob": [
+        (r"\b(list files|which files|tree|glob|folder|directory)\b|一覧|ファイル一覧|ディレクトリ", 3, "file discovery intent"),
+    ],
+    "Bash": [
+        (r"\b(run|test|build|install|compile|execute|benchmark|pytest|npm|pnpm|cargo|make)\b|実行|テスト|ビルド|インストール", 3, "command execution intent"),
+        (r"\b(git|lint|format|ruff|eslint)\b", 2, "tooling command intent"),
+    ],
+    "Write": [
+        (r"\b(create file|new file|scaffold|generate|write)\b|新規ファイル|作成|テンプレート", 3, "new file generation intent"),
+    ],
+    "Edit": [
+        (r"\b(fix|change|update|modify|rename|refactor|patch)\b|修正|変更|更新|直して|リファクタ", 3, "targeted code change intent"),
+    ],
+    "MultiEdit": [
+        (r"\b(across files|multiple files|bulk|many files)\b|複数ファイル|まとめて|一括", 4, "multi-file edit intent"),
+    ],
+    "WebSearch": [
+        (r"\b(latest|news|today|recent|look up|search web)\b|最新|ニュース|今日|調べて", 4, "fresh web information intent"),
+    ],
+    "WebFetch": [
+        (r"https?://|www\.", 5, "URL present in request"),
+        (r"\b(fetch|download page|read page)\b|URLを読|ページを読", 3, "direct URL fetch intent"),
+    ],
+    "NotebookEdit": [
+        (r"\.ipynb\b|\bnotebook\b|\bjupyter\b|ノートブック", 5, "notebook-specific edit intent"),
+    ],
+    "TaskCreate": [
+        (r"\b(task|todo|plan)\b|タスク|TODO|計画", 2, "task planning intent"),
+    ],
+    "TaskList": [
+        (r"\b(list tasks|show tasks|blocked by)\b|タスク一覧|タスクを見せて", 3, "task listing intent"),
+    ],
+    "TaskUpdate": [
+        (r"\b(update task|complete task|task status)\b|タスク更新|完了にして", 3, "task update intent"),
+    ],
+    "AskUserQuestion": [
+        (r"\b(ask me|need confirmation|which one)\b|確認が必要|どれにする", 2, "interactive clarification intent"),
+    ],
+    "SubAgent": [
+        (r"\b(deep research|investigate deeply|delegate)\b|深掘り|詳細調査|委譲", 3, "delegation intent"),
+    ],
+    "ParallelAgents": [
+        (r"\b(in parallel|parallel|simultaneously)\b|並列|同時", 4, "parallel execution intent"),
+    ],
+}
+
+_ROUTE_PREFILTER_ALWAYS = {
+    "Read", "Grep", "TaskCreate", "TaskList", "TaskUpdate",
+    "AskUserQuestion", "SubAgent", "ParallelAgents",
+}
+
+
+def _score_tool_candidates(user_input, allowed_tool_names=None, plan_mode=False):
+    text = (user_input or "").strip()
+    lower = text.lower()
+    allowed = set(allowed_tool_names or [])
+    scored = {}
+    for tool_name, rules in _ROUTE_RULES.items():
+        if allowed and tool_name not in allowed:
+            continue
+        for pattern, score, reason in rules:
+            if re.search(pattern, text, re.IGNORECASE):
+                entry = scored.setdefault(tool_name, {"name": tool_name, "score": 0, "reasons": []})
+                entry["score"] += score
+                if reason not in entry["reasons"]:
+                    entry["reasons"].append(reason)
+    if plan_mode:
+        for tool_name in ("TaskCreate", "TaskList", "TaskUpdate", "Read", "Grep"):
+            if allowed and tool_name not in allowed:
+                continue
+            entry = scored.setdefault(tool_name, {"name": tool_name, "score": 0, "reasons": []})
+            entry["score"] += 2
+            if "plan mode baseline" not in entry["reasons"]:
+                entry["reasons"].append("plan mode baseline")
+    if any(t in scored for t in ("Write", "Edit", "MultiEdit", "Bash")):
+        for dep_tool, dep_reason in (("Read", "editing requires context"), ("Grep", "editing benefits from code search")):
+            if allowed and dep_tool not in allowed:
+                continue
+            entry = scored.setdefault(dep_tool, {"name": dep_tool, "score": 0, "reasons": []})
+            entry["score"] += 2
+            if dep_reason not in entry["reasons"]:
+                entry["reasons"].append(dep_reason)
+    if any(ch in lower for ch in ("?", "？")) and (not allowed or "AskUserQuestion" in allowed):
+        entry = scored.setdefault("AskUserQuestion", {"name": "AskUserQuestion", "score": 0, "reasons": []})
+        entry["score"] += 1
+        if "question-like phrasing" not in entry["reasons"]:
+            entry["reasons"].append("question-like phrasing")
+    ranked = sorted(scored.values(), key=lambda item: (-item["score"], item["name"]))
+    return ranked
+
+
+def _derive_route_prefilter(tool_candidates, allowed_tool_names=None):
+    if not tool_candidates:
+        return None
+    strong = [c for c in tool_candidates if c.get("score", 0) >= 3]
+    if not strong:
+        return None
+    names = {item["name"] for item in strong[:6]}
+    names.update(_ROUTE_PREFILTER_ALWAYS)
+    if allowed_tool_names is not None:
+        names &= set(allowed_tool_names)
+    return names or None
+
+
+def _format_route_report(route_report):
+    if not route_report:
+        return "No routing snapshot available yet."
+    lines = [
+        f"mode: {'plan' if route_report.get('plan_mode') else 'act'}",
+        f"prefilter: {'enabled' if route_report.get('prefilter_active') else 'disabled'}",
+    ]
+    if route_report.get("parallel_tasks"):
+        lines.append(f"parallel_tasks: {len(route_report['parallel_tasks'])}")
+    candidates = route_report.get("candidates", [])
+    if candidates:
+        lines.append("candidates:")
+        for item in candidates[:6]:
+            reasons = ", ".join(item.get("reasons", [])[:3])
+            lines.append(f"  - {item['name']} ({item['score']}): {reasons}")
+    else:
+        lines.append("candidates: none")
+    return "\n".join(lines)
+
+
+def _current_repo_trusted_scopes(config):
+    trusted = _load_trusted_repos(config)
+    entry = trusted.get(_repo_key(config), {})
+    scopes = []
+    for key in ("instructions", "skills", "commands", "permissions", "mcp"):
+        if _get_repo_scope_hashes(entry, key):
+            scopes.append(key)
+    try:
+        hook_mgr = HookManager(config)
+        trusted_hooks = hook_mgr._load_trusted_hooks()
+        if trusted_hooks.get(os.path.realpath(config.cwd), {}).get("trusted"):
+            scopes.append("hooks")
+    except Exception:
+        pass
+    return scopes
+
+
+def _tool_permission_mode(tool_name, permissions):
+    if tool_name in getattr(permissions, "SAFE_TOOLS", set()):
+        return "safe"
+    if tool_name in getattr(permissions, "ASK_TOOLS", set()):
+        return "ask"
+    if tool_name in getattr(permissions, "NETWORK_TOOLS", set()):
+        return "network"
+    return "other"
+
+
+def _build_tool_pool_lines(registry, permissions, allowed_names=None):
+    allowed = set(allowed_names or registry.names())
+    lines = ["Tool                 Category     Source    Mode     Description",
+             "───────────────────  ───────────  ────────  ───────  ─────────────────────────────"]
+    for name in sorted(registry.names()):
+        if name not in allowed:
+            continue
+        tool = registry.get(name)
+        source = "mcp" if isinstance(tool, MCPTool) else "builtin"
+        category = PermissionMgr._tool_category(name)
+        mode = _tool_permission_mode(name, permissions)
+        desc = ""
+        try:
+            schema = tool.get_schema()
+            desc = schema.get("function", {}).get("description", "")
+        except Exception:
+            desc = getattr(tool, "description", "")
+        desc = re.sub(r"\s+", " ", (desc or "")).strip()[:44]
+        lines.append(f"{name:<20} {category:<12} {source:<8} {mode:<8} {desc}")
+    return lines
+
+
+def _build_command_graph_lines(config, agent, registry, prompt_text=""):
+    lines = [
+        "input",
+        "  -> slash/custom/skill preprocessing",
+        "  -> @file / image attachment expansion",
+        "  -> optional RAG injection",
+        "  -> routing heuristics / candidate scoring",
+        "  -> LLM tool-call planning",
+        "  -> permission check / hook gate",
+        "  -> tool execution",
+        "  -> tool results -> next turn / final answer",
+    ]
+    report = None
+    if prompt_text:
+        report = {
+            "plan_mode": bool(getattr(agent, "_plan_mode", False)),
+            "parallel_tasks": agent._detect_parallel_tasks(prompt_text) if agent else [],
+            "candidates": _score_tool_candidates(
+                prompt_text,
+                allowed_tool_names=agent._get_allowed_tool_names() if agent else registry.names(),
+                plan_mode=bool(getattr(agent, "_plan_mode", False)),
+            ),
+        }
+        report["prefilter_active"] = bool(_derive_route_prefilter(report["candidates"], agent._get_allowed_tool_names() if agent else None))
+    elif agent and getattr(agent, "_last_route_report", None):
+        report = agent._last_route_report
+    if report:
+        lines.append("")
+        lines.append("last_route")
+        lines.extend("  " + ln for ln in _format_route_report(report).splitlines())
+    return lines
+
+
+def _build_bootstrap_graph_lines(config, client, registry, permissions, hook_mgr, channel_manager, mcp_clients):
+    try:
+        conn_ok, models = client.check_connection(retries=1)
+    except Exception:
+        conn_ok, models = False, []
+    skills = _load_skills(config)
+    with _custom_commands_lock:
+        custom_cmd_count = len(_custom_commands)
+    lines = [
+        f"[1] config.load          OK    model={config.model or '(auto)'} profile={config.profile}",
+        f"[2] ollama.connect       {'OK' if conn_ok else 'FAIL'}  host={config.ollama_host}",
+        f"[3] model.check          {'OK' if client.check_model(config.model, available_models=models) else 'WARN'}  model={config.model}",
+        f"[4] skill.load           OK    skills={len(skills)} custom_commands={custom_cmd_count}",
+        f"[5] registry.defaults    OK    tools={len(registry.names())}",
+        f"[6] approvals            OK    project={sum(permissions.policy_summary().values())}",
+        f"[7] mcp.init             {'OK' if mcp_clients else 'SKIP'}  clients={len(mcp_clients)}",
+        f"[8] hooks.init           {'OK' if hook_mgr.has_hooks else 'SKIP'}  hooks={len(getattr(hook_mgr, '_hooks', []))}",
+        f"[9] channels.init        {'OK' if channel_manager else 'SKIP'}  channels={','.join(config.channels) if config.channels else '(none)'}",
+        "[10] agent.ready         OK",
+    ]
+    return lines
+
+
+def _format_cost_usd(cost):
+    if not cost:
+        return "$0.0000"
+    return f"${cost:,.4f}"
+
+
+def _build_usage_report_lines(config, evolution, session=None):
+    summary = evolution.usage_summary()
+    total_tokens = summary["prompt_tokens"] + summary["completion_tokens"]
+    lines = [
+        "Usage Report",
+        f"  total prompt tokens:      {summary['prompt_tokens']:,}",
+        f"  total completion tokens:  {summary['completion_tokens']:,}",
+        f"  total model tokens:       {total_tokens:,}",
+        f"  estimated cost:           {_format_cost_usd(summary['estimated_cost_usd'])}",
+    ]
+    if config.prompt_cost_per_mtok or config.completion_cost_per_mtok:
+        lines.append(
+            f"  active pricing:           in={config.prompt_cost_per_mtok}/M out={config.completion_cost_per_mtok}/M"
+        )
+    else:
+        lines.append("  active pricing:           not configured (cost uses stored rates when available)")
+    if session is not None:
+        lines.append(f"  current session estimate: ~{session.get_token_estimate():,} context tokens")
+    top_models = summary.get("top_models", [])
+    if top_models:
+        lines.append("")
+        lines.append("Top models:")
+        for model_name, data in top_models[:5]:
+            model_tokens = data.get("prompt_tokens", 0) + data.get("completion_tokens", 0)
+            lines.append(f"  - {model_name}: {model_tokens:,} tokens, {_format_cost_usd(data.get('estimated_cost_usd', 0.0))}")
+    recent_days = summary.get("recent_days", [])
+    if recent_days:
+        lines.append("")
+        lines.append("Recent days:")
+        for day, data in recent_days[:5]:
+            day_tokens = data.get("prompt_tokens", 0) + data.get("completion_tokens", 0)
+            lines.append(f"  - {day}: {day_tokens:,} tokens across {data.get('calls', 0)} call(s), {_format_cost_usd(data.get('estimated_cost_usd', 0.0))}")
+    return lines
+
+
+def _build_doctor_lines(config, client, registry, permissions, session, agent, hook_mgr, channel_manager, mcp_clients):
+    try:
+        conn_ok, models = client.check_connection(retries=1)
+    except Exception:
+        conn_ok, models = False, []
+    policy = permissions.policy_summary()
+    skills = _load_skills(config)
+    trusted_scopes = _current_repo_trusted_scopes(config)
+    with _custom_commands_lock:
+        custom_commands = sorted(_custom_commands.keys())
+    evo = getattr(agent, "_evolution", None)
+    usage = evo.usage_summary() if evo else {"prompt_tokens": 0, "completion_tokens": 0, "estimated_cost_usd": 0.0}
+    lines = [
+        "Doctor",
+        f"  version:            {__version__}",
+        f"  cwd:                {config.cwd}",
+        f"  session:            {session.session_id}",
+        f"  model:              {config.model}",
+        f"  sidecar:            {config.sidecar_model or '(none)'}",
+        f"  host:               {config.ollama_host}",
+        f"  connection:         {'ok' if conn_ok else 'failed'}",
+        f"  model_available:    {'yes' if client.check_model(config.model, available_models=models if conn_ok else None) else 'no'}",
+        f"  think_mode:         {config.think_mode}",
+        f"  context_window:     {config.context_window}",
+        f"  pricing:            in={config.prompt_cost_per_mtok}/M out={config.completion_cost_per_mtok}/M",
+        f"  approvals:          global={policy['global_tool_rules'] + policy['global_category_rules'] + policy['global_path_rules']} "
+        f"project={policy['project_tool_rules'] + policy['project_category_rules'] + policy['project_path_rules']}",
+        f"  trusted_scopes:     {', '.join(trusted_scopes) if trusted_scopes else '(none)'}",
+        f"  skills:             {len(skills)}",
+        f"  custom_commands:    {len(custom_commands)}",
+        f"  hooks:              {len(getattr(hook_mgr, '_hooks', [])) if hook_mgr else 0}",
+        f"  mcp_clients:        {len(mcp_clients)}",
+        f"  channels:           {', '.join(config.channels) if config.channels else '(none)'}",
+        f"  session_tokens:     ~{session.get_token_estimate():,}",
+        f"  usage_tokens:       {(usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0)):,}",
+        f"  estimated_cost:     {_format_cost_usd(usage.get('estimated_cost_usd', 0.0))}",
+    ]
+    stop = getattr(agent, "_last_stop_reason", None)
+    if stop:
+        lines.append(f"  last_stop_reason:   {stop.get('reason')} ({stop.get('detail', '')})")
+    route = getattr(agent, "_last_route_report", None)
+    if route:
+        lines.append("")
+        lines.append("Last route:")
+        lines.extend("  " + ln for ln in _format_route_report(route).splitlines())
+    return lines
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # Permission Manager
 # ════════════════════════════════════════════════════════════════════════════════
@@ -13134,6 +13499,13 @@ class EvolutionEngine:
             "version": 1, "total_sessions": 0, "total_tool_calls": 0,
             "tool_stats": {}, "error_patterns": {}, "workflow_patterns": [],
             "user_preferences": {}, "insights": [], "last_updated": None,
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "models": {},
+                "days": {},
+            },
         }
 
     def _save(self):
@@ -13162,6 +13534,55 @@ class EvolutionEngine:
         self._data["total_tool_calls"] = self._data.get("total_tool_calls", 0) + 1
         self._session_tool_calls.append(tool_name)
 
+    def record_usage(self, model, prompt_tokens, completion_tokens,
+                     prompt_cost_per_mtok=0.0, completion_cost_per_mtok=0.0):
+        prompt_tokens = int(prompt_tokens or 0)
+        completion_tokens = int(completion_tokens or 0)
+        prompt_rate = max(0.0, float(prompt_cost_per_mtok or 0.0))
+        completion_rate = max(0.0, float(completion_cost_per_mtok or 0.0))
+        est_cost = ((prompt_tokens / 1_000_000.0) * prompt_rate
+                    + (completion_tokens / 1_000_000.0) * completion_rate)
+
+        usage = self._data.setdefault("usage", {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "estimated_cost_usd": 0.0,
+            "models": {},
+            "days": {},
+        })
+        usage["prompt_tokens"] = usage.get("prompt_tokens", 0) + prompt_tokens
+        usage["completion_tokens"] = usage.get("completion_tokens", 0) + completion_tokens
+        usage["estimated_cost_usd"] = round(usage.get("estimated_cost_usd", 0.0) + est_cost, 6)
+
+        model_key = model or "(unknown)"
+        model_entry = usage.setdefault("models", {}).setdefault(model_key, {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "estimated_cost_usd": 0.0,
+            "prompt_cost_per_mtok": prompt_rate,
+            "completion_cost_per_mtok": completion_rate,
+        })
+        model_entry["prompt_tokens"] += prompt_tokens
+        model_entry["completion_tokens"] += completion_tokens
+        model_entry["estimated_cost_usd"] = round(model_entry.get("estimated_cost_usd", 0.0) + est_cost, 6)
+        if prompt_rate:
+            model_entry["prompt_cost_per_mtok"] = prompt_rate
+        if completion_rate:
+            model_entry["completion_cost_per_mtok"] = completion_rate
+
+        day_key = datetime.now().strftime("%Y-%m-%d")
+        day_entry = usage.setdefault("days", {}).setdefault(day_key, {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "estimated_cost_usd": 0.0,
+            "calls": 0,
+        })
+        day_entry["prompt_tokens"] += prompt_tokens
+        day_entry["completion_tokens"] += completion_tokens
+        day_entry["estimated_cost_usd"] = round(day_entry.get("estimated_cost_usd", 0.0) + est_cost, 6)
+        day_entry["calls"] += 1
+        return est_cost
+
     def record_error(self, error_type, auto_fixed=False):
         patterns = self._data.setdefault("error_patterns", {})
         entry = patterns.setdefault(error_type, {"count": 0, "auto_fixed": 0, "manual_fixed": 0})
@@ -13180,6 +13601,24 @@ class EvolutionEngine:
             existing.update(file_types)
             prefs["common_file_types"] = sorted(existing)[:20]
         self._save()
+
+    def usage_summary(self):
+        usage = self._data.get("usage", {})
+        models = usage.get("models", {})
+        days = usage.get("days", {})
+        top_models = sorted(
+            models.items(),
+            key=lambda item: (item[1].get("prompt_tokens", 0) + item[1].get("completion_tokens", 0)),
+            reverse=True,
+        )
+        recent_days = sorted(days.items(), key=lambda item: item[0], reverse=True)
+        return {
+            "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+            "estimated_cost_usd": float(usage.get("estimated_cost_usd", 0.0) or 0.0),
+            "top_models": top_models[:8],
+            "recent_days": recent_days[:7],
+        }
 
     def _update_workflow_patterns(self):
         calls = self._session_tool_calls
@@ -14066,7 +14505,8 @@ class TUI:
                 # Tab-completion for slash commands and @files
                 _slash_commands = [
                     "/help", "/exit", "/quit", "/q", "/clear", "/model", "/models",
-                    "/status", "/save", "/compact", "/yes", "/no", "/tokens",
+                    "/status", "/doctor", "/tool-pool", "/command-graph", "/bootstrap-graph",
+                    "/save", "/compact", "/yes", "/no", "/tokens", "/usage",
                     "/think", "/no-think", "/map",
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
@@ -15431,11 +15871,16 @@ class TUI:
   {_c198}/model{C.RESET} <name>      Switch model
   {_c198}/models{C.RESET}            List installed models with tier info
   {_c198}/status{C.RESET}            Session, git, and recovery info
+  {_c198}/doctor{C.RESET}            Environment, trust, and runtime diagnostics
+  {_c198}/tool-pool{C.RESET}         List currently available tools
+  {_c198}/command-graph{C.RESET}     Show routing graph / candidate tools
+  {_c198}/bootstrap-graph{C.RESET}   Show startup pipeline and status
   {_c198}/save{C.RESET}              Save session
   {_c198}/compact{C.RESET}           Compress context to save memory
   {_c198}/undo{C.RESET}              Undo last file change
   {_c198}/config{C.RESET}            Show configuration
   {_c198}/tokens{C.RESET}            Show token usage
+  {_c198}/usage{C.RESET}             Show persistent token/cost usage report
   {_c198}/init{C.RESET}              Create CLAUDE.md template
   {_c198}/yes{C.RESET}               Auto-approve ON
   {_c198}/no{C.RESET}                Auto-approve OFF
@@ -15444,6 +15889,8 @@ class TUI:
   {_c198}@file{C.RESET}              Attach file contents (e.g. @src/main.py)
   {_c198}/browser{C.RESET}           Browser automation (Playwright MCP)
   {_c198}/debug{C.RESET}             Toggle debug mode
+  {_c198}/debug setup{C.RESET}       Alias for /doctor
+  {_c198}/debug route{C.RESET}       Show last routing snapshot
   {_c198}/debug-scroll{C.RESET}      Test scroll region (DECSTBM)
   {_c198}/resume{C.RESET}            Switch to a different session
   {_c198}/fork{C.RESET} [name]       Fork current session (explore different approach)
@@ -15666,6 +16113,9 @@ class Agent:
         self._plan_mode = False
         self._active_plan_path = None     # current plan file path
         self.allowed_tool_names = None
+        self._route_prefilter_names = None
+        self._last_route_report = None
+        self._last_stop_reason = None
 
         self.git_checkpoint = GitCheckpoint(config.cwd, runtime_state=session.runtime_state)
         self.change_tracker = GitChangeTracker(config.cwd)
@@ -15839,10 +16289,26 @@ class Agent:
 
     def _get_tool_schemas(self):
         allowed_names = self._get_allowed_tool_names()
+        if self._route_prefilter_names:
+            allowed_names &= set(self._route_prefilter_names)
         return [
             schema for schema in self.registry.get_schemas()
             if schema.get("function", {}).get("name") in allowed_names
         ]
+
+    def _set_stop_reason(self, reason, detail=""):
+        payload = {"reason": reason, "detail": detail or ""}
+        self._last_stop_reason = payload
+        if self.session.runtime_state:
+            self.session.runtime_state.update_runtime(
+                last_stop_reason=reason,
+                last_stop_detail=detail or "",
+                updated_at=time.time(),
+            )
+            try:
+                self.session.runtime_state.record_resume_event("stop_reason", f"{reason}: {detail or '-'}")
+            except Exception:
+                pass
 
     def _run_impl(self, user_input, skip_add=False):
         """Internal agent loop implementation."""
@@ -15890,6 +16356,29 @@ class Agent:
                     print(f"{C.DIM}[debug] RAG query failed: {e}{C.RESET}", file=sys.stderr)
         if not skip_add:
             self.session.add_user_message(user_input)
+        _parallel_tasks = self._detect_parallel_tasks(user_input) if not self._plan_mode else []
+        _route_candidates = _score_tool_candidates(
+            user_input,
+            allowed_tool_names=self._get_allowed_tool_names(),
+            plan_mode=self._plan_mode,
+        )
+        self._route_prefilter_names = _derive_route_prefilter(_route_candidates, self._get_allowed_tool_names())
+        self._last_route_report = {
+            "plan_mode": self._plan_mode,
+            "parallel_tasks": _parallel_tasks,
+            "candidates": _route_candidates,
+            "prefilter_active": bool(self._route_prefilter_names),
+        }
+        if self.session.runtime_state:
+            try:
+                self.session.runtime_state.record_resume_event(
+                    "route",
+                    _format_route_report(self._last_route_report)[:500],
+                )
+            except Exception:
+                pass
+        if self.config.debug and _route_candidates:
+            _p(f"  {C.DIM}[route] {_format_route_report(self._last_route_report).replace(chr(10), ' | ')}{C.RESET}")
         self._interrupted.clear()
         self._auto_fix_count = 0
         _recent_tool_calls = []  # track recent calls for loop detection
@@ -15909,10 +16398,13 @@ class Agent:
         _esc_monitor.start()
 
         for iteration in range(self.max_iterations):
+            if iteration > 0:
+                self._route_prefilter_names = None
             if self._interrupted.is_set() or _esc_monitor.pressed:
                 if _esc_monitor.pressed:
                     _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
                     self._interrupted.set()
+                self._set_stop_reason("interrupted", "user interrupt")
                 break
 
             # Auto-compact if context is getting full
@@ -16004,6 +16496,14 @@ class Agent:
                         pct = min(int(((prompt_t + completion_t) / self.config.context_window) * 100), 100)
                         _p(f"  {_ansi(chr(27)+'[38;5;240m')}tokens: {prompt_t}→{completion_t} "
                            f"({pct}% ctx){C.RESET}")
+                        if self._evolution:
+                            self._evolution.record_usage(
+                                self.config.model,
+                                prompt_t,
+                                completion_t,
+                                self.config.prompt_cost_per_mtok,
+                                self.config.completion_cost_per_mtok,
+                            )
                 self.session._just_compacted = False
 
                 # Handle empty response from local LLM (smart retry cascade)
@@ -16084,6 +16584,8 @@ class Agent:
 
                 # 4. If no tool calls, we're done
                 if not tool_calls:
+                    self._set_stop_reason("assistant_final", "model returned final text without tool calls")
+                    self._route_prefilter_names = None
                     break
 
                 # 5. Detect infinite tool call loops
@@ -16120,6 +16622,8 @@ class Agent:
                             # Second detection after warning: give up
                             _p(f"\n{C.YELLOW}AI が同じアクションを繰り返して停止しました。(The AI got stuck repeating the same action - Stopped){C.RESET}")
                             _p(f"{C.DIM}Try rephrasing your request or asking for a different approach.{C.RESET}")
+                            self._set_stop_reason("tool_loop", current_calls[0][0] if current_calls else "unknown")
+                            self._route_prefilter_names = None
                             break
                 if len(_recent_tool_calls) > 10:
                     _recent_tool_calls = _recent_tool_calls[-10:]
@@ -16495,10 +16999,12 @@ class Agent:
                     self.session.add_assistant_message(text)
                 _p(f"\n{C.RED}問題が発生しました：{e} (Something went wrong: {e}){C.RESET}")
                 _p(f"{C.DIM}Your conversation is still active. Try your request again.{C.RESET}")
+                self._set_stop_reason("error", str(e)[:200])
                 if self.config.debug:
                     traceback.print_exc()
                 else:
                     _p(f"{C.DIM}(Run with --debug for full details){C.RESET}")
+                self._route_prefilter_names = None
                 break
         else:
             # P1: 制限到達時の UX 改善 — 自動保存＋再開 prompt
@@ -16518,8 +17024,10 @@ class Agent:
                     _p(f"{C.DIM}セッションが終了しました。再開：eve-coder --resume (Session ended. Resume with: eve-coder --resume){C.RESET}")
             except EOFError:
                 _p(f"{C.DIM}セッションが終了しました。再開：eve-coder --resume (Session ended. Resume with: eve-coder --resume){C.RESET}")
+            self._set_stop_reason("max_iterations", f"{self.max_iterations} iterations")
 
         # Fire Stop hook when agent loop ends
+        self._route_prefilter_names = None
         if self.session.runtime_state:
             self.session.runtime_state.update_runtime(
                 last_known_phase="idle",
@@ -17835,6 +18343,32 @@ def main():
                 elif cmd == "/status":
                     tui.show_status(session, config, agent=agent)
                     continue
+                elif cmd == "/doctor":
+                    print()
+                    for _line in _build_doctor_lines(config, client, registry, permissions, session, agent, hook_mgr, channel_manager, _mcp_clients):
+                        print(f"  {_line}")
+                    print()
+                    continue
+                elif cmd == "/tool-pool":
+                    print()
+                    for _line in _build_tool_pool_lines(registry, permissions, allowed_names=agent._get_allowed_tool_names()):
+                        print(f"  {_line}")
+                    print()
+                    continue
+                elif cmd == "/command-graph":
+                    _parts = user_input.split(None, 1)
+                    _prompt_text = _parts[1].strip() if len(_parts) > 1 else ""
+                    print()
+                    for _line in _build_command_graph_lines(config, agent, registry, prompt_text=_prompt_text):
+                        print(f"  {_line}")
+                    print()
+                    continue
+                elif cmd == "/bootstrap-graph":
+                    print()
+                    for _line in _build_bootstrap_graph_lines(config, client, registry, permissions, hook_mgr, channel_manager, _mcp_clients):
+                        print(f"  {_line}")
+                    print()
+                    continue
                 elif cmd == "/jobs":
                     # Show recent background jobs with output history
                     _rt = _get_active_runtime_state()
@@ -18043,6 +18577,13 @@ def main():
                     if pct >= 80:
                         print(f"  {_ansi(chr(27)+'[38;5;196m')}⚠ {t('slash.tokens_warning', default='Context almost full! Use /compact or /clear')}{C.RESET}")
                     print(f"  {_c51}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    continue
+                elif cmd == "/usage":
+                    _usage_engine = getattr(agent, "_evolution", None) or EvolutionEngine(config.config_dir)
+                    print()
+                    for _line in _build_usage_report_lines(config, _usage_engine, session=session):
+                        print(f"  {_line}")
+                    print()
                     continue
                 # ── Git commands ──────────────────────────────────────
                 elif cmd == "/commit":
@@ -19114,6 +19655,8 @@ def main():
                     print(f"  {_c87x}Temperature{C.RESET}   {config.temperature}")
                     print(f"  {_c87x}Max tokens{C.RESET}    {config.max_tokens}")
                     print(f"  {_c87x}Context{C.RESET}       {config.context_window}")
+                    print(f"  {_c87x}Prompt $/M{C.RESET}    {config.prompt_cost_per_mtok}")
+                    print(f"  {_c87x}Output $/M{C.RESET}    {config.completion_cost_per_mtok}")
                     print(f"  {_c87x}Auto-approve{C.RESET}  {'ON' if config.yes_mode else 'OFF'}")
                     print(f"  {_c87x}Debug{C.RESET}         {'ON' if config.debug else 'OFF'}")
                     print(f"\n  {_c240x}Config: {config.config_file}{C.RESET}")
@@ -19354,9 +19897,22 @@ def main():
                     continue
 
                 elif cmd == "/debug":
-                    config.debug = not config.debug
-                    state_str = f"{C.GREEN}ON{C.RESET}" if config.debug else f"{C.RED}OFF{C.RESET}"
-                    print(f"  Debug mode: {state_str}")
+                    _parts = user_input.split(None, 1)
+                    _debug_sub = _parts[1].strip().lower() if len(_parts) > 1 else ""
+                    if _debug_sub == "setup":
+                        print()
+                        for _line in _build_doctor_lines(config, client, registry, permissions, session, agent, hook_mgr, channel_manager, _mcp_clients):
+                            print(f"  {_line}")
+                        print()
+                    elif _debug_sub == "route":
+                        print()
+                        for _line in _build_command_graph_lines(config, agent, registry):
+                            print(f"  {_line}")
+                        print()
+                    else:
+                        config.debug = not config.debug
+                        state_str = f"{C.GREEN}ON{C.RESET}" if config.debug else f"{C.RED}OFF{C.RESET}"
+                        print(f"  Debug mode: {state_str}")
                     continue
 
                 elif cmd == "/debug-scroll":
@@ -19852,8 +20408,9 @@ Review this code for:
                     else:
                         # "Did you mean?" for typo'd slash commands
                         _all_cmds = ["/help", "/exit", "/quit", "/clear", "/model", "/models",
-                                     "/status", "/save", "/compact", "/yes", "/no",
-                                     "/tokens", "/think", "/no-think", "/map",
+                                     "/status", "/doctor", "/tool-pool", "/command-graph", "/bootstrap-graph",
+                                     "/save", "/compact", "/yes", "/no",
+                                     "/tokens", "/usage", "/think", "/no-think", "/map",
                                      "/commit", "/diff", "/git", "/plan",
                                      "/approve", "/act", "/execute", "/undo", "/init",
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",

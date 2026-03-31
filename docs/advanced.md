@@ -493,6 +493,8 @@ eve-cli --channels discord,slack,webhook
 | `EVE_CLI_PROFILE` | 接続プロファイル | `auto` |
 | `EVE_CLI_DEBUG` | デバッグモード | `1` |
 | `EVE_CLI_MAX_AGENT_STEPS` | AI ステップ上限 | `80` |
+| `EVE_CLI_PROMPT_COST_PER_MTOK` | 入力 100 万 tokens あたりの推定コスト（USD） | `0.15` |
+| `EVE_CLI_COMPLETION_COST_PER_MTOK` | 出力 100 万 tokens あたりの推定コスト（USD） | `0.60` |
 | `OLLAMA_HOST` | Ollama ホスト URL | `http://localhost:11434` / `https://ollama.com/api` |
 | `OLLAMA_API_KEY` | Ollama Cloud API キー | `ollama_...` |
 
@@ -505,6 +507,8 @@ OLLAMA_HOST=http://localhost:11434
 CONTEXT_WINDOW=65536
 MAX_TOKENS=4096
 TEMPERATURE=0.25
+PROMPT_COST_PER_MTOK=0.15
+COMPLETION_COST_PER_MTOK=0.60
 PROFILE=auto
 ```
 
@@ -518,6 +522,7 @@ eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
 補足:
 - `OLLAMA_HOST` は `https://ollama.com` や `https://ollama.com/api` を受け付け、内部で native API 向けに正規化します。
 - `eve-cli` は Ollama の native `/api/*` を使うため、OpenAI 互換の `/v1` ではなく Ollama endpoint を指定してください。
+- `PROMPT_COST_PER_MTOK` / `COMPLETION_COST_PER_MTOK` は `/usage` の推定コスト計算に使われます。未設定時は `0.0` として扱われます。
 
 ### 設定ファイル一覧
 
