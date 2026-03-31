@@ -102,6 +102,7 @@ EvE CLI はファイル書き込みやコマンド実行の前に必ず確認を
 |------|------|
 | `y` | **今回だけ**許可 |
 | `a` | このツールを**今後すべて**許可 |
+| `p` | このツールを**今後も毎回確認** |
 | `n` / Enter | **拒否**（デフォルト） |
 | `d` | このツールを**今後すべて**拒否 |
 | `Y` | **すべてのツール**を自動許可（`-y` モードと同じ） |
@@ -109,8 +110,10 @@ EvE CLI はファイル書き込みやコマンド実行の前に必ず確認を
 ### 知っておくと便利なこと
 
 - `a` や `d` の設定は `~/.config/eve-cli/permissions.json` に保存され、次回も有効
-- **安全のため** `Bash`・`Write`・`Edit`・`NotebookEdit` は永続的な自動許可ができません（毎回確認）
+- `p` を選ぶと、そのツールは三値ポリシーの `prompt` として保存され、`-y` や Guardian auto-mode より優先して毎回確認されます
+- **安全のため** `Bash`・`Write`・`Edit`・`ApplyPatch`・`MultiEdit`・`NotebookEdit` は永続的な自動許可ができません（毎回確認）
 - 危険なコマンド（`sudo`、`rm` 等）は赤色でハイライト表示されます
+- `--auto-mode` では Guardian が `low / medium / high` リスクを評価し、`low` は自動許可、`medium` は確認、`high` は自動拒否します
 
 ---
 
@@ -134,6 +137,11 @@ EvE CLI はファイル書き込みやコマンド実行の前に必ず確認を
 ファイル編集時に、変更前後の差分が色付きで表示されます：
 - 赤色（`-`）: 削除される行
 - 緑色（`+`）: 追加される行
+
+### patch 形式の編集
+
+大きめの変更や複数 hunk の修正では、`ApplyPatch` ツールが unified diff をまとめて適用します。
+`Edit` の文字列置換よりも、大きな差分や複数ファイル変更に向いています。
 
 ---
 
@@ -159,6 +167,15 @@ EvE CLI はファイル書き込みやコマンド実行の前に必ず確認を
 - `どのツールが今 blocked か確認したい` とき: `/tool-pool`
 - `hooks / MCP / channel の読込状態を見たい` とき: `/bootstrap-graph`
 - `トークン消費と概算費用を見たい` とき: `/usage`
+
+`/doctor` には approval stack と直近の Guardian risk 判定も表示されます。
+
+---
+
+## ストリーミング中の入力キュー
+
+AI が応答をストリーミングしている間に次の入力をタイプすると、入力はキューに積まれます。
+改行まで入力した内容は次のターンでそのまま送信され、途中までの入力は次の prompt に prefill されます。
 
 `/usage` の cost は、`PROMPT_COST_PER_MTOK` / `COMPLETION_COST_PER_MTOK` または
 `EVE_CLI_PROMPT_COST_PER_MTOK` / `EVE_CLI_COMPLETION_COST_PER_MTOK` に設定した単価を元に計算されます。

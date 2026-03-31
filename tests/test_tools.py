@@ -24,6 +24,7 @@ Tool = eve_coder.Tool
 ReadTool = eve_coder.ReadTool
 WriteTool = eve_coder.WriteTool
 EditTool = eve_coder.EditTool
+ApplyPatchTool = eve_coder.ApplyPatchTool
 GlobTool = eve_coder.GlobTool
 GrepTool = eve_coder.GrepTool
 BashTool = eve_coder.BashTool
@@ -290,6 +291,13 @@ class TestWriteTool(unittest.TestCase):
         self.assertIn("Error", result)
         self.assertIn("blocked", result.lower())
 
+    def test_write_protected_config_json(self):
+        """Writing to config.json is blocked."""
+        path = os.path.join(self.sandbox, "config.json")
+        result = self.tool.execute({"file_path": path, "content": "{}"})
+        self.assertIn("Error", result)
+        self.assertIn("blocked", result.lower())
+
     def test_write_reports_byte_count(self):
         """Result message includes byte count."""
         path = os.path.join(self.sandbox, "count.txt")
@@ -401,6 +409,12 @@ class TestEditTool(unittest.TestCase):
         self.assertIn("Error", result)
         self.assertIn("blocked", result.lower())
 
+    def test_config_json_blocked(self):
+        path = _write_file(self.sandbox, "config.json", '{"model": "x"}\n')
+        result = self.tool.execute({"file_path": path, "old_string": "x", "new_string": "y"})
+        self.assertIn("Error", result)
+        self.assertIn("blocked", result.lower())
+
     def test_binary_file_blocked(self):
         """Editing a binary file is refused."""
         path = os.path.join(self.sandbox, "bin.dat")
@@ -449,6 +463,131 @@ class TestEditTool(unittest.TestCase):
             self.assertIn("outside repository", result.lower())
         finally:
             shutil.rmtree(outside_dir, ignore_errors=True)
+
+
+class TestApplyPatchTool(unittest.TestCase):
+    """Tests for ApplyPatchTool."""
+
+    def setUp(self):
+        self.sandbox = _make_sandbox()
+        self.tool = ApplyPatchTool(cwd=self.sandbox)
+
+    def tearDown(self):
+        shutil.rmtree(self.sandbox, ignore_errors=True)
+
+    def test_patch_existing_file(self):
+        path = _write_file(self.sandbox, "hello.txt", "hello\nworld\n")
+        patch_text = (
+            "--- hello.txt\n"
+            "+++ hello.txt\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-hello\n"
+            "+goodbye\n"
+            " world\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("Applied patch", result)
+        with open(path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "goodbye\nworld\n")
+
+    def test_patch_creates_new_file(self):
+        path = os.path.join(self.sandbox, "new.txt")
+        patch_text = (
+            "--- /dev/null\n"
+            "+++ new.txt\n"
+            "@@ -1,0 +1,2 @@\n"
+            "+alpha\n"
+            "+beta\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("created", result)
+        with open(path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "alpha\nbeta\n")
+
+    def test_patch_create_refuses_existing_target(self):
+        _write_file(self.sandbox, "new.txt", "already here\n")
+        patch_text = (
+            "--- /dev/null\n"
+            "+++ new.txt\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+alpha\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("already exists", result)
+
+    def test_patch_deletes_file(self):
+        path = _write_file(self.sandbox, "old.txt", "alpha\n")
+        patch_text = (
+            "--- old.txt\n"
+            "+++ /dev/null\n"
+            "@@ -1,1 +1,0 @@\n"
+            "-alpha\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("deleted", result)
+        self.assertFalse(os.path.exists(path))
+
+    def test_patch_outside_repo_blocked(self):
+        outside_dir = tempfile.mkdtemp(prefix="eve_outside_")
+        try:
+            outside_path = os.path.join(outside_dir, "outside.txt")
+            with open(outside_path, "w", encoding="utf-8") as f:
+                f.write("secret\n")
+            patch_text = (
+                f"--- {outside_path}\n"
+                f"+++ {outside_path}\n"
+                "@@ -1,1 +1,1 @@\n"
+                "-secret\n"
+                "+public\n"
+            )
+            result = self.tool.execute({"patch": patch_text})
+            self.assertIn("outside repository", result.lower())
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
+
+    def test_patch_protected_file_blocked(self):
+        path = _write_file(self.sandbox, "permissions.json", "{}\n")
+        patch_text = (
+            "--- permissions.json\n"
+            "+++ permissions.json\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-{}\n"
+            "+{\"allow\": true}\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("blocked", result.lower())
+
+    def test_patch_config_json_blocked(self):
+        _write_file(self.sandbox, "config.json", "{}\n")
+        patch_text = (
+            "--- config.json\n"
+            "+++ config.json\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-{}\n"
+            "+{\"model\": \"x\"}\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("blocked", result.lower())
+
+    def test_patch_rolls_back_on_failure(self):
+        path = _write_file(self.sandbox, "keep.txt", "one\ntwo\n")
+        patch_text = (
+            "--- keep.txt\n"
+            "+++ keep.txt\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-one\n"
+            "+ONE\n"
+            " two\n"
+            "--- missing.txt\n"
+            "+++ missing.txt\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-x\n"
+            "+y\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("Error", result)
+        with open(path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "one\ntwo\n")
 
 
 # ════════════════════════════════════════════════════════════════════════════════

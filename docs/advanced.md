@@ -607,7 +607,7 @@ eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
 | ファイル | 内容 |
 |---------|------|
 | `~/.config/eve-cli/config` | メイン設定 |
-| `~/.config/eve-cli/permissions.json` | グローバルなツール許可・拒否（自動保存） |
+| `~/.config/eve-cli/permissions.json` | グローバルなツール許可・拒否・確認（自動保存） |
 | `.eve-cli/permissions.json` | プロジェクト単位の approval policy（tool / category / path ルール） |
 | `~/.config/eve-cli/memory/memory.json` | 長期メモリ |
 | `~/.config/eve-cli/hooks.json` | グローバルフック |
@@ -617,4 +617,5 @@ eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
 | `~/.config/eve-cli/trusted_repos.json` | 信頼済みリポジトリ |
 | `~/.config/eve-cli/trusted_hooks.json` | 信頼済みフック |
 
-`permissions.json` は従来の `{ "ToolName": "allow|deny" }` 形式に加えて、`tools` / `categories` / `paths` を持つ構造化形式も読めます。
+`permissions.json` は従来の `{ "ToolName": "allow|deny|prompt" }` 形式に加えて、`tools` / `categories` / `paths` を持つ構造化形式も読めます。
+`prompt` は明示的な確認ポリシーで、`-y` や Guardian auto-mode より優先されます。

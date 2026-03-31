@@ -35,6 +35,14 @@ class TestRoutingHeuristics(unittest.TestCase):
         self.assertIn("Read", names)
         self.assertIn("Grep", names)
 
+    def test_patch_request_prefers_apply_patch(self):
+        scored = eve_coder._score_tool_candidates(
+            "この unified diff を apply patch して",
+            allowed_tool_names={"ApplyPatch", "Edit", "Read"},
+        )
+        self.assertTrue(scored)
+        self.assertEqual(scored[0]["name"], "ApplyPatch")
+
     def test_prefilter_selects_strong_candidates(self):
         scored = eve_coder._score_tool_candidates(
             "最新情報を検索して https://example.com を読んで",
@@ -86,6 +94,31 @@ class TestDiagnosticsFormatting(unittest.TestCase):
             joined = "\n".join(lines)
             self.assertIn("Read", joined)
             self.assertIn("Grep", joined)
+
+    def test_doctor_lines_include_approval_stack(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = eve_coder.Config()
+            cfg.cwd = tmpdir
+            cfg.config_dir = tmpdir
+            cfg.notify_on = ["stop"]
+            cfg.channels = []
+            session = SimpleNamespace(session_id="sess", get_token_estimate=lambda: 0)
+            permissions = eve_coder.PermissionMgr(SimpleNamespace(
+                yes_mode=False,
+                auto_mode=False,
+                permissions_file=os.path.join(tmpdir, "permissions.json"),
+                cwd=tmpdir,
+                config_dir=tmpdir,
+            ))
+            client = SimpleNamespace(
+                check_connection=lambda retries=1: (True, [cfg.model] if cfg.model else []),
+                check_model=lambda model, available_models=None: True,
+            )
+            registry = eve_coder.ToolRegistry().register_defaults()
+            hook_mgr = SimpleNamespace(has_hooks=False, _hooks=[])
+            agent = SimpleNamespace(_evolution=None, _last_stop_reason=None, _last_route_report=None)
+            lines = eve_coder._build_doctor_lines(cfg, client, registry, permissions, session, agent, hook_mgr, None, [])
+            self.assertIn("approval_stack", "\n".join(lines))
 
     def test_command_graph_uses_last_route_when_no_prompt(self):
         agent = SimpleNamespace(

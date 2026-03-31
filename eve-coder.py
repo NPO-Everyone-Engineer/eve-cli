@@ -43,6 +43,7 @@ import atexit
 import struct
 import sqlite3
 import asyncio
+import contextlib
 from abc import ABC, abstractmethod
 from datetime import datetime
 import collections
@@ -51,6 +52,7 @@ import shlex
 import http.server
 import hmac
 import queue as _queue_mod
+import codecs
 
 # 言語設定グローバル変数
 _LANG = None  # 'ja' or 'en' (None = auto-detect)
@@ -1014,8 +1016,9 @@ class InputMonitor:
     Unix-only: uses termios + tty.setcbreak for real-time key detection.
     On Windows (or when termios is unavailable), all methods are no-ops.
 
-    NOTE: Type-ahead capture was removed due to IME compatibility issues.
-    Only ESC key detection is supported for safe interrupt functionality.
+    Optional type-ahead capture is exposed through on_typeahead for simple
+    queued input while the assistant is streaming. The callback receives raw
+    bytes that were not interpreted as ESC/Ctrl+C.
     """
 
     def __init__(self, on_typeahead=None):
@@ -1023,6 +1026,7 @@ class InputMonitor:
         self._stop_event = threading.Event()
         self._thread = None
         self._old_settings = None
+        self._on_typeahead = on_typeahead
 
     @property
     def pressed(self):
@@ -1082,7 +1086,11 @@ class InputMonitor:
                 elif ch == b'\x03':  # Ctrl+C
                     self._pressed.set()
                     break
-                # Ignore all other keys - type-ahead capture removed for IME compatibility
+                elif self._on_typeahead is not None:
+                    try:
+                        self._on_typeahead(ch)
+                    except Exception:
+                        pass
 
     def stop(self):
         """Stop monitoring and restore terminal settings."""
@@ -1096,6 +1104,42 @@ class InputMonitor:
             except termios.error:
                 pass
             self._old_settings = None
+
+
+class ReadWriteLock:
+    """Simple reader-writer lock for tool execution coordination."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._readers = 0
+        self._writer = False
+
+    @contextlib.contextmanager
+    def read(self):
+        with self._condition:
+            while self._writer:
+                self._condition.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @contextlib.contextmanager
+    def write(self):
+        with self._condition:
+            while self._writer or self._readers:
+                self._condition.wait()
+            self._writer = True
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._writer = False
+                self._condition.notify_all()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -5383,6 +5427,8 @@ class Tool(ABC):
     name = ""
     description = ""
     parameters = {}  # JSON Schema
+    lock_mode = "write"
+    parallel_safe = False
 
     def __init__(self, cwd=None):
         self.cwd = os.path.realpath(cwd) if cwd else None
@@ -5394,6 +5440,9 @@ class Tool(ABC):
 
     def _base_dir(self):
         return self.cwd or os.getcwd()
+
+    def execution_lock(self):
+        return self.lock_mode
 
     def _is_path_within_repo(self, file_path):
         """Check if file_path is within the repo directory."""
@@ -5530,6 +5579,7 @@ class SandboxRuntime:
 
 class BashTool(Tool):
     name = "Bash"
+    lock_mode = "write"
     description = """bash コマンドをサブプロセスで実行する。
 
 使い分けの指針:
@@ -5993,6 +6043,8 @@ def _build_multimodal_content(text, image_data_list):
 
 class ReadTool(Tool):
     name = "Read"
+    lock_mode = "read"
+    parallel_safe = True
     description = "Read a file from the filesystem. Returns content with line numbers. Can also read image files (PNG, JPG, etc.) for multimodal models."
     parameters = {
         "type": "object",
@@ -6245,7 +6297,7 @@ class ReadTool(Tool):
 
 def _is_protected_path(file_path):
     """Check if a file path points to a protected config/permission file."""
-    _PROTECTED_BASENAMES = {"permissions.json", ".eve-coder.json"}
+    _PROTECTED_BASENAMES = {"permissions.json", ".eve-coder.json", "config.json"}
     try:
         real = os.path.realpath(file_path)
         basename = os.path.basename(real)
@@ -6309,6 +6361,140 @@ def _resolve_repo_storage_path(base_dir, *parts):
     return resolved
 
 
+def _normalize_patch_target_path(raw_path):
+    """Normalize unified-diff paths like a/foo, b/foo, or /dev/null."""
+    if not isinstance(raw_path, str):
+        return ""
+    token = raw_path.strip().split("\t", 1)[0].strip()
+    if not token:
+        return ""
+    if token == "/dev/null":
+        return token
+    if token.startswith("a/") or token.startswith("b/"):
+        token = token[2:]
+    return token
+
+
+def _read_text_file_for_patch(file_path):
+    try:
+        with open(file_path, "rb") as bf:
+            sample = bf.read(8192)
+            if b"\x00" in sample:
+                return None, f"Error: {file_path} appears to be a binary file — patching refused."
+        with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            return f.read(), None
+    except OSError as e:
+        return None, f"Error reading file: {e}"
+
+
+def _split_patch_lines_with_endings(text):
+    lines = text.splitlines(keepends=True)
+    if text and not text.endswith(("\n", "\r")) and lines:
+        return lines
+    return lines
+
+
+def _apply_unified_patch_to_text(original_text, hunks):
+    original_lines = _split_patch_lines_with_endings(original_text)
+    out_lines = []
+    cursor = 0
+    for hunk in hunks:
+        old_start = max(1, int(hunk["old_start"]))
+        target_index = max(0, old_start - 1)
+        if target_index < cursor:
+            return None, "Error: overlapping hunks are not supported."
+        if target_index > len(original_lines):
+            return None, "Error: patch hunk starts past end of file."
+        out_lines.extend(original_lines[cursor:target_index])
+        cursor = target_index
+        for sign, text in hunk["lines"]:
+            if sign == " ":
+                if cursor >= len(original_lines) or original_lines[cursor] != text:
+                    return None, "Error: patch context does not match file contents."
+                out_lines.append(original_lines[cursor])
+                cursor += 1
+            elif sign == "-":
+                if cursor >= len(original_lines) or original_lines[cursor] != text:
+                    return None, "Error: patch removal does not match file contents."
+                cursor += 1
+            elif sign == "+":
+                out_lines.append(text)
+        # Ignore old/new counts; verified by context/removals above.
+    out_lines.extend(original_lines[cursor:])
+    return "".join(out_lines), None
+
+
+def _parse_unified_patch_text(patch_text):
+    """Parse a limited unified diff for text files.
+
+    Supports:
+    - one or more file sections
+    - ---/+++ headers
+    - @@ hunk headers
+    - added/removed/context lines
+    """
+    if not isinstance(patch_text, str) or not patch_text.strip():
+        return None, "Error: patch cannot be empty"
+    lines = patch_text.splitlines(keepends=True)
+    files = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith(("diff --git ", "index ", "new file mode ", "deleted file mode ")):
+            i += 1
+            continue
+        if not line.startswith("--- "):
+            i += 1
+            continue
+        if i + 1 >= len(lines) or not lines[i + 1].startswith("+++ "):
+            return None, "Error: malformed patch header"
+        old_path = _normalize_patch_target_path(line[4:])
+        new_path = _normalize_patch_target_path(lines[i + 1][4:])
+        if old_path == "/dev/null" and new_path == "/dev/null":
+            return None, "Error: patch cannot target /dev/null on both sides"
+        entry = {"old_path": old_path, "new_path": new_path, "hunks": []}
+        i += 2
+        while i < len(lines):
+            cur = lines[i]
+            if cur.startswith(("diff --git ", "--- ")):
+                break
+            if cur.startswith("@@"):
+                m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", cur)
+                if not m:
+                    return None, f"Error: invalid patch hunk header: {cur.strip()}"
+                hunk = {
+                    "old_start": int(m.group(1)),
+                    "old_count": int(m.group(2) or "1"),
+                    "new_start": int(m.group(3)),
+                    "new_count": int(m.group(4) or "1"),
+                    "lines": [],
+                }
+                i += 1
+                while i < len(lines):
+                    body = lines[i]
+                    if body.startswith(("diff --git ", "--- ", "@@")):
+                        break
+                    if body.startswith("\\ No newline at end of file"):
+                        i += 1
+                        continue
+                    if not body or body[0] not in (" ", "+", "-"):
+                        return None, f"Error: invalid patch body line: {body.rstrip()}"
+                    hunk["lines"].append((body[0], body[1:]))
+                    i += 1
+                entry["hunks"].append(hunk)
+                continue
+            i += 1
+        if not entry["hunks"]:
+            return None, f"Error: patch for {new_path or old_path} has no hunks"
+        files.append(entry)
+    if not files:
+        return None, "Error: no file sections found in patch"
+    return files, None
+
+
+_TOOL_EXECUTION_RWLOCK = ReadWriteLock()
+
+
 class WriteTool(Tool):
     name = "Write"
     description = """新規ファイルを作成する、または既存ファイルを全上書きする。
@@ -6331,6 +6517,7 @@ class WriteTool(Tool):
         },
         "required": ["file_path", "content"],
     }
+    lock_mode = "write"
 
     MAX_WRITE_SIZE = 10 * 1024 * 1024  # 10MB write size limit
 
@@ -6423,6 +6610,7 @@ class EditTool(Tool):
         },
         "required": ["file_path", "old_string", "new_string"],
     }
+    lock_mode = "write"
 
     def execute(self, params):
         file_path = params.get("file_path", "")
@@ -6553,6 +6741,120 @@ class EditTool(Tool):
             return f"Error writing file: {e}"
 
 
+class ApplyPatchTool(Tool):
+    name = "ApplyPatch"
+    description = (
+        "Apply a text patch across one or more files. "
+        "Accepts unified diff with ---/+++/@@ hunks. "
+        "Use this for coordinated multi-hunk edits that are harder to express with Edit."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "patch": {
+                "type": "string",
+                "description": "Unified diff patch text covering one or more files",
+            },
+        },
+        "required": ["patch"],
+    }
+    MAX_PATCH_SIZE = 512 * 1024
+    lock_mode = "write"
+
+    def _write_text(self, file_path, content):
+        dirname = os.path.dirname(file_path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=dirname or ".", suffix=".eve_tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+            os.replace(tmp_path, file_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def execute(self, params):
+        patch_text = params.get("patch", "")
+        if not isinstance(patch_text, str) or not patch_text.strip():
+            return "Error: patch cannot be empty"
+        if len(patch_text.encode("utf-8")) > self.MAX_PATCH_SIZE:
+            return f"Error: patch too large ({len(patch_text)} chars). Max {self.MAX_PATCH_SIZE} bytes."
+
+        parsed, parse_error = _parse_unified_patch_text(patch_text)
+        if parse_error:
+            return parse_error
+
+        operations = []
+        rollback = []
+        try:
+            for entry in parsed:
+                old_path = entry["old_path"]
+                new_path = entry["new_path"]
+                if old_path != "/dev/null" and new_path != "/dev/null" and old_path != new_path:
+                    return f"Error: rename patches are not supported ({old_path} -> {new_path})"
+                target_spec = new_path if new_path != "/dev/null" else old_path
+                require_exists = old_path != "/dev/null"
+                resolved_path, path_error = _resolve_repo_path(
+                    self._base_dir(), target_spec, require_exists=require_exists, path_label="file"
+                )
+                if path_error:
+                    if "symlink" in path_error.lower():
+                        return path_error.replace("access through", "patch through")
+                    return path_error
+                if _is_protected_path(resolved_path):
+                    return f"Error: patching {os.path.basename(resolved_path)} is blocked for security. Use the config system instead."
+
+                existed = os.path.exists(resolved_path)
+                if old_path == "/dev/null":
+                    if existed:
+                        return f"Error: patch expects a new file but it already exists: {target_spec}"
+                    original_text = ""
+                else:
+                    original_text, read_error = _read_text_file_for_patch(resolved_path)
+                    if read_error:
+                        return read_error
+
+                new_content, apply_error = _apply_unified_patch_to_text(original_text, entry["hunks"])
+                if apply_error:
+                    return f"{apply_error} ({target_spec})"
+                if new_path == "/dev/null" and new_content:
+                    return f"Error: delete patch for {target_spec} must remove all content before deleting the file"
+
+                rollback.append((resolved_path, existed, original_text if existed else None))
+                operations.append((resolved_path, old_path, new_path, new_content))
+
+            for resolved_path, old_path, new_path, new_content in operations:
+                if new_path == "/dev/null":
+                    os.unlink(resolved_path)
+                    continue
+                self._write_text(resolved_path, new_content)
+
+            parts = []
+            for resolved_path, old_path, new_path, new_content in operations:
+                if old_path == "/dev/null":
+                    action = "created"
+                elif new_path == "/dev/null":
+                    action = "deleted"
+                else:
+                    action = "patched"
+                parts.append(f"- {action}: {os.path.relpath(resolved_path, self._base_dir())}")
+            return f"Applied patch to {len(operations)} file(s)\n" + "\n".join(parts)
+        except Exception as e:
+            for resolved_path, existed, original_text in reversed(rollback):
+                try:
+                    if existed and original_text is not None:
+                        self._write_text(resolved_path, original_text)
+                    elif not existed and os.path.exists(resolved_path):
+                        os.unlink(resolved_path)
+                except Exception:
+                    pass
+            return f"Error applying patch: {e}"
+
+
 # Global configuration for parallel file operations
 _MAX_PARALLEL_FILES = 5  # Default max parallelism
 _SHOW_PROGRESS = True    # Show progress indicators
@@ -6586,6 +6888,7 @@ class MultiEditTool(Tool):
         },
         "required": ["edits"],
     }
+    lock_mode = "write"
 
     # Thread-safe locks for file operations
     _file_locks = {}
@@ -6701,6 +7004,8 @@ class MultiEditTool(Tool):
 
 class GlobTool(Tool):
     name = "Glob"
+    lock_mode = "read"
+    parallel_safe = True
     description = """ファイル名のパターン検索を行う。ワイルドカード（*、?）を使用してファイルを finding。
 
 使い方:
@@ -6824,6 +7129,8 @@ class GlobTool(Tool):
 
 class GrepTool(Tool):
     name = "Grep"
+    lock_mode = "read"
+    parallel_safe = True
     description = """ファイル内容を正規表現で検索する。一致した行とファイルパスを返す。
 
 重要:
@@ -7030,6 +7337,7 @@ class GrepTool(Tool):
 
 class WebFetchTool(Tool):
     name = "WebFetch"
+    lock_mode = "read"
     description = "Fetch content from a URL. Returns the text content of the page."
     parameters = {
         "type": "object",
@@ -7270,6 +7578,7 @@ class WebFetchTool(Tool):
 class WebSearchTool(Tool):
     """Web search via DuckDuckGo HTML endpoint."""
     name = "WebSearch"
+    lock_mode = "read"
     description = "Search the web using DuckDuckGo. Returns titles, URLs, and snippets."
     parameters = {
         "type": "object",
@@ -7403,6 +7712,7 @@ class WebSearchTool(Tool):
 
 class NotebookEditTool(Tool):
     name = "NotebookEdit"
+    lock_mode = "write"
     description = "Edit a Jupyter notebook (.ipynb) cell. Supports replace, insert, and delete."
     parameters = {
         "type": "object",
@@ -8481,7 +8791,7 @@ class SubAgentTool(Tool):
 
     The sub-agent runs its own agent loop with a separate conversation context.
     By default it only has access to read-only tools (Read, Glob, Grep,
-    WebFetch, WebSearch). Set allow_writes=true to grant Bash/Write/Edit.
+    WebFetch, WebSearch). Set allow_writes=true to grant Bash/Write/Edit/ApplyPatch.
     """
     name = "SubAgent"
     description = (
@@ -8494,7 +8804,7 @@ class SubAgentTool(Tool):
     # Read-only tools allowed by default
     READ_ONLY_TOOLS = frozenset({"Read", "Glob", "Grep", "WebFetch", "WebSearch"})
     # Additional tools when allow_writes is True
-    WRITE_TOOLS = frozenset({"Bash", "Write", "Edit"})
+    WRITE_TOOLS = frozenset({"Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"})
     NETWORK_TOOLS = frozenset({"WebFetch", "WebSearch"})
     # Hard cap on max_turns to prevent runaway loops
     HARD_MAX_TURNS = 20
@@ -8516,8 +8826,11 @@ class SubAgentTool(Tool):
             "Read": ReadTool,
             "Write": WriteTool,
             "Edit": EditTool,
+            "ApplyPatch": ApplyPatchTool,
+            "MultiEdit": MultiEditTool,
             "Glob": GlobTool,
             "Grep": GrepTool,
+            "NotebookEdit": NotebookEditTool,
         }
         tool_cls = cwd_aware.get(name)
         return tool_cls(cwd=cwd) if tool_cls else None
@@ -12322,7 +12635,7 @@ class ToolRegistry:
 
     def register_defaults(self):
         """Register all built-in tools."""
-        for cls in [BashTool, ReadTool, WriteTool, EditTool, MultiEditTool, GlobTool,
+        for cls in [BashTool, ReadTool, WriteTool, EditTool, ApplyPatchTool, MultiEditTool, GlobTool,
                     GrepTool, WebFetchTool, WebSearchTool, NotebookEditTool,
                     TaskCreateTool, TaskListTool, TaskGetTool, TaskUpdateTool,
                     AskUserQuestionTool, AskUserQuestionBatchTool]:
@@ -12351,6 +12664,9 @@ _ROUTE_RULES = {
     ],
     "Edit": [
         (r"\b(fix|change|update|modify|rename|refactor|patch)\b|修正|変更|更新|直して|リファクタ", 3, "targeted code change intent"),
+    ],
+    "ApplyPatch": [
+        (r"\b(apply patch|unified diff|diff patch|hunk)\b|パッチ|差分|unified diff", 5, "patch-based edit intent"),
     ],
     "MultiEdit": [
         (r"\b(across files|multiple files|bulk|many files)\b|複数ファイル|まとめて|一括", 4, "multi-file edit intent"),
@@ -12413,7 +12729,7 @@ def _score_tool_candidates(user_input, allowed_tool_names=None, plan_mode=False)
             entry["score"] += 2
             if "plan mode baseline" not in entry["reasons"]:
                 entry["reasons"].append("plan mode baseline")
-    if any(t in scored for t in ("Write", "Edit", "MultiEdit", "Bash")):
+    if any(t in scored for t in ("Write", "Edit", "ApplyPatch", "MultiEdit", "Bash")):
         for dep_tool, dep_reason in (("Read", "editing requires context"), ("Grep", "editing benefits from code search")):
             if allowed and dep_tool not in allowed:
                 continue
@@ -12648,6 +12964,7 @@ def _build_doctor_lines(config, client, registry, permissions, session, agent, h
         f"  notify_on:          {', '.join(config.notify_on)}",
         f"  approvals:          global={policy['global_tool_rules'] + policy['global_category_rules'] + policy['global_path_rules']} "
         f"project={policy['project_tool_rules'] + policy['project_category_rules'] + policy['project_path_rules']}",
+        f"  approval_stack:     {' > '.join(permissions.policy_precedence())}",
         f"  trusted_scopes:     {', '.join(trusted_scopes) if trusted_scopes else '(none)'}",
         f"  skills:             {len(skills)}",
         f"  skill_filters:      enable={len(config.skill_enable_patterns)} disable={len(config.skill_disable_patterns)}",
@@ -12662,6 +12979,12 @@ def _build_doctor_lines(config, client, registry, permissions, session, agent, h
     stop = getattr(agent, "_last_stop_reason", None)
     if stop:
         lines.append(f"  last_stop_reason:   {stop.get('reason')} ({stop.get('detail', '')})")
+    risk = getattr(permissions, "_last_risk", None)
+    if risk:
+        lines.append(
+            f"  last_risk:          {risk.get('level')} ({risk.get('source')}) score={risk.get('score', 0):.2f} "
+            f"{risk.get('reason', '')}"
+        )
     route = getattr(agent, "_last_route_report", None)
     if route:
         lines.append("")
@@ -12679,15 +13002,16 @@ class PermissionMgr:
 
     SAFE_TOOLS = {"Read", "Glob", "Grep", "SubAgent", "AskUserQuestion",
                    "TaskCreate", "TaskList", "TaskGet", "TaskUpdate"}
-    ASK_TOOLS = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"}
+    ASK_TOOLS = {"Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"}
     NETWORK_TOOLS = {"WebFetch", "WebSearch"}
 
-    _NO_PERSIST_ALLOW = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"}
-    _VALID_RULE_VALUES = {"allow", "deny"}
+    _NO_PERSIST_ALLOW = {"Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"}
+    _VALID_RULE_VALUES = {"allow", "deny", "prompt"}
     _TOOL_CATEGORIES = {
         "Bash": "shell",
         "Write": "write",
         "Edit": "write",
+        "ApplyPatch": "write",
         "MultiEdit": "write",
         "NotebookEdit": "write",
         "WebFetch": "network",
@@ -12713,6 +13037,7 @@ class PermissionMgr:
         self.rules = {}  # tool_name -> "allow" | "deny"
         self._session_allows = set()  # remembered "allow" decisions this session
         self._session_denies = set()  # remembered "deny" decisions this session
+        self._last_risk = None
         self._global_rules = {}
         self._project_rules = {}
         self._global_category_rules = {}
@@ -12915,6 +13240,102 @@ class PermissionMgr:
             return {"decision": self.rules[tool_name], "scope": "legacy", "tool": tool_name}
         return None
 
+    def policy_precedence(self):
+        return [
+            "session-deny",
+            "path-policy",
+            "category-policy",
+            "tool-policy",
+            "yes-mode",
+            "guardian-auto-mode",
+            "safe-tool",
+            "session-allow",
+            "interactive-prompt",
+            "default-deny",
+        ]
+
+    def _record_risk(self, level, score, reason, source):
+        self._last_risk = {
+            "level": level,
+            "score": float(score),
+            "reason": reason,
+            "source": source,
+        }
+        return self._last_risk
+
+    def _heuristic_risk(self, tool_name, params):
+        if tool_name in self.SAFE_TOOLS:
+            return self._record_risk("low", 0.05, f"{tool_name} is read-only or interaction-safe.", "heuristic")
+        if tool_name in self.NETWORK_TOOLS:
+            url = (params or {}).get("url", "")
+            reason = "Network access can reach external systems."
+            if isinstance(url, str) and url.startswith("http://"):
+                return self._record_risk("high", 0.8, "Plain HTTP URL increases network risk.", "heuristic")
+            return self._record_risk("medium", 0.55, reason, "heuristic")
+        if tool_name == "Bash":
+            cmd = ((params or {}).get("command", "") or "").strip()
+            if is_dangerous_command(cmd):
+                return self._record_risk("high", 0.95, "Command matches dangerous shell patterns.", "heuristic")
+            if re.search(r"\b(sudo|curl|wget|scp|ssh|npm\s+install|pip(?:3)?\s+install|brew\s+install|git\s+push)\b", cmd):
+                return self._record_risk("high", 0.82, "Command changes the system or reaches external services.", "heuristic")
+            if re.search(r"^\s*(ls|pwd|git\s+status|git\s+diff|python3?\s+-m\s+unittest)\b", cmd):
+                return self._record_risk("low", 0.28, "Command looks observational or repo-local.", "heuristic")
+            return self._record_risk("medium", 0.62, "Shell execution may mutate files or the environment.", "heuristic")
+        if tool_name in {"Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"}:
+            path = self._extract_candidate_path(params)
+            if path and _is_protected_path(path):
+                return self._record_risk("high", 0.92, "Target path is protected.", "heuristic")
+            if tool_name == "ApplyPatch":
+                patch_text = (params or {}).get("patch", "") or ""
+                file_headers = len(re.findall(r"^--- ", patch_text, re.MULTILINE))
+                if file_headers >= 4:
+                    return self._record_risk("high", 0.84, "Patch touches many files.", "heuristic")
+                if len(patch_text) > 50_000:
+                    return self._record_risk("medium", 0.68, "Patch is large and should be reviewed.", "heuristic")
+            if tool_name == "MultiEdit":
+                edits = (params or {}).get("edits", []) or []
+                if len(edits) >= 4:
+                    return self._record_risk("high", 0.8, "MultiEdit touches many files.", "heuristic")
+            return self._record_risk("medium", 0.6, "File modifications should be confirmed.", "heuristic")
+        return self._record_risk("medium", 0.5, "Tool has side effects or unknown safety profile.", "heuristic")
+
+    def assess_risk(self, tool_name, params):
+        heuristic = self._heuristic_risk(tool_name, params)
+        sidecar = self._classify_with_sidecar(tool_name, params)
+        if sidecar is not None:
+            return sidecar
+        return heuristic
+
+    def _prompt_for_permission(self, tool_name, params, tui, *, prompt_reason=""):
+        risk = self.assess_risk(tool_name, params)
+        if not tui:
+            self._set_last_decision(False, "default-deny", f"{tool_name} requires approval and no TUI is available.", "runtime")
+            return False
+        result = tui.ask_permission(tool_name, params, risk=risk, reason=prompt_reason)
+        if result == "yes_mode":
+            self.yes_mode = True
+            self._set_last_decision(True, "prompt", f"User enabled yes_mode while approving {tool_name}.", "session", record_event=True)
+            return True
+        if result == "allow_all":
+            self.session_allow(tool_name)
+            self._set_last_decision(True, "prompt", f"User allowed {tool_name} for the rest of the session.", "session", record_event=True)
+            return True
+        if result == "prompt_all":
+            self._global_rules[tool_name] = "prompt"
+            self._merge_visible_rules()
+            self._save_rules()
+            self._set_last_decision(True, "prompt", f"User persisted prompt policy for {tool_name}.", "persistent", record_event=True)
+            return True
+        if result == "deny_all":
+            self._session_denies.add(tool_name)
+            self._global_rules[tool_name] = "deny"
+            self._merge_visible_rules()
+            self._save_rules()
+            self._set_last_decision(False, "prompt", f"User denied {tool_name} and persisted the deny rule.", "persistent", record_event=True)
+            return False
+        self._set_last_decision(bool(result), "prompt", f"User {'approved' if result else 'denied'} {tool_name}.", "session", record_event=not result)
+        return bool(result)
+
     def check(self, tool_name, params, tui=None):
         """Check if tool execution is allowed. Returns True to proceed."""
         # Session-level deny takes priority
@@ -12928,38 +13349,41 @@ class PermissionMgr:
             for pat in self._ALWAYS_CONFIRM_PATTERNS:
                 if re.search(pat, cmd, re.IGNORECASE):
                     if tui:
-                        result = tui.ask_permission(tool_name, params)
-                        if result == "yes_mode":
-                            self.yes_mode = True
-                            return True
-                        if result == "allow_all":
-                            self._set_last_decision(True, "prompt", f"User approved dangerous Bash command: {cmd[:120]}", "session", record_event=True)
-                            return True
-                        if result == "deny_all":
-                            self._session_denies.add(tool_name)
-                            self._global_rules[tool_name] = "deny"
-                            self._merge_visible_rules()
-                            self._save_rules()
-                            self._set_last_decision(False, "prompt", f"User denied dangerous Bash command: {cmd[:120]}", "persistent", record_event=True)
-                            return False
-                        self._set_last_decision(bool(result), "prompt", f"Dangerous Bash command requires confirmation: {cmd[:120]}", "session", record_event=not result)
-                        return result
+                        return self._prompt_for_permission(
+                            tool_name, params, tui,
+                            prompt_reason=f"Dangerous Bash command requires confirmation: {cmd[:120]}",
+                        )
                     self._set_last_decision(False, "dangerous-bash", f"Dangerous Bash command blocked without TUI: {cmd[:120]}", "runtime", record_event=True)
                     return False
         path_rule = self._match_path_rule(tool_name, params)
         if path_rule:
+            if path_rule["decision"] == "prompt":
+                return self._prompt_for_permission(
+                    tool_name, params, tui,
+                    prompt_reason=f"Matched {path_rule['scope']} path rule prompt for {path_rule['path']}",
+                )
             allowed = path_rule["decision"] == "allow"
             message = f"Matched {path_rule['scope']} path rule {path_rule['decision']} for {path_rule['path']}"
             self._set_last_decision(allowed, "path-policy", message, path_rule["scope"], rule=path_rule, record_event=not allowed)
             return allowed
         category_rule = self._match_category_rule(tool_name)
         if category_rule:
+            if category_rule["decision"] == "prompt":
+                return self._prompt_for_permission(
+                    tool_name, params, tui,
+                    prompt_reason=f"Matched {category_rule['scope']} category rule prompt for {category_rule['category']}",
+                )
             allowed = category_rule["decision"] == "allow"
             message = f"Matched {category_rule['scope']} category rule {category_rule['decision']} for {category_rule['category']}"
             self._set_last_decision(allowed, "category-policy", message, category_rule["scope"], rule=category_rule, record_event=not allowed)
             return allowed
         tool_rule = self._match_tool_rule(tool_name)
         if tool_rule:
+            if tool_rule["decision"] == "prompt":
+                return self._prompt_for_permission(
+                    tool_name, params, tui,
+                    prompt_reason=f"Matched {tool_rule['scope']} tool rule prompt for {tool_name}",
+                )
             allowed = tool_rule["decision"] == "allow"
             message = f"Matched {tool_rule['scope']} tool rule {tool_rule['decision']} for {tool_name}"
             self._set_last_decision(allowed, "tool-policy", message, tool_rule["scope"], rule=tool_rule, record_event=not allowed)
@@ -12970,13 +13394,17 @@ class PermissionMgr:
         # Auto mode: use sidecar model to classify tool calls
         if self.auto_mode and tool_name not in self.SAFE_TOOLS:
             if tool_name in self.ASK_TOOLS or tool_name in self.NETWORK_TOOLS:
-                allowed, reason = self._classify_with_sidecar(tool_name, params)
-                if allowed is not None:
-                    action = "auto-allowed" if allowed else "auto-denied"
-                    self._set_last_decision(allowed, "auto-mode",
-                        f"[auto] {tool_name}: {reason}" if reason else f"[auto] {tool_name}: {action}",
+                risk = self.assess_risk(tool_name, params)
+                if risk["level"] == "low":
+                    self._set_last_decision(True, "auto-mode",
+                        f"[guardian] {tool_name}: low risk ({risk['reason']})",
                         "session")
-                    return allowed
+                    return True
+                if risk["level"] == "high":
+                    self._set_last_decision(False, "auto-mode",
+                        f"[guardian] {tool_name}: high risk ({risk['reason']})",
+                        "session")
+                    return False
                 # Sidecar unavailable — fall through to user prompt
         if tool_name in self.SAFE_TOOLS:
             self._set_last_decision(True, "safe-tool", f"{tool_name} is always allowed.", "runtime")
@@ -12995,44 +13423,30 @@ class PermissionMgr:
                 return False  # Unknown tools denied without TUI
 
         # Ask user (network tools shown with extra context)
-        if tui:
-            result = tui.ask_permission(tool_name, params)
-            if result == "yes_mode":
-                self.yes_mode = True
-                self._set_last_decision(True, "prompt", f"User enabled yes_mode while approving {tool_name}.", "session", record_event=True)
-                return True
-            if result == "allow_all":
-                self.session_allow(tool_name)
-                self._set_last_decision(True, "prompt", f"User allowed {tool_name} for the rest of the session.", "session", record_event=True)
-                return True
-            if result == "deny_all":
-                self._session_denies.add(tool_name)
-                self._global_rules[tool_name] = "deny"
-                self._merge_visible_rules()
-                self._save_rules()
-                self._set_last_decision(False, "prompt", f"User denied {tool_name} and persisted the deny rule.", "persistent", record_event=True)
-                return False
-            self._set_last_decision(bool(result), "prompt", f"User {'approved' if result else 'denied'} {tool_name}.", "session", record_event=not result)
-            return result
-        self._set_last_decision(False, "default-deny", f"{tool_name} requires approval and no TUI is available.", "runtime")
-        return False  # Default deny when no TUI (safety)
+        return self._prompt_for_permission(tool_name, params, tui)
 
     def _save_rules(self):
         try:
             os.makedirs(os.path.dirname(self._permissions_path), exist_ok=True)
             with open(self._permissions_path, "w", encoding="utf-8") as f:
-                payload = self._global_rules if self._global_rules else self.rules
+                if self._global_category_rules or self._global_path_rules:
+                    payload = {}
+                    if self._global_rules:
+                        payload["tools"] = self._global_rules
+                    if self._global_category_rules:
+                        payload["categories"] = self._global_category_rules
+                    if self._global_path_rules:
+                        payload["paths"] = self._global_path_rules
+                else:
+                    payload = self._global_rules if self._global_rules else self.rules
                 json.dump(payload, f, indent=2, ensure_ascii=False)
         except OSError:
             pass
 
     def _classify_with_sidecar(self, tool_name, params):
-        """Use sidecar model to classify a tool call as safe or unsafe.
-
-        Returns (allowed: bool, reason: str) or (None, "") if sidecar unavailable.
-        """
+        """Use sidecar model to classify a tool call into risk bands."""
         if not self._sidecar_client or not self._sidecar_model:
-            return None, ""
+            return None
         # Build compact param summary (truncate for speed)
         param_str = json.dumps(params, ensure_ascii=False)
         if len(param_str) > 500:
@@ -13040,12 +13454,11 @@ class PermissionMgr:
         classify_prompt = [
             {"role": "system", "content": (
                 "You are a security classifier for CLI tool calls.\n"
-                "Classify as ALLOW or DENY.\n"
-                "ALLOW = read-only, non-destructive, clearly benign operations "
-                "(e.g. listing files, reading content, searching, simple writes to non-critical files)\n"
-                "DENY = destructive, critical system file modification, package install with sudo, "
-                "sensitive data access, network calls to unknown hosts\n"
-                "First line: ALLOW or DENY\n"
+                "Classify as LOW, MEDIUM, or HIGH risk.\n"
+                "LOW = read-only, non-destructive, clearly benign repo-local operations.\n"
+                "MEDIUM = normal file edits, ordinary network reads, or commands that should still be reviewed.\n"
+                "HIGH = destructive commands, sensitive data access, privileged system changes, or risky network activity.\n"
+                "First line: LOW, MEDIUM, or HIGH\n"
                 "Second line: one-sentence reason"
             )},
             {"role": "user", "content": f"Tool: {tool_name}\nArguments: {param_str}"},
@@ -13065,20 +13478,22 @@ class PermissionMgr:
             if not content:
                 content = resp.get("message", {}).get("content", "")
             if not content:
-                return None, ""
+                return None
             # Strip <think> blocks (Qwen reasoning traces)
             content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
             lines = content.strip().split("\n", 1)
             decision_word = lines[0].strip().upper()
             reason = lines[1].strip() if len(lines) > 1 else ""
-            if "ALLOW" in decision_word:
-                return True, reason
-            elif "DENY" in decision_word:
-                return False, reason
+            if "LOW" in decision_word:
+                return self._record_risk("low", 0.2, reason or "Sidecar marked the tool call as low risk.", "guardian")
+            if "MEDIUM" in decision_word:
+                return self._record_risk("medium", 0.55, reason or "Sidecar marked the tool call as medium risk.", "guardian")
+            if "HIGH" in decision_word:
+                return self._record_risk("high", 0.9, reason or "Sidecar marked the tool call as high risk.", "guardian")
             # Ambiguous response — treat as unavailable
-            return None, ""
+            return None
         except Exception:
-            return None, ""
+            return None
 
     def session_allow(self, tool_name):
         """Allow a tool for the rest of this session, and persist if safe."""
@@ -14808,6 +15223,10 @@ class TUI:
         self.is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
         self._is_cjk = self._detect_cjk_locale()
         self.scroll_region = ScrollRegion()
+        self._typeahead_lock = threading.Lock()
+        self._queued_inputs = collections.deque()
+        self._typeahead_partial = ""
+        self._typeahead_decoder = codecs.getincrementaldecoder("utf-8")("ignore")
 
         try:
             self._term_cols = shutil.get_terminal_size((80, 24)).columns
@@ -15042,13 +15461,44 @@ class TUI:
             pass
         return False
 
-    def _typeahead_buffer(self):
-        """Buffer for Type-ahead input during AI response.
-        
-        Stores user input typed while AI is responding.
-        Cleared after response completes.
-        """
-        return []
+    def queue_typeahead_bytes(self, data):
+        """Collect simple queued input while the assistant is streaming."""
+        if not data:
+            return
+        if isinstance(data, bytes):
+            text = self._typeahead_decoder.decode(data, final=False)
+        else:
+            text = str(data)
+        if not text:
+            return
+        with self._typeahead_lock:
+            for ch in text:
+                if ch in ("\r", "\n"):
+                    if self._typeahead_partial.strip():
+                        self._queued_inputs.append(self._typeahead_partial.strip())
+                    self._typeahead_partial = ""
+                elif ch in ("\x7f", "\b"):
+                    self._typeahead_partial = self._typeahead_partial[:-1]
+                elif ch.isprintable() or ch == "\t":
+                    if len(self._typeahead_partial) < 4000:
+                        self._typeahead_partial += ch
+
+    def dequeue_typeahead_input(self):
+        with self._typeahead_lock:
+            if self._queued_inputs:
+                return self._queued_inputs.popleft()
+            return None
+
+    def consume_typeahead_prefill(self):
+        with self._typeahead_lock:
+            prefill = self._typeahead_partial
+            self._typeahead_partial = ""
+            if prefill:
+                try:
+                    self._typeahead_decoder.reset()
+                except Exception:
+                    pass
+            return prefill
 
     def get_input(self, session=None, plan_mode=False, prefill=""):
         """Get a single line of user input with full readline support.
@@ -15074,15 +15524,32 @@ class TUI:
 
             # Type-ahead: prefill with buffered input if available
             if prefill:
-                # Prefill is handled by readline (not implemented here for simplicity)
-                pass
+                if HAS_READLINE and self.is_interactive:
+                    def _prefill_hook():
+                        try:
+                            readline.insert_text(prefill)
+                            readline.redisplay()
+                        finally:
+                            readline.set_pre_input_hook(None)
+                    readline.set_pre_input_hook(_prefill_hook)
 
             line = input(prompt_str)
 
             return _strip_shift_enter_garbage(line)
         except (EOFError, KeyboardInterrupt):
             print()
+            if HAS_READLINE:
+                try:
+                    readline.set_pre_input_hook(None)
+                except Exception:
+                    pass
             return None
+        finally:
+            if HAS_READLINE:
+                try:
+                    readline.set_pre_input_hook(None)
+                except Exception:
+                    pass
 
     def get_multiline_input(self, session=None, plan_mode=False, prefill=""):
         """Get potentially multi-line input.
@@ -15145,7 +15612,7 @@ class TUI:
             # Scroll region stays active — no teardown/setup needed.
             pass
 
-    def stream_response(self, response_iter, known_tools=None):
+    def stream_response(self, response_iter, known_tools=None, interrupt_monitor=None):
         """Stream LLM response to terminal. Returns (text, tool_calls).
 
         Handles both text content and tool_call deltas from streaming responses.
@@ -15197,8 +15664,7 @@ class TUI:
             choice = chunk.get("choices", [{}])[0]
             delta = choice.get("delta", {})
 
-            # TUI 機能強化：ESC キー検出で中断
-            if self._check_esc_key():
+            if interrupt_monitor is not None and getattr(interrupt_monitor, "pressed", False):
                 _clear_thinking_status()
                 self._scroll_print(f"\n{C.DIM}(ESC で中断しました){C.RESET}")
                 break
@@ -15722,6 +16188,7 @@ class TUI:
             "Read": ("📄", _ansi("\033[38;5;87m")),
             "Write": ("✏️ ", _ansi("\033[38;5;198m")),
             "Edit": ("📝", _ansi("\033[38;5;208m")),
+            "ApplyPatch": ("🧩", _ansi("\033[38;5;214m")),
             "MultiEdit": ("📝", _ansi("\033[38;5;208m")),
             "Glob": ("🔍", _ansi("\033[38;5;51m")),
             "Grep": ("🔎", _ansi("\033[38;5;39m")),
@@ -15790,6 +16257,20 @@ class TUI:
                     break
                 _p(f"  {_dg}  + {ln[:100]}{C.RESET}")
                 shown += 1
+        elif name == "ApplyPatch":
+            patch_text = params.get("patch", "")
+            parsed, _ = _parse_unified_patch_text(patch_text)
+            touched = []
+            if parsed:
+                for entry in parsed[:5]:
+                    target = entry["new_path"] if entry["new_path"] != "/dev/null" else entry["old_path"]
+                    touched.append(target)
+            _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} "
+               f"{C.WHITE}{len(parsed or [])} file patches{C.RESET}")
+            for target in touched:
+                _p(f"  {_ansi(chr(27)+'[38;5;240m')}  {target}{C.RESET}")
+            if len(parsed or []) > 5:
+                _p(f"  {_ansi(chr(27)+'[38;5;240m')}  ... +{len(parsed)-5} more{C.RESET}")
         elif name == "MultiEdit":
             edits = params.get("edits", [])
             _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}\u2192{C.RESET} {C.WHITE}{len(edits)} edits{C.RESET}")
@@ -15867,6 +16348,9 @@ class TUI:
             elif name in ("Write", "Edit"):
                 fp = params.get("file_path", "")
                 key_arg = f" {os.path.basename(fp)}" if fp else ""
+            elif name == "ApplyPatch":
+                parsed, _ = _parse_unified_patch_text(params.get("patch", ""))
+                key_arg = f" {len(parsed or [])} file(s)"
             elif name == "MultiEdit":
                 edits = params.get("edits", [])
                 key_arg = f" {len(edits)} edits"
@@ -15945,7 +16429,7 @@ class TUI:
                 remaining = line_count - max_detail
                 _p(f"{detail_marker} {_ansi(chr(27)+'[38;5;245m')}  \u2195 {remaining} more lines{C.RESET}")
 
-    def ask_permission(self, tool_name, params):
+    def ask_permission(self, tool_name, params, risk=None, reason=""):
         """Ask user for permission — Claude Code style prompt."""
         icon, color = self._tool_icons().get(tool_name, ("🔧", C.YELLOW))
 
@@ -15991,6 +16475,21 @@ class TUI:
                     detail_extra.append(f"{_dg}+ {ln[:100]}{C.RESET}")
                 if new_s.count("\n") >= 8:
                     detail_extra.append(f"{_dg}  ... ({new_count} lines total){C.RESET}")
+        elif tool_name == "ApplyPatch":
+            parsed, _ = _parse_unified_patch_text(params.get("patch", ""))
+            detail = f"{len(parsed or [])} file(s)"
+            for entry in (parsed or [])[:6]:
+                target = entry["new_path"] if entry["new_path"] != "/dev/null" else entry["old_path"]
+                detail_extra.append(f"{C.DIM}  • {target}{C.RESET}")
+            if len(parsed or []) > 6:
+                detail_extra.append(f"{C.DIM}  ... +{len(parsed)-6} more{C.RESET}")
+        elif tool_name == "MultiEdit":
+            edits = params.get("edits", [])
+            detail = f"{len(edits)} edit(s)"
+            for edit in edits[:6]:
+                detail_extra.append(f"{C.DIM}  • {edit.get('file_path', '')}{C.RESET}")
+            if len(edits) > 6:
+                detail_extra.append(f"{C.DIM}  ... +{len(edits)-6} more{C.RESET}")
         elif tool_name == "Write":
             detail = params.get("file_path", "")
             content = params.get("content", "")
@@ -16015,19 +16514,14 @@ class TUI:
         elif tool_name == "Edit":
             command_str = params.get("file_path", "")
 
-        # Determine warning color and text based on risk level
-        if tool_name == "Bash" and is_dangerous_command(command_str):
-            warning_color = _ansi("\033[38;5;196m")  # Red
-            warning_icon = "⚠️"
-            warning_title = "[高リスク]"
-            warning_message = "このコマンドは破壊的な操作を含む可能性があります。"
-            warning_sub = "実行内容を十分に確認してから許可してください。"
-        else:
-            warning_color = _ansi("\033[38;5;226m")  # Yellow
-            warning_icon = "⚡"
-            warning_title = "[注意]"
-            warning_message = "AI がファイルを変更・コマンドを実行します。"
-            warning_sub = "内容を確認してから許可してください。"
+        risk = risk or {"level": "medium", "score": 0.5, "reason": ""}
+        level = risk.get("level", "medium")
+        level_map = {
+            "low": (_ansi("\033[38;5;46m"), "✓", "[低リスク]", "影響範囲は限定的です。", "そのまま許可してもよい操作です。"),
+            "medium": (_ansi("\033[38;5;226m"), "⚡", "[中リスク]", "変更や外部アクセスを伴います。", "内容を確認してから許可してください。"),
+            "high": (_ansi("\033[38;5;196m"), "⚠️", "[高リスク]", "破壊的または機微な操作の可能性があります。", "実行内容を十分に確認してから許可してください。"),
+        }
+        warning_color, warning_icon, warning_title, warning_message, warning_sub = level_map.get(level, level_map["medium"])
 
         # Box-style permission prompt (Japanese display text, English keys retained)
         _y = _ansi("\033[38;5;226m")
@@ -16050,9 +16544,12 @@ class TUI:
         # Show risk warning
         print(f"  {_y}│{C.RESET} {warning_color}{warning_icon} {warning_title} {warning_message}{C.RESET}")
         print(f"  {_y}│{C.RESET} {warning_color}   {warning_sub}{C.RESET}")
+        risk_reason = reason or risk.get("reason", "")
+        if risk_reason:
+            print(f"  {_y}│{C.RESET} {C.DIM}   {risk_reason[:160]}{C.RESET}")
         print(f"  {_y}│{C.RESET}")
-        persist_hint = " (保存)" if tool_name not in {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"} else ""
-        print(f"  {_y}│{C.RESET}  [y] 一度許可   [a] 常に許可{persist_hint}")
+        persist_hint = " (保存)" if tool_name not in {"Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"} else ""
+        print(f"  {_y}│{C.RESET}  [y] 一度許可   [a] 常に許可{persist_hint}   [p] 常に確認")
         print(f"  {_y}│{C.RESET}  [n] 拒否 (Enter)  [d] 常に拒否   [Y] 全て自動許可")
         print(f"  {_y}╰{'─' * box_w}{C.RESET}")
         try:
@@ -16068,6 +16565,8 @@ class TUI:
             return True
         elif reply_lower in ("a", "all", "always", "常に", "いつも"):
             return "allow_all"
+        elif reply_lower in ("p", "prompt", "確認"):
+            return "prompt_all"
         elif reply_lower in ("d", "deny", "いいえ", "拒否"):
             return "deny_all"
         else:
@@ -16282,7 +16781,7 @@ class TUI:
   {_c198}--headless{C.RESET}         CI/CD mode (no TUI, requires -p)
   {_c198}--channels X{C.RESET}       Enable channels (discord, slack, webhook)
   {_c51}━━ Tools {sep[8:]}{C.RESET}
-  {_c87}Bash, Read, Write, Edit, MultiEdit,{C.RESET}
+  {_c87}Bash, Read, Write, Edit, ApplyPatch, MultiEdit,{C.RESET}
   {_c87}Glob, Grep, WebFetch, WebSearch,{C.RESET}
   {_c87}NotebookEdit, SubAgent, ParallelAgents,{C.RESET}
   {_c87}AskUserQuestion/Batch, MCP tools{C.RESET}
@@ -16393,7 +16892,7 @@ class Agent:
     HARD_MAX_ITERATIONS = Config.HARD_MAX_AGENT_STEPS
     MAX_RETRIES = 2      # retries for malformed LLM responses
     MAX_SAME_TOOL_REPEAT = 5  # prevent infinite same-tool loops (5 allows thinking models to re-verify)
-    PARALLEL_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep"})  # read-only, no side effects
+    PARALLEL_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep"})  # backward-compatible fallback
 
     # Tools allowed in plan mode (read-only exploration + task tracking)
     PLAN_MODE_TOOLS = {
@@ -16406,7 +16905,7 @@ class Agent:
     }
 
     # Tools allowed in act mode only (write/modify tools)
-    ACT_ONLY_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit"}
+    ACT_ONLY_TOOLS = {"Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"}
 
     def __init__(self, config, client, registry, permissions, session, tui,
                  rag_engine=None, hook_mgr=None, code_intel=None,
@@ -16614,6 +17113,17 @@ class Agent:
             if schema.get("function", {}).get("name") in allowed_names
         ]
 
+    def _is_parallel_safe_tool(self, tool):
+        if tool is None:
+            return False
+        return bool(getattr(tool, "parallel_safe", False) or getattr(tool, "name", "") in self.PARALLEL_SAFE_TOOLS)
+
+    def _tool_lock_context(self, tool):
+        lock_mode = getattr(tool, "execution_lock", lambda: getattr(tool, "lock_mode", "write"))()
+        if lock_mode == "read":
+            return _TOOL_EXECUTION_RWLOCK.read()
+        return _TOOL_EXECUTION_RWLOCK.write()
+
     def _set_stop_reason(self, reason, detail=""):
         payload = {"reason": reason, "detail": detail or ""}
         self._last_stop_reason = payload
@@ -16733,7 +17243,7 @@ class Agent:
             self.tui.scroll_region.update_mode_display(f"Model: {self.config.model}")
 
         # ESC key monitor for real-time interrupt
-        _esc_monitor = InputMonitor()
+        _esc_monitor = InputMonitor(on_typeahead=self.tui.queue_typeahead_bytes)
         _esc_monitor.start()
 
         for iteration in range(self.max_iterations):
@@ -16822,7 +17332,9 @@ class Agent:
                     _had_thinking = False
                     try:
                         text, tool_calls, _had_thinking = self.tui.stream_response(
-                            response, known_tools=self.registry.names()
+                            response,
+                            known_tools=self.registry.names(),
+                            interrupt_monitor=_esc_monitor,
                         )
                     finally:
                         if hasattr(response, 'close'):
@@ -17072,7 +17584,7 @@ class Agent:
                 # Phase 3: Execute — parallel for read-only tools, sequential otherwise
                 all_parallel_safe = (
                     len(validated_calls) > 1
-                    and all(name in self.PARALLEL_SAFE_TOOLS for _, name, _, _ in validated_calls)
+                    and all(self._is_parallel_safe_tool(tool) for _, _, _, tool in validated_calls)
                 )
 
                 if all_parallel_safe:
@@ -17085,7 +17597,8 @@ class Agent:
                         tc_id, tool_name, tool_params, tool = item
                         try:
                             _t0 = time.time()
-                            output = tool.execute(tool_params)
+                            with self._tool_lock_context(tool):
+                                output = tool.execute(tool_params)
                             _parallel_durations[tc_id] = time.time() - _t0
                             return ToolResult(tc_id, output)
                         except Exception as e:
@@ -17134,24 +17647,42 @@ class Agent:
                         if self._interrupted.is_set() or _esc_monitor.pressed:
                             break
                         try:
+                            tracked_paths = []
                             tracked_path = None
                             if tool_name == "Write":
                                 tracked_path = tool_params.get("file_path", "")
                             elif tool_name == "Edit":
                                 tracked_path = tool_params.get("file_path", "")
+                            elif tool_name == "ApplyPatch":
+                                parsed_patch, _patch_error = _parse_unified_patch_text(tool_params.get("patch", ""))
+                                if parsed_patch:
+                                    for _entry in parsed_patch:
+                                        _target = _entry["new_path"] if _entry["new_path"] != "/dev/null" else _entry["old_path"]
+                                        if _target:
+                                            tracked_paths.append(_target)
+                            elif tool_name == "MultiEdit":
+                                tracked_paths.extend(e.get("file_path", "") for e in tool_params.get("edits", []) if e.get("file_path"))
                             elif tool_name == "NotebookEdit":
                                 tracked_path = tool_params.get("notebook_path", "")
                             if tracked_path and not os.path.isabs(tracked_path):
                                 tracked_path = os.path.join(os.getcwd(), tracked_path)
+                            if tracked_path:
+                                tracked_paths.append(tracked_path)
+                            tracked_paths = [p for p in tracked_paths if p]
+                            tracked_paths = [
+                                p if os.path.isabs(p) else os.path.join(os.getcwd(), p)
+                                for p in tracked_paths
+                            ]
                             tracked_exists = bool(tracked_path and os.path.exists(tracked_path))
 
                             # Git checkpoint before write/edit operations
-                            if tool_name in ("Write", "Edit", "NotebookEdit") and self.git_checkpoint._is_git_repo:
+                            if tracked_paths and self.git_checkpoint._is_git_repo:
                                 self.git_checkpoint.create(f"before-{tool_name.lower()}")
 
                             self.tui.start_tool_status(tool_name)
                             _tool_t0 = time.time()
-                            output = tool.execute(tool_params)
+                            with self._tool_lock_context(tool):
+                                output = tool.execute(tool_params)
                             _tool_dur = time.time() - _tool_t0
                             self.tui.stop_spinner()
                             _is_err = isinstance(output, str) and (
@@ -17171,14 +17702,15 @@ class Agent:
                             if self.hook_mgr and self.hook_mgr.has_hooks:
                                 self.hook_mgr.fire_post_tool(tool_name, output, _is_err)
 
-                            if tracked_path and not _is_err and tool_name in ("Write", "Edit", "NotebookEdit"):
-                                if tool_name == "Write":
-                                    action = "write" if tracked_exists else "create"
-                                elif tool_name == "NotebookEdit":
-                                    action = "notebook"
-                                else:
-                                    action = "edit"
-                                self.change_tracker.record(action, tracked_path)
+                            if tracked_paths and not _is_err:
+                                for _tracked in tracked_paths:
+                                    if tool_name == "Write":
+                                        action = "write" if tracked_exists else "create"
+                                    elif tool_name == "NotebookEdit":
+                                        action = "notebook"
+                                    else:
+                                        action = "edit"
+                                    self.change_tracker.record(action, _tracked)
 
                             # Detect plan file creation
                             if tool_name == "Write" and self._plan_mode and not _is_err:
@@ -17191,12 +17723,12 @@ class Agent:
                                     pass
 
                             # Refresh file watcher snapshot after writes
-                            if tool_name in ("Write", "Edit", "NotebookEdit") and self.file_watcher.enabled:
+                            if tracked_paths and self.file_watcher.enabled:
                                 self.file_watcher.refresh_snapshot()
 
                             # Auto test after file modifications
-                            if tool_name in ("Write", "Edit", "NotebookEdit") and self.auto_test.enabled:
-                                fpath = tracked_path
+                            if tracked_paths and self.auto_test.enabled:
+                                fpath = tracked_paths[0]
                                 if fpath:
                                     verifier_desc = self.auto_test.describe()
                                     verifier_cmd = verifier_desc.get("test") or verifier_desc.get("lint") or ""
@@ -18648,10 +19180,18 @@ def main():
                 if not _ch_ready:
                     continue  # no user input yet; loop back to poll channels
 
-            user_input = tui.get_multiline_input(
-                session=session, plan_mode=agent._plan_mode,
-            )
+            queued_input = tui.dequeue_typeahead_input()
+            if queued_input is not None:
+                user_input = queued_input
+                print(f"{C.DIM}[queued] {queued_input}{C.RESET}")
+            else:
+                prefill = tui.consume_typeahead_prefill()
+                user_input = tui.get_multiline_input(
+                    session=session, plan_mode=agent._plan_mode, prefill=prefill,
+                )
 
+            if user_input is None:
+                continue
             user_input = user_input.strip()
             if not user_input:
                 continue

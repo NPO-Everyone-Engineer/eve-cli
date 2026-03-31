@@ -23,7 +23,7 @@ spec.loader.exec_module(eve_coder)
 PermissionMgr = eve_coder.PermissionMgr
 
 
-def _make_config(tmpdir, yes_mode=False, rules=None):
+def _make_config(tmpdir, yes_mode=False, rules=None, auto_mode=False):
     """Create a mock Config with a temporary permissions file."""
     perm_file = os.path.join(tmpdir, "permissions.json")
     if rules is not None:
@@ -31,6 +31,7 @@ def _make_config(tmpdir, yes_mode=False, rules=None):
             json.dump(rules, f)
     return SimpleNamespace(
         yes_mode=yes_mode,
+        auto_mode=auto_mode,
         permissions_file=perm_file,
         cwd=tmpdir,
         config_dir=tmpdir,
@@ -259,6 +260,20 @@ class TestPermissionMgrStructuredPolicies(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("category rule deny", mgr.describe_last_decision())
 
+    def test_project_tool_prompt_rule_overrides_yes_mode(self):
+        project_dir = os.path.join(self.tmpdir, ".eve-cli")
+        os.makedirs(project_dir, exist_ok=True)
+        with open(os.path.join(project_dir, "permissions.json"), "w", encoding="utf-8") as f:
+            json.dump({"tools": {"WebFetch": "prompt"}}, f)
+        cfg = _make_config(self.tmpdir, yes_mode=True)
+        _trust_project_permissions(cfg)
+        mgr = PermissionMgr(cfg)
+
+        tui = SimpleNamespace(ask_permission=lambda *args, **kwargs: False)
+        allowed = mgr.check("WebFetch", {"url": "https://example.com"}, tui=tui)
+        self.assertFalse(allowed)
+        self.assertIn("denied", mgr.describe_last_decision())
+
     def test_policy_summary_counts_project_rules(self):
         project_dir = os.path.join(self.tmpdir, ".eve-cli")
         os.makedirs(project_dir, exist_ok=True)
@@ -330,6 +345,10 @@ class TestPermissionMgrSessionAllowDeny(unittest.TestCase):
         self.mgr.session_allow("Edit")
         self.assertNotIn("Edit", self.mgr.rules)
 
+    def test_session_allow_does_not_persist_for_apply_patch(self):
+        self.mgr.session_allow("ApplyPatch")
+        self.assertNotIn("ApplyPatch", self.mgr.rules)
+
     def test_session_allow_does_not_persist_for_multiedit(self):
         self.mgr.session_allow("MultiEdit")
         self.assertNotIn("MultiEdit", self.mgr.rules)
@@ -369,7 +388,7 @@ class TestPermissionMgrClassConstants(unittest.TestCase):
     """Tests for class-level constants."""
 
     def test_ask_tools(self):
-        expected = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"}
+        expected = {"Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"}
         self.assertEqual(PermissionMgr.ASK_TOOLS, expected)
 
     def test_network_tools(self):
@@ -377,8 +396,41 @@ class TestPermissionMgrClassConstants(unittest.TestCase):
         self.assertEqual(PermissionMgr.NETWORK_TOOLS, expected)
 
     def test_no_persist_allow(self):
-        expected = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"}
+        expected = {"Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"}
         self.assertEqual(PermissionMgr._NO_PERSIST_ALLOW, expected)
+
+
+class TestPermissionMgrGuardian(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_auto_mode_low_risk_allows_without_prompt(self):
+        cfg = _make_config(self.tmpdir, auto_mode=True)
+        mgr = PermissionMgr(cfg)
+        mgr._sidecar_client = object()
+        mgr._sidecar_model = "sidecar"
+        mgr._classify_with_sidecar = lambda tool, params: {"level": "low", "score": 0.1, "reason": "safe", "source": "guardian"}
+        self.assertTrue(mgr.check("WebFetch", {"url": "https://example.com"}))
+
+    def test_auto_mode_medium_risk_prompts(self):
+        cfg = _make_config(self.tmpdir, auto_mode=True)
+        mgr = PermissionMgr(cfg)
+        mgr._sidecar_client = object()
+        mgr._sidecar_model = "sidecar"
+        mgr._classify_with_sidecar = lambda tool, params: {"level": "medium", "score": 0.5, "reason": "review", "source": "guardian"}
+        tui = SimpleNamespace(ask_permission=lambda *args, **kwargs: True)
+        self.assertTrue(mgr.check("WebFetch", {"url": "https://example.com"}, tui=tui))
+
+    def test_auto_mode_high_risk_denies(self):
+        cfg = _make_config(self.tmpdir, auto_mode=True)
+        mgr = PermissionMgr(cfg)
+        mgr._sidecar_client = object()
+        mgr._sidecar_model = "sidecar"
+        mgr._classify_with_sidecar = lambda tool, params: {"level": "high", "score": 0.9, "reason": "danger", "source": "guardian"}
+        self.assertFalse(mgr.check("WebFetch", {"url": "https://example.com"}))
 
 
 if __name__ == "__main__":
