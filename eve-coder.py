@@ -1927,7 +1927,7 @@ class Config:
         # Apply profile settings (only override if not already set by CLI args)
         if prof.get("MODEL") and not self._cli_model_set:
             self.model = prof["MODEL"]
-        if prof.get("SIDECAR_MODEL") and not self._cli_model_set:
+        if prof.get("SIDECAR_MODEL") and not self._cli_sidecar_set:
             self.sidecar_model = prof["SIDECAR_MODEL"]
             self._cli_sidecar_set = True
         if prof.get("OLLAMA_HOST") and not self._cli_ollama_host_set:
@@ -2380,7 +2380,7 @@ def _build_sanitized_env(config, kind="shell"):
         "FORCE_COLOR", "CC", "CXX", "CFLAGS", "LDFLAGS", "PKG_CONFIG_PATH",
         "GOPATH", "GOROOT", "CARGO_HOME", "RUSTUP_HOME", "JAVA_HOME",
         "NVM_DIR", "PYENV_ROOT", "VIRTUAL_ENV", "CONDA_DEFAULT_ENV",
-        "OLLAMA_HOST", "PYTHONPATH", "NODE_PATH", "GEM_HOME", "RBENV_ROOT",
+        "PYTHONPATH", "NODE_PATH", "GEM_HOME", "RBENV_ROOT",
     }
     sensitive_prefixes = (
         "CLAUDECODE", "CLAUDE_CODE", "ANTHROPIC", "OPENAI",
@@ -2393,6 +2393,20 @@ def _build_sanitized_env(config, kind="shell"):
         "PRIVATE_KEY", "_AUTH", "KUBECONFIG",
     )
 
+    def _allow_env_value(key, value):
+        if key.upper() != "OLLAMA_HOST":
+            return True
+        raw = (value or "").strip()
+        if not raw:
+            return False
+        if "://" not in raw:
+            raw = "http://" + raw
+        try:
+            parsed = urllib.parse.urlparse(raw)
+        except Exception:
+            return False
+        return Config._is_allowed_ollama_host(parsed.hostname or "")
+
     clean_env = {}
     for key, value in os.environ.items():
         key_upper = key.upper()
@@ -2403,14 +2417,20 @@ def _build_sanitized_env(config, kind="shell"):
                     continue
                 if any(sub in key_upper for sub in sensitive_substrings):
                     continue
+                if not _allow_env_value(key, value):
+                    continue
             clean_env[key] = value
             continue
         if key in always_allow or explicitly_included:
+            if not explicitly_included and not _allow_env_value(key, value):
+                continue
             clean_env[key] = value
             continue
         if key_upper.startswith(sensitive_prefixes):
             continue
         if any(sub in key_upper for sub in sensitive_substrings):
+            continue
+        if not _allow_env_value(key, value):
             continue
         clean_env[key] = value
 
@@ -2467,6 +2487,17 @@ def _resolve_allowed_tool_names(registry, tool_spec):
         if canonical not in resolved:
             resolved.append(canonical)
     return resolved, invalid
+
+
+def _requires_shell_execution(command):
+    """Return True when a command uses shell-only syntax."""
+    if not isinstance(command, str):
+        return True
+    shell_markers = (
+        "|", "||", "&&", ";", "<", ">", "<<", ">>", "$(", "`",
+        "\n", "&", "*", "?", "[", "]", "{", "}", "~",
+    )
+    return any(marker in command for marker in shell_markers)
 
 
 def _is_cloud_model(model_name):
@@ -3725,6 +3756,17 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
             safe = re.sub(
                 r'<%s\b[^>]*>.*?</%s>' % (re.escape(_tn), re.escape(_tn)),
                 '[BLOCKED]', safe, flags=re.DOTALL)
+        safe = re.sub(r'(?is)"tool_calls"\s*:\s*\[[^\]]*\]', '"tool_calls": [BLOCKED]', safe)
+        safe = re.sub(
+            r'(?is)"name"\s*:\s*"(?:Bash|Read|Write|Edit|Glob|Grep|WebFetch|WebSearch|NotebookEdit|SubAgent)"\s*,\s*"arguments"\s*:\s*(\{.*?\}|".*?")',
+            '"name":"[BLOCKED]","arguments":"[BLOCKED]"',
+            safe,
+        )
+        safe = re.sub(
+            r'(?is)"function"\s*:\s*\{\s*"name"\s*:\s*"(?:Bash|Read|Write|Edit|Glob|Grep|WebFetch|WebSearch|NotebookEdit|SubAgent)"[^}]*\}',
+            '"function":{"name":"[BLOCKED]"}',
+            safe,
+        )
         return safe
 
     def _load_instructions(fpath, max_bytes=4000):
@@ -5646,6 +5688,15 @@ class BashTool(Tool):
         """Build sanitized environment dict, applying shell env policy."""
         return _build_sanitized_env(self._config, kind="shell")
 
+    @staticmethod
+    def _build_exec_args(command):
+        if _requires_shell_execution(command):
+            return command, True
+        try:
+            return shlex.split(command), False
+        except ValueError:
+            return command, True
+
     def execute(self, params):
         command = params.get("command", "")
         try:
@@ -5719,6 +5770,12 @@ class BashTool(Tool):
         _DANGEROUS_PATTERNS = [
             r'\bcurl\b.*\|\s*\bsh\b',       # curl pipe to shell
             r'\bwget\b.*\|\s*\bsh\b',       # wget pipe to shell
+            r'\|\s*(?:env\s+)?(?:sh|bash|zsh|dash|ksh|fish)\b',
+            r'\|\s*(?:python|python3|perl|ruby|node|php)\b',
+            r'\b(?:sh|bash|zsh|dash|ksh|fish)\s+-c\b',
+            r'[`][^`]+[`]',
+            r'\$\([^)]+\)',
+            r'<\([^)]+\)',
             r'\brm\s+-rf\s+/',              # rm -rf from root
             r'\bmkfs\b',                     # format filesystem
             r'\bdd\b.*\bof=/dev/',          # dd to device
@@ -5754,8 +5811,9 @@ class BashTool(Tool):
                 proc = None
                 try:
                     _bg_pgroup = platform.system() != "Windows"
+                    exec_args, use_shell = self._build_exec_args(cmd)
                     proc = subprocess.Popen(
-                        cmd, shell=True, stdin=subprocess.DEVNULL,
+                        exec_args, shell=use_shell, stdin=subprocess.DEVNULL,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True, encoding="utf-8", errors="replace",
                         cwd=self._base_dir(), env=bg_clean_env,
@@ -5851,8 +5909,9 @@ class BashTool(Tool):
             clean_env = self._build_clean_env()
             # Use process group on Unix to ensure all child processes are killed on timeout
             use_pgroup = platform.system() != "Windows"
+            exec_args, use_shell = self._build_exec_args(command)
             popen_kwargs = {
-                "shell": True,
+                "shell": use_shell,
                 "stdin": subprocess.DEVNULL,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
@@ -5867,7 +5926,7 @@ class BashTool(Tool):
             # Use Popen instead of run() to access PID for process group cleanup on timeout
             proc = None
             try:
-                proc = subprocess.Popen(command, **popen_kwargs)
+                proc = subprocess.Popen(exec_args, **popen_kwargs)
                 try:
                     stdout, stderr = proc.communicate(timeout=timeout_s)
                 except subprocess.TimeoutExpired:
@@ -7510,6 +7569,8 @@ class WebFetchTool(Tool):
         parsed_url = urllib.parse.urlparse(url)
         if parsed_url.scheme and parsed_url.scheme.lower() not in ("http", "https", ""):
             return f"Error: unsupported URL scheme '{parsed_url.scheme}'. Only http/https allowed."
+        if url.startswith("//"):
+            return "Error: scheme-relative URLs are not allowed. Use a full https:// URL."
 
         # Strip userinfo from URL (block user@host attacks)
         if parsed_url.username or "@" in (parsed_url.netloc or ""):
@@ -7738,7 +7799,7 @@ class NotebookEditTool(Tool):
                 "description": "Edit mode: 'replace', 'insert', or 'delete'",
             },
         },
-        "required": ["notebook_path", "new_source"],
+        "required": ["notebook_path"],
     }
 
     VALID_CELL_TYPES = {"code", "markdown", "raw"}
@@ -7771,6 +7832,10 @@ class NotebookEditTool(Tool):
         # C12: Reject negative cell_number for insert
         if cell_num < 0:
             return "Error: cell_number cannot be negative"
+        if edit_mode in ("replace", "insert") and not isinstance(new_source, str):
+            return "Error: new_source must be a string"
+        if edit_mode in ("replace", "insert") and not new_source:
+            return "Error: new_source is required for replace/insert modes"
 
         try:
             with open(nb_path, "r", encoding="utf-8") as f:
@@ -8411,7 +8476,7 @@ class TaskUpdateTool(Tool):
             },
             "status": {
                 "type": "string",
-                "description": "New status: pending, in_progress, completed, or deleted",
+                "description": "New status: pending, in_progress, completed, skipped, or deleted",
             },
             "subject": {
                 "type": "string",
@@ -8435,7 +8500,7 @@ class TaskUpdateTool(Tool):
         "required": ["taskId"],
     }
 
-    VALID_STATUSES = {"pending", "in_progress", "completed", "deleted"}
+    VALID_STATUSES = {"pending", "in_progress", "completed", "skipped", "deleted"}
 
     def execute(self, params):
         tid = str(params.get("taskId", "")).strip()
@@ -17171,6 +17236,7 @@ class Agent:
         # Auto-parallel detection: if user asks multiple independent tasks, run them in parallel
         # Known limitation: RAG context is not injected when auto-parallel fires, because
         # this branch returns early before the RAG injection block below.
+        parallel_tasks = []
         if not self._plan_mode:
             parallel_tasks = self._detect_parallel_tasks(user_input)
             if len(parallel_tasks) >= 2:
@@ -17204,7 +17270,7 @@ class Agent:
                     print(f"{C.DIM}[debug] RAG query failed: {e}{C.RESET}", file=sys.stderr)
         if not skip_add:
             self.session.add_user_message(user_input)
-        _parallel_tasks = self._detect_parallel_tasks(user_input) if not self._plan_mode else []
+        _parallel_tasks = parallel_tasks if not self._plan_mode else []
         _route_candidates = _score_tool_candidates(
             user_input,
             allowed_tool_names=self._get_allowed_tool_names(),
@@ -17405,8 +17471,10 @@ class Agent:
                         # Restore original settings
                         if hasattr(self, '_orig_temperature'):
                             self.client.temperature = self._orig_temperature
+                            del self._orig_temperature
                         if hasattr(self, '_orig_model'):
                             self.config.model = self._orig_model
+                            del self._orig_model
                         _p(f"\n{C.YELLOW}AI から空のレスポンスが返されました（4回リトライ後も失敗）{C.RESET}")
                         _p(f"{C.DIM}対処法:{C.RESET}")
                         _p(f"{C.DIM}  1. /compact — コンテキストを圧縮{C.RESET}")
@@ -20542,12 +20610,21 @@ def main():
                             # Validate model name (same validation as Config._validate_ollama_host)
                             _SAFE_MODEL_RE = re.compile(r'^[a-zA-Z0-9_.:\-/]+$')
                             if _SAFE_MODEL_RE.match(new_model):
-                                config.model = new_model
-                                # Update footer mode display
-                                if agent.tui.scroll_region._active:
-                                    agent.tui.scroll_region.update_mode_display(f"Model: {new_model}")
-                                print(f"\n  {C.GREEN}Model changed to: {new_model}{C.RESET}")
-                                print(f"  {_c240x}To make this permanent, add MODEL={new_model} to {config.config_file}{C.RESET}\n")
+                                _ok, fresh_models = client.check_connection()
+                                if client.check_model(new_model, available_models=fresh_models if _ok else None):
+                                    config.model = new_model
+                                    config._apply_context_window(new_model)
+                                    config._apply_max_tokens(new_model)
+                                    # Update footer mode display
+                                    if agent.tui.scroll_region._active:
+                                        agent.tui.scroll_region.update_mode_display(f"Model: {new_model}")
+                                    print(f"\n  {C.GREEN}Model changed to: {new_model}{C.RESET}")
+                                    print(f"  {_c240x}To make this permanent, add MODEL={new_model} to {config.config_file}{C.RESET}\n")
+                                else:
+                                    print(f"\n  {C.YELLOW}Model '{new_model}' is not downloaded yet.{C.RESET}")
+                                    if _ok and fresh_models:
+                                        _show_model_list(fresh_models)
+                                    print(f"  {_c240x}Download it first: ollama pull {new_model}{C.RESET}\n")
                             else:
                                 print(f"\n  {C.RED}Invalid model name. Use only alphanumeric, dots, colons, hyphens, underscores, and slashes.{C.RESET}\n")
                             continue

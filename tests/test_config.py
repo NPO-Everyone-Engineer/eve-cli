@@ -1047,6 +1047,18 @@ class TestLoadConfigFile(unittest.TestCase):
         )
         self.assertEqual(auto_detect_hosts, [Config.DEFAULT_OLLAMA_HOST])
 
+    def test_apply_profile_respects_cli_sidecar_override(self):
+        cfg = Config()
+        cfg.profile = "online"
+        cfg.network_status = "online"
+        cfg.sidecar_model = "cli-sidecar"
+        cfg._cli_sidecar_set = True
+        cfg._profiles = {"online": {"SIDECAR_MODEL": "profile-sidecar"}}
+
+        cfg._apply_profile()
+
+        self.assertEqual(cfg.sidecar_model, "cli-sidecar")
+
 
 if __name__ == "__main__":
     unittest.main()
