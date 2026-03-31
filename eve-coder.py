@@ -274,7 +274,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.26.0"
+__version__ = "2.27.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors

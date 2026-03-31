@@ -3,6 +3,7 @@ Test suite for security hardening regressions.
 """
 
 import importlib.util
+import hashlib
 import json
 import os
 import shutil
@@ -205,6 +206,13 @@ class TestSecurityHardening(unittest.TestCase):
         content = Path(SCRIPT_DIR, "eve-cli.sh").read_text(encoding="utf-8")
         self.assertIn("https://(ollama\\.com|www\\.ollama\\.com)(/api)?/?$", content)
         self.assertIn('if [[ "$arg" == "--version" ]]', content)
+
+    def test_install_manifest_hashes_match_repo_files(self):
+        manifest = json.loads(Path(SCRIPT_DIR, "install-manifest.json").read_text(encoding="utf-8"))
+        for rel_path, expected_hash in manifest.get("files", {}).items():
+            with self.subTest(path=rel_path):
+                actual = hashlib.sha256(Path(SCRIPT_DIR, rel_path).read_bytes()).hexdigest()
+                self.assertEqual(actual, expected_hash)
 
     def test_extension_manifest_rejects_unsupported_agent_type(self):
         mgr = eve_coder.ExtensionManager(SimpleNamespace(config_dir=self.config_dir))
