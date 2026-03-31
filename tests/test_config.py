@@ -55,6 +55,18 @@ class TestConfigDefaults(unittest.TestCase):
     def test_default_completion_cost_per_mtok(self):
         self.assertEqual(self.cfg.completion_cost_per_mtok, 0.0)
 
+    def test_default_plan_mode_reasoning_effort(self):
+        self.assertEqual(self.cfg.plan_mode_reasoning_effort, "")
+
+    def test_default_shell_env_policy(self):
+        self.assertEqual(self.cfg.shell_env_policy, "default")
+
+    def test_default_hook_env_policy(self):
+        self.assertEqual(self.cfg.hook_env_policy, "default")
+
+    def test_default_notify_on(self):
+        self.assertEqual(self.cfg.notify_on, ["stop"])
+
     def test_default_max_agent_steps(self):
         self.assertEqual(self.cfg.max_agent_steps, 100)
 
@@ -238,6 +250,34 @@ class TestParseConfigFile(unittest.TestCase):
             self.cfg._parse_config_file(path)
             self.assertEqual(self.cfg.prompt_cost_per_mtok, 0.12)
             self.assertEqual(self.cfg.completion_cost_per_mtok, 0.34)
+        finally:
+            os.unlink(path)
+
+    def test_advanced_runtime_fields(self):
+        path = self._write_config(
+            "PLAN_MODE_REASONING_EFFORT = high\n"
+            "SHELL_ENV_POLICY = inherit\n"
+            "SHELL_ENV_INCLUDE = CI,HTTPS_PROXY\n"
+            "SHELL_ENV_EXCLUDE = PATH\n"
+            "SHELL_ENV_SET = FOO=bar,HELLO=world\n"
+            "HOOK_ENV_POLICY = inherit\n"
+            "NOTIFY_COMMAND = python3 notify.py\n"
+            "NOTIFY_ON = stop,error\n"
+            "SKILLS_ENABLE = design*,review\n"
+            "SKILLS_DISABLE = bugfix\n"
+        )
+        try:
+            self.cfg._parse_config_file(path)
+            self.assertEqual(self.cfg.plan_mode_reasoning_effort, "high")
+            self.assertEqual(self.cfg.shell_env_policy, "inherit")
+            self.assertEqual(self.cfg.shell_env_include, ["CI", "HTTPS_PROXY"])
+            self.assertEqual(self.cfg.shell_env_exclude, ["PATH"])
+            self.assertEqual(self.cfg.shell_env_set["FOO"], "bar")
+            self.assertEqual(self.cfg.hook_env_policy, "inherit")
+            self.assertEqual(self.cfg.notify_command, "python3 notify.py")
+            self.assertEqual(self.cfg.notify_on, ["stop", "error"])
+            self.assertEqual(self.cfg.skill_enable_patterns, ["design*", "review"])
+            self.assertEqual(self.cfg.skill_disable_patterns, ["bugfix"])
         finally:
             os.unlink(path)
 
@@ -480,6 +520,11 @@ class TestLoadEnv(unittest.TestCase):
             "OLLAMA_HOST", "EVE_CODER_MODEL", "EVE_CLI_MODEL",
             "OLLAMA_API_KEY", "EVE_CLI_OLLAMA_API_KEY",
             "EVE_CLI_PROMPT_COST_PER_MTOK", "EVE_CLI_COMPLETION_COST_PER_MTOK",
+            "EVE_CLI_PLAN_MODE_REASONING_EFFORT",
+            "EVE_CLI_SHELL_ENV_POLICY", "EVE_CLI_SHELL_ENV_INCLUDE", "EVE_CLI_SHELL_ENV_EXCLUDE", "EVE_CLI_SHELL_ENV_SET",
+            "EVE_CLI_HOOK_ENV_POLICY", "EVE_CLI_HOOK_ENV_INCLUDE", "EVE_CLI_HOOK_ENV_EXCLUDE", "EVE_CLI_HOOK_ENV_SET",
+            "EVE_CLI_NOTIFY_COMMAND", "EVE_CLI_NOTIFY_ON",
+            "EVE_CLI_SKILLS_ENABLE", "EVE_CLI_SKILLS_DISABLE",
             "EVE_CODER_SIDECAR", "EVE_CLI_SIDECAR_MODEL",
             "EVE_CODER_MAX_AGENT_STEPS", "EVE_CLI_MAX_AGENT_STEPS",
             "EVE_CLI_PROFILE", "EVE_CODER_DEBUG", "EVE_CLI_DEBUG",
@@ -528,6 +573,28 @@ class TestLoadEnv(unittest.TestCase):
             self.cfg._load_env()
         self.assertEqual(self.cfg.prompt_cost_per_mtok, 0.25)
         self.assertEqual(self.cfg.completion_cost_per_mtok, 0.75)
+
+    def test_advanced_runtime_fields_from_env(self):
+        env = self._make_env(
+            EVE_CLI_PLAN_MODE_REASONING_EFFORT="medium",
+            EVE_CLI_SHELL_ENV_POLICY="inherit",
+            EVE_CLI_SHELL_ENV_INCLUDE="CI,HTTPS_PROXY",
+            EVE_CLI_HOOK_ENV_POLICY="inherit",
+            EVE_CLI_NOTIFY_COMMAND="python3 notify.py",
+            EVE_CLI_NOTIFY_ON="stop,error",
+            EVE_CLI_SKILLS_ENABLE="design*",
+            EVE_CLI_SKILLS_DISABLE="bugfix",
+        )
+        with patch.dict(os.environ, env):
+            self.cfg._load_env()
+        self.assertEqual(self.cfg.plan_mode_reasoning_effort, "medium")
+        self.assertEqual(self.cfg.shell_env_policy, "inherit")
+        self.assertEqual(self.cfg.shell_env_include, ["CI", "HTTPS_PROXY"])
+        self.assertEqual(self.cfg.hook_env_policy, "inherit")
+        self.assertEqual(self.cfg.notify_command, "python3 notify.py")
+        self.assertEqual(self.cfg.notify_on, ["stop", "error"])
+        self.assertEqual(self.cfg.skill_enable_patterns, ["design*"])
+        self.assertEqual(self.cfg.skill_disable_patterns, ["bugfix"])
 
     def test_eve_cli_model_overrides_legacy(self):
         env = self._make_env(EVE_CODER_MODEL="legacy-model", EVE_CLI_MODEL="new-model")

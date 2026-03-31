@@ -51,14 +51,17 @@ if [ -f "$CONFIG_FILE" ]; then
     unset _m _s _h _d _t
 fi
 
-# [SEC] Validate OLLAMA_HOST - only allow localhost (SSRF prevention)
+# [SEC] Validate OLLAMA_HOST - allow localhost or official Ollama Cloud only
 # Strict regex: reject @-credential injection (e.g. http://localhost:11434@attacker.com)
 _host_valid=0
 if [[ "$OLLAMA_HOST" =~ ^http://(localhost|127\.0\.0\.1|\[::1\]):[0-9]{1,5}(/.*)?$ ]]; then
     [[ "$OLLAMA_HOST" != *@* ]] && _host_valid=1
 fi
+if [[ "$OLLAMA_HOST" =~ ^https://(ollama\.com|www\.ollama\.com)(/api)?/?$ ]]; then
+    [[ "$OLLAMA_HOST" != *@* ]] && _host_valid=1
+fi
 if [ "$_host_valid" -eq 0 ]; then
-    echo "⚠️  OLLAMA_HOST='$OLLAMA_HOST' はlocalhostではありません。セキュリティのためlocalhostにリセットします。"
+    echo "⚠️  OLLAMA_HOST='$OLLAMA_HOST' は許可されていません。localhost にリセットします。"
     OLLAMA_HOST="http://localhost:11434"
 fi
 unset _host_valid
@@ -174,6 +177,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+IS_CLOUD_HOST=0
+if [[ "$OLLAMA_HOST" =~ ^https://(ollama\.com|www\.ollama\.com)(/api)?/?$ ]]; then
+    IS_CLOUD_HOST=1
+fi
+
+for arg in "${EXTRA_ARGS[@]:-}"; do
+    if [[ "$arg" == "--version" ]]; then
+        OLLAMA_HOST="$OLLAMA_HOST" \
+        EVE_CLI_MODEL="${MODEL:-}" \
+        EVE_CLI_SIDECAR_MODEL="${SIDECAR_MODEL:-}" \
+        EVE_CLI_DEBUG="${EVE_CLI_DEBUG:-0}" \
+        exec python3 "$EVE_CODER_SCRIPT" --version
+    fi
+done
+
 # --- 自動判定モード ---
 if [ "$AUTO_MODE" -eq 1 ]; then
     if check_network; then
@@ -191,15 +209,17 @@ if [ "$AUTO_MODE" -eq 1 ]; then
 fi
 
 # --- ローカルモードで起動 ---
-if ! ensure_ollama; then
-    echo ""
-    echo "ollama が起動できないため終了します。"
-    exit 1
+if [ "$IS_CLOUD_HOST" -eq 0 ]; then
+    if ! ensure_ollama; then
+        echo ""
+        echo "ollama が起動できないため終了します。"
+        exit 1
+    fi
 fi
 
 # モデル引数を組み立て
 MODEL_ARGS=()
-if [ -n "$MODEL" ]; then
+if [ -n "$MODEL" ] && [ "$IS_CLOUD_HOST" -eq 0 ]; then
     MODEL_ARGS+=(--model "$MODEL")
 fi
 

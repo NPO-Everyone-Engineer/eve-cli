@@ -107,6 +107,7 @@ PROFILE=auto
 [profile:online]
 MODEL=qwen3.5:397b-cloud
 SIDECAR_MODEL=qwen3:8b
+PLAN_MODE_REASONING_EFFORT=high
 
 [profile:offline]
 MODEL=qwen3:8b
@@ -159,6 +160,23 @@ SIDECAR_MODEL=qwen3:4b
 | `Stop` | セッション終了時 | クリーンアップ |
 
 `PreToolUse` フックが非ゼロで終了すると、そのツール実行はブロックされます。
+
+### Hook 環境変数ポリシー
+
+フックに渡す環境変数は config で調整できます。
+
+```ini
+HOOK_ENV_POLICY=inherit
+HOOK_ENV_INCLUDE=CI,HTTPS_PROXY
+HOOK_ENV_EXCLUDE=CI_JOB_TOKEN
+HOOK_ENV_SET=TEAM=backend
+```
+
+- `HOOK_ENV_POLICY=default`: 既定の安全な allowlist を使う
+- `HOOK_ENV_POLICY=inherit`: ほぼ現在の環境を引き継ぐ。ただし secret 系は明示 include しない限り除外
+- `HOOK_ENV_INCLUDE`: 追加で渡したい変数
+- `HOOK_ENV_EXCLUDE`: 明示的に外したい変数
+- `HOOK_ENV_SET`: 固定値を注入
 
 ### フック実行時の環境変数
 
@@ -230,6 +248,19 @@ docs/api/<filename>.md
 | `$SKILL_DIR` | Skill ディレクトリのパス |
 | `$CWD` | 現在の作業ディレクトリ |
 
+### Skill の有効/無効化
+
+Skill が増えて prompt が膨らむ場合は、config で絞れます。
+
+```ini
+SKILLS_ENABLE=design*,review
+SKILLS_DISABLE=bugfix
+```
+
+- `SKILLS_ENABLE`: このパターンに一致する skill だけを読み込む
+- `SKILLS_DISABLE`: 一致する skill を除外する
+- 判定対象は skill 名、パス、basename
+
 ---
 
 ## コードインテリジェンス
@@ -278,6 +309,37 @@ eve-cli
 | `.eve-cli/mcp.json` | プロジェクト | 初回に必要 |
 
 プロジェクトレベルの MCP 設定は、リポジトリに含まれるファイルのためセキュリティ確認が必要です。
+
+### MCP の詳細設定
+
+`mcp.json` では、server 単位で tool の絞り込みや timeout を指定できます。
+
+```json
+{
+  "mcpServers": {
+    "docs": {
+      "command": "python3",
+      "args": ["scripts/docs_mcp.py"],
+      "enabled": true,
+      "required": true,
+      "enabled_tools": ["read_doc", "search_doc"],
+      "disabled_tools": ["delete_doc"],
+      "startup_timeout_sec": 20,
+      "tool_timeout_sec": 45,
+      "env_vars": ["DOCS_API_TOKEN"],
+      "env": {"DOCS_MODE": "readonly"}
+    }
+  }
+}
+```
+
+- `enabled`: `false` なら読み込まない
+- `required`: 起動失敗時に eve-cli 全体を止める
+- `enabled_tools` / `disabled_tools`: 公開する MCP tool を絞る
+- `startup_timeout_sec`: `initialize` / `tools/list` の待ち時間
+- `tool_timeout_sec`: `tools/call` の待ち時間
+- `env_vars`: 明示した環境変数だけを子プロセスに渡す
+- `env`: 固定値を追加で渡す
 
 ---
 
@@ -495,6 +557,13 @@ eve-cli --channels discord,slack,webhook
 | `EVE_CLI_MAX_AGENT_STEPS` | AI ステップ上限 | `80` |
 | `EVE_CLI_PROMPT_COST_PER_MTOK` | 入力 100 万 tokens あたりの推定コスト（USD） | `0.15` |
 | `EVE_CLI_COMPLETION_COST_PER_MTOK` | 出力 100 万 tokens あたりの推定コスト（USD） | `0.60` |
+| `EVE_CLI_PLAN_MODE_REASONING_EFFORT` | Plan mode 用の reasoning 強度 | `high` |
+| `EVE_CLI_SHELL_ENV_POLICY` | Bash 実行時の環境変数ポリシー | `inherit` |
+| `EVE_CLI_HOOK_ENV_POLICY` | Hook 実行時の環境変数ポリシー | `inherit` |
+| `EVE_CLI_NOTIFY_COMMAND` | 通知用コマンド | `python3 ~/.config/eve-cli/notify.py` |
+| `EVE_CLI_NOTIFY_ON` | 通知イベント | `stop,error` |
+| `EVE_CLI_SKILLS_ENABLE` | 読み込む skill パターン | `design*,review` |
+| `EVE_CLI_SKILLS_DISABLE` | 除外する skill パターン | `bugfix` |
 | `OLLAMA_HOST` | Ollama ホスト URL | `http://localhost:11434` / `https://ollama.com/api` |
 | `OLLAMA_API_KEY` | Ollama Cloud API キー | `ollama_...` |
 
@@ -509,6 +578,12 @@ MAX_TOKENS=4096
 TEMPERATURE=0.25
 PROMPT_COST_PER_MTOK=0.15
 COMPLETION_COST_PER_MTOK=0.60
+PLAN_MODE_REASONING_EFFORT=high
+SHELL_ENV_POLICY=inherit
+HOOK_ENV_POLICY=default
+NOTIFY_COMMAND=python3 ~/.config/eve-cli/notify.py
+NOTIFY_ON=stop,error
+SKILLS_ENABLE=design*,review
 PROFILE=auto
 ```
 
@@ -523,6 +598,9 @@ eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
 - `OLLAMA_HOST` は `https://ollama.com` や `https://ollama.com/api` を受け付け、内部で native API 向けに正規化します。
 - `eve-cli` は Ollama の native `/api/*` を使うため、OpenAI 互換の `/v1` ではなく Ollama endpoint を指定してください。
 - `PROMPT_COST_PER_MTOK` / `COMPLETION_COST_PER_MTOK` は `/usage` の推定コスト計算に使われます。未設定時は `0.0` として扱われます。
+- `PLAN_MODE_REASONING_EFFORT` は `none|low|medium|high|max` を受け付け、Plan mode 中だけ thinking budget を上書きします。
+- `SHELL_ENV_POLICY` / `HOOK_ENV_POLICY` は `default` と `inherit` を受け付けます。
+- `NOTIFY_COMMAND` は JSON payload を stdin で受け取る想定です。
 
 ### 設定ファイル一覧
 

@@ -203,6 +203,7 @@ _active_tui = None
 # Active channel context: set when processing a channel message, cleared after
 # Contains {"channel_manager": ChannelManager, "source_msg": ChannelMessage} or None
 _active_channel_context = None
+_active_notifier = None
 
 # Custom commands cache: command_name -> {"description": str, "path": str, "frontmatter": dict}
 _custom_commands = {}
@@ -271,7 +272,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.25.0"
+__version__ = "2.26.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1112,6 +1113,7 @@ class Config:
     DEFAULT_CONTEXT_WINDOW = 65536
     DEFAULT_PROMPT_COST_PER_MTOK = 0.0
     DEFAULT_COMPLETION_COST_PER_MTOK = 0.0
+    DEFAULT_PLAN_MODE_REASONING_EFFORT = ""
     DEFAULT_MAX_AGENT_STEPS = 100
     HARD_MAX_AGENT_STEPS = 200
     _LOCAL_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
@@ -1127,6 +1129,7 @@ class Config:
         self.context_window = self.DEFAULT_CONTEXT_WINDOW
         self.prompt_cost_per_mtok = self.DEFAULT_PROMPT_COST_PER_MTOK
         self.completion_cost_per_mtok = self.DEFAULT_COMPLETION_COST_PER_MTOK
+        self.plan_mode_reasoning_effort = self.DEFAULT_PLAN_MODE_REASONING_EFFORT
         self.max_agent_steps = self.DEFAULT_MAX_AGENT_STEPS
         self.prompt = None          # -p one-shot prompt
         self.output_format = "text" # --output-format (text, json, stream-json)
@@ -1187,6 +1190,18 @@ class Config:
         self.output_schema = None       # --output-schema (structured JSON output)
         self.auto_mode = False          # -a/--auto-mode (sidecar permission classifier)
         self.mcp_server = False         # --mcp-server (run as MCP server)
+        self.shell_env_policy = "default"
+        self.shell_env_include = []
+        self.shell_env_exclude = []
+        self.shell_env_set = {}
+        self.hook_env_policy = "default"
+        self.hook_env_include = []
+        self.hook_env_exclude = []
+        self.hook_env_set = {}
+        self.notify_command = ""
+        self.notify_on = ["stop"]
+        self.skill_enable_patterns = []
+        self.skill_disable_patterns = []
 
         # Channels
         self.channels = []  # list of enabled channel names e.g. ["webhook", "discord"]
@@ -1330,10 +1345,36 @@ class Config:
                             self.completion_cost_per_mtok = max(0.0, float(val))
                         except ValueError:
                             pass
+                    elif key == "PLAN_MODE_REASONING_EFFORT" and val:
+                        self.plan_mode_reasoning_effort = _normalize_reasoning_effort(val)
                     elif key == "MAX_AGENT_STEPS" and val:
                         parsed = self._normalize_max_agent_steps(val)
                         if parsed is not None:
                             self.max_agent_steps = parsed
+                    elif key == "SHELL_ENV_POLICY" and val:
+                        self.shell_env_policy = _normalize_env_policy(val)
+                    elif key == "SHELL_ENV_INCLUDE" and val:
+                        self.shell_env_include = _parse_csv_list(val)
+                    elif key == "SHELL_ENV_EXCLUDE" and val:
+                        self.shell_env_exclude = _parse_csv_list(val)
+                    elif key == "SHELL_ENV_SET" and val:
+                        self.shell_env_set = _parse_key_value_csv(val)
+                    elif key == "HOOK_ENV_POLICY" and val:
+                        self.hook_env_policy = _normalize_env_policy(val)
+                    elif key == "HOOK_ENV_INCLUDE" and val:
+                        self.hook_env_include = _parse_csv_list(val)
+                    elif key == "HOOK_ENV_EXCLUDE" and val:
+                        self.hook_env_exclude = _parse_csv_list(val)
+                    elif key == "HOOK_ENV_SET" and val:
+                        self.hook_env_set = _parse_key_value_csv(val)
+                    elif key == "NOTIFY_COMMAND" and val:
+                        self.notify_command = val
+                    elif key == "NOTIFY_ON" and val:
+                        self.notify_on = _parse_csv_list(val)
+                    elif key == "SKILLS_ENABLE" and val:
+                        self.skill_enable_patterns = _parse_csv_list(val)
+                    elif key == "SKILLS_DISABLE" and val:
+                        self.skill_disable_patterns = _parse_csv_list(val)
                     elif key == "MARKDOWN_RENDERER" and val:
                         if val.lower() in ("glow", "simple"):
                             self.markdown_renderer = val.lower()
@@ -1389,6 +1430,34 @@ class Config:
                 self.completion_cost_per_mtok = max(0.0, float(os.environ["EVE_CLI_COMPLETION_COST_PER_MTOK"]))
             except ValueError:
                 pass
+        if os.environ.get("EVE_CLI_PLAN_MODE_REASONING_EFFORT"):
+            self.plan_mode_reasoning_effort = _normalize_reasoning_effort(
+                os.environ["EVE_CLI_PLAN_MODE_REASONING_EFFORT"]
+            )
+        if os.environ.get("EVE_CLI_SHELL_ENV_POLICY"):
+            self.shell_env_policy = _normalize_env_policy(os.environ["EVE_CLI_SHELL_ENV_POLICY"])
+        if os.environ.get("EVE_CLI_SHELL_ENV_INCLUDE"):
+            self.shell_env_include = _parse_csv_list(os.environ["EVE_CLI_SHELL_ENV_INCLUDE"])
+        if os.environ.get("EVE_CLI_SHELL_ENV_EXCLUDE"):
+            self.shell_env_exclude = _parse_csv_list(os.environ["EVE_CLI_SHELL_ENV_EXCLUDE"])
+        if os.environ.get("EVE_CLI_SHELL_ENV_SET"):
+            self.shell_env_set = _parse_key_value_csv(os.environ["EVE_CLI_SHELL_ENV_SET"])
+        if os.environ.get("EVE_CLI_HOOK_ENV_POLICY"):
+            self.hook_env_policy = _normalize_env_policy(os.environ["EVE_CLI_HOOK_ENV_POLICY"])
+        if os.environ.get("EVE_CLI_HOOK_ENV_INCLUDE"):
+            self.hook_env_include = _parse_csv_list(os.environ["EVE_CLI_HOOK_ENV_INCLUDE"])
+        if os.environ.get("EVE_CLI_HOOK_ENV_EXCLUDE"):
+            self.hook_env_exclude = _parse_csv_list(os.environ["EVE_CLI_HOOK_ENV_EXCLUDE"])
+        if os.environ.get("EVE_CLI_HOOK_ENV_SET"):
+            self.hook_env_set = _parse_key_value_csv(os.environ["EVE_CLI_HOOK_ENV_SET"])
+        if os.environ.get("EVE_CLI_NOTIFY_COMMAND"):
+            self.notify_command = os.environ["EVE_CLI_NOTIFY_COMMAND"]
+        if os.environ.get("EVE_CLI_NOTIFY_ON"):
+            self.notify_on = _parse_csv_list(os.environ["EVE_CLI_NOTIFY_ON"])
+        if os.environ.get("EVE_CLI_SKILLS_ENABLE"):
+            self.skill_enable_patterns = _parse_csv_list(os.environ["EVE_CLI_SKILLS_ENABLE"])
+        if os.environ.get("EVE_CLI_SKILLS_DISABLE"):
+            self.skill_disable_patterns = _parse_csv_list(os.environ["EVE_CLI_SKILLS_DISABLE"])
         if os.environ.get("EVE_CODER_DEBUG") == "1" or os.environ.get("EVE_CLI_DEBUG") == "1":
             self.debug = True
         if os.environ.get("EVE_CLI_MARKDOWN_RENDERER"):
@@ -1846,6 +1915,32 @@ class Config:
                 self.completion_cost_per_mtok = max(0.0, float(prof["COMPLETION_COST_PER_MTOK"]))
             except ValueError:
                 pass
+        if prof.get("PLAN_MODE_REASONING_EFFORT"):
+            self.plan_mode_reasoning_effort = _normalize_reasoning_effort(prof["PLAN_MODE_REASONING_EFFORT"])
+        if prof.get("SHELL_ENV_POLICY"):
+            self.shell_env_policy = _normalize_env_policy(prof["SHELL_ENV_POLICY"])
+        if prof.get("SHELL_ENV_INCLUDE"):
+            self.shell_env_include = _parse_csv_list(prof["SHELL_ENV_INCLUDE"])
+        if prof.get("SHELL_ENV_EXCLUDE"):
+            self.shell_env_exclude = _parse_csv_list(prof["SHELL_ENV_EXCLUDE"])
+        if prof.get("SHELL_ENV_SET"):
+            self.shell_env_set = _parse_key_value_csv(prof["SHELL_ENV_SET"])
+        if prof.get("HOOK_ENV_POLICY"):
+            self.hook_env_policy = _normalize_env_policy(prof["HOOK_ENV_POLICY"])
+        if prof.get("HOOK_ENV_INCLUDE"):
+            self.hook_env_include = _parse_csv_list(prof["HOOK_ENV_INCLUDE"])
+        if prof.get("HOOK_ENV_EXCLUDE"):
+            self.hook_env_exclude = _parse_csv_list(prof["HOOK_ENV_EXCLUDE"])
+        if prof.get("HOOK_ENV_SET"):
+            self.hook_env_set = _parse_key_value_csv(prof["HOOK_ENV_SET"])
+        if prof.get("NOTIFY_COMMAND"):
+            self.notify_command = prof["NOTIFY_COMMAND"]
+        if prof.get("NOTIFY_ON"):
+            self.notify_on = _parse_csv_list(prof["NOTIFY_ON"])
+        if prof.get("SKILLS_ENABLE"):
+            self.skill_enable_patterns = _parse_csv_list(prof["SKILLS_ENABLE"])
+        if prof.get("SKILLS_DISABLE"):
+            self.skill_disable_patterns = _parse_csv_list(prof["SKILLS_DISABLE"])
 
     def _get_effective_ram(self):
         """Get effective RAM in GB (system RAM or VRAM, whichever is larger)."""
@@ -2014,6 +2109,10 @@ class Config:
             self.prompt_cost_per_mtok = self.DEFAULT_PROMPT_COST_PER_MTOK
         if self.completion_cost_per_mtok < 0:
             self.completion_cost_per_mtok = self.DEFAULT_COMPLETION_COST_PER_MTOK
+        self.plan_mode_reasoning_effort = _normalize_reasoning_effort(self.plan_mode_reasoning_effort)
+        self.shell_env_policy = _normalize_env_policy(self.shell_env_policy)
+        self.hook_env_policy = _normalize_env_policy(self.hook_env_policy)
+        self.notify_on = _normalize_notify_events(self.notify_on)
         # Validate model names — reject shell metacharacters / path traversal
         _SAFE_MODEL_RE = re.compile(r'^[a-zA-Z0-9_.:\-/]+$')
         for attr in ("model", "sidecar_model"):
@@ -2128,6 +2227,162 @@ class Config:
                         }
                     except (OSError, UnicodeDecodeError):
                         pass
+
+
+_ENV_POLICY_ALLOWED = {"default", "inherit"}
+_NOTIFY_EVENTS_ALLOWED = {"stop", "question", "error"}
+_REASONING_EFFORT_BUDGETS = {
+    "": None,
+    "none": None,
+    "off": None,
+    "low": 2048,
+    "medium": 8192,
+    "high": 24576,
+    "max": 49152,
+}
+
+
+def _parse_csv_list(value):
+    if not value:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _parse_key_value_csv(value):
+    result = {}
+    for item in _parse_csv_list(value):
+        if "=" not in item:
+            continue
+        key, val = item.split("=", 1)
+        key = key.strip()
+        if key:
+            result[key] = val.strip()
+    return result
+
+
+def _normalize_env_policy(value):
+    lowered = str(value or "default").strip().lower()
+    return lowered if lowered in _ENV_POLICY_ALLOWED else "default"
+
+
+def _normalize_notify_events(value):
+    events = []
+    for item in _parse_csv_list(value):
+        lowered = item.lower()
+        if lowered in _NOTIFY_EVENTS_ALLOWED and lowered not in events:
+            events.append(lowered)
+    return events or ["stop"]
+
+
+def _normalize_reasoning_effort(value):
+    lowered = str(value or "").strip().lower()
+    if lowered == "minimal":
+        lowered = "low"
+    if lowered not in _REASONING_EFFORT_BUDGETS:
+        return ""
+    return lowered
+
+
+def _resolve_reasoning_settings(config, plan_mode=False):
+    think_mode = config.think_mode
+    thinking_budget = config.thinking_budget
+    effort = config.plan_mode_reasoning_effort if plan_mode else ""
+    if effort in ("none", "off"):
+        return False, None, effort or ""
+    if effort:
+        return True, _REASONING_EFFORT_BUDGETS.get(effort), effort
+    return think_mode, thinking_budget, ""
+
+
+def _matches_any_pattern(value, patterns):
+    value = str(value or "")
+    for pattern in patterns or []:
+        if fnmatch.fnmatch(value, pattern):
+            return True
+    return False
+
+
+def _skill_is_enabled(config, skill_name, skill_path):
+    basename = os.path.basename(skill_path or "")
+    candidates = [skill_name or "", skill_path or "", basename]
+    if config.skill_enable_patterns and not any(_matches_any_pattern(item, config.skill_enable_patterns) for item in candidates):
+        return False
+    if config.skill_disable_patterns and any(_matches_any_pattern(item, config.skill_disable_patterns) for item in candidates):
+        return False
+    return True
+
+
+def _build_sanitized_env(config, kind="shell"):
+    if kind == "hook":
+        policy = getattr(config, "hook_env_policy", "default")
+        include = getattr(config, "hook_env_include", [])
+        exclude = getattr(config, "hook_env_exclude", [])
+        env_set = getattr(config, "hook_env_set", {})
+    else:
+        policy = getattr(config, "shell_env_policy", "default")
+        include = getattr(config, "shell_env_include", [])
+        exclude = getattr(config, "shell_env_exclude", [])
+        env_set = getattr(config, "shell_env_set", {})
+
+    always_allow = {
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG",
+        "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TMPDIR", "TMP", "TEMP",
+        "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "SSH_AUTH_SOCK",
+        "EDITOR", "VISUAL", "PAGER", "HOSTNAME", "PWD", "OLDPWD", "SHLVL",
+        "COLORTERM", "TERM_PROGRAM", "COLUMNS", "LINES", "NO_COLOR",
+        "FORCE_COLOR", "CC", "CXX", "CFLAGS", "LDFLAGS", "PKG_CONFIG_PATH",
+        "GOPATH", "GOROOT", "CARGO_HOME", "RUSTUP_HOME", "JAVA_HOME",
+        "NVM_DIR", "PYENV_ROOT", "VIRTUAL_ENV", "CONDA_DEFAULT_ENV",
+        "OLLAMA_HOST", "PYTHONPATH", "NODE_PATH", "GEM_HOME", "RBENV_ROOT",
+    }
+    sensitive_prefixes = (
+        "CLAUDECODE", "CLAUDE_CODE", "ANTHROPIC", "OPENAI",
+        "AWS_SECRET", "AWS_SESSION", "GITHUB_TOKEN", "GH_TOKEN",
+        "GITLAB_", "HF_TOKEN", "AZURE_",
+    )
+    sensitive_substrings = (
+        "_SECRET", "_TOKEN", "_KEY", "_PASSWORD", "_CREDENTIAL",
+        "_API_KEY", "DATABASE_URL", "REDIS_URL", "MONGO_URI",
+        "PRIVATE_KEY", "_AUTH", "KUBECONFIG",
+    )
+
+    clean_env = {}
+    for key, value in os.environ.items():
+        key_upper = key.upper()
+        explicitly_included = key in include
+        if policy == "inherit":
+            if not explicitly_included:
+                if key_upper.startswith(sensitive_prefixes):
+                    continue
+                if any(sub in key_upper for sub in sensitive_substrings):
+                    continue
+            clean_env[key] = value
+            continue
+        if key in always_allow or explicitly_included:
+            clean_env[key] = value
+            continue
+        if key_upper.startswith(sensitive_prefixes):
+            continue
+        if any(sub in key_upper for sub in sensitive_substrings):
+            continue
+        clean_env[key] = value
+
+    for key in exclude:
+        clean_env.pop(key, None)
+    for key, value in (env_set or {}).items():
+        clean_env[key] = value
+
+    if "PATH" not in clean_env:
+        if os.name == "nt":
+            clean_env["PATH"] = os.environ.get("PATH", "")
+        else:
+            clean_env["PATH"] = "/usr/local/bin:/usr/bin:/bin"
+    if os.name != "nt":
+        clean_env.setdefault("LANG", "en_US.UTF-8")
+    return clean_env
 
 
 def _check_internet(timeout=3):
@@ -5338,46 +5593,8 @@ class BashTool(Tool):
         return self._sandbox if self._sandbox is not False else None
 
     def _build_clean_env(self):
-        """Build sanitized environment dict, stripping secrets."""
-        _ALWAYS_ALLOW = {
-            "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG",
-            "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TMPDIR", "TMP", "TEMP",
-            "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_DATA_HOME",
-            "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "SSH_AUTH_SOCK",
-            "EDITOR", "VISUAL", "PAGER", "HOSTNAME", "PWD", "OLDPWD", "SHLVL",
-            "COLORTERM", "TERM_PROGRAM", "COLUMNS", "LINES", "NO_COLOR",
-            "FORCE_COLOR", "CC", "CXX", "CFLAGS", "LDFLAGS", "PKG_CONFIG_PATH",
-            "GOPATH", "GOROOT", "CARGO_HOME", "RUSTUP_HOME", "JAVA_HOME",
-            "NVM_DIR", "PYENV_ROOT", "VIRTUAL_ENV", "CONDA_DEFAULT_ENV",
-            "OLLAMA_HOST", "PYTHONPATH", "NODE_PATH", "GEM_HOME", "RBENV_ROOT",
-        }
-        _SENSITIVE_PREFIXES = ("CLAUDECODE", "CLAUDE_CODE", "ANTHROPIC",
-                               "OPENAI", "AWS_SECRET", "AWS_SESSION",
-                               "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_",
-                               "HF_TOKEN", "AZURE_")
-        _SENSITIVE_SUBSTRINGS = ("_SECRET", "_TOKEN", "_KEY", "_PASSWORD",
-                                 "_CREDENTIAL", "_API_KEY", "DATABASE_URL",
-                                 "REDIS_URL", "MONGO_URI", "PRIVATE_KEY",
-                                 "_AUTH", "KUBECONFIG")
-        clean_env = {}
-        for k, v in os.environ.items():
-            if k in _ALWAYS_ALLOW:
-                clean_env[k] = v
-                continue
-            k_upper = k.upper()
-            if k_upper.startswith(_SENSITIVE_PREFIXES):
-                continue
-            if any(sub in k_upper for sub in _SENSITIVE_SUBSTRINGS):
-                continue
-            clean_env[k] = v
-        if "PATH" not in clean_env:
-            if os.name == "nt":
-                clean_env["PATH"] = os.environ.get("PATH", "")
-            else:
-                clean_env["PATH"] = "/usr/local/bin:/usr/bin:/bin"
-        if os.name != "nt":
-            clean_env.setdefault("LANG", "en_US.UTF-8")
-        return clean_env
+        """Build sanitized environment dict, applying shell env policy."""
+        return _build_sanitized_env(self._config, kind="shell")
 
     def execute(self, params):
         command = params.get("command", "")
@@ -8017,6 +8234,13 @@ class AskUserQuestionTool(Tool):
         options = params.get("options", [])
         if not question:
             return "Error: question is required"
+        if _active_notifier is not None:
+            _active_notifier.notify("question", {
+                "event": "question",
+                "question": question[:2000],
+                "options": list(options[:10]) if isinstance(options, list) else [],
+                "cwd": os.getcwd(),
+            })
 
         # ── Channel mode: route question through channel_manager ──
         ctx = _active_channel_context
@@ -8176,6 +8400,12 @@ class AskUserQuestionBatchTool(Tool):
         questions = params.get("questions", [])
         if not questions:
             return "Error: questions array is required"
+        if _active_notifier is not None:
+            _active_notifier.notify("question", {
+                "event": "question",
+                "questions": questions[:10],
+                "cwd": os.getcwd(),
+            })
 
         if len(questions) > 10:
             return "Error: maximum 10 questions allowed"
@@ -8684,18 +8914,23 @@ class SubAgentTool(Tool):
 class MCPClient:
     """Communicates with an MCP server over stdin/stdout using JSON-RPC 2.0."""
 
-    def __init__(self, name, command, args=None, env=None):
+    def __init__(self, name, command, args=None, env=None, startup_timeout=30, tool_timeout=30):
         self.name = name
         self.command = command
         self.args = args or []
         self.env = env or {}
+        self.startup_timeout = max(1, int(startup_timeout or 30))
+        self.tool_timeout = max(1, int(tool_timeout or 30))
         self._proc = None
         self._request_id = 0
         self._tools = {}  # name -> schema
 
     def start(self):
         """Start the MCP server subprocess."""
-        full_env = os.environ.copy()
+        full_env = {}
+        for key in ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TMP", "TEMP"):
+            if key in os.environ:
+                full_env[key] = os.environ[key]
         full_env.update(self.env)
         try:
             self._proc = subprocess.Popen(
@@ -8721,9 +8956,7 @@ class MCPClient:
                 except Exception:
                     pass
 
-    MCP_SEND_TIMEOUT = 30  # seconds to wait for MCP server response
-
-    def _send(self, method, params=None):
+    def _send(self, method, params=None, timeout=None):
         """Send a JSON-RPC 2.0 request and return the result."""
         if not self._proc or self._proc.poll() is not None:
             raise RuntimeError(t('errors.mcp_server_not_running', default=f"MCP server '{self.name}' is not running"))
@@ -8742,10 +8975,11 @@ class MCPClient:
             # Use select() with timeout to prevent infinite blocking
             # (npx/MCP servers may take time to start or hang on first launch)
             import select as _sel_mod
-            ready, _, _ = _sel_mod.select([self._proc.stdout], [], [], self.MCP_SEND_TIMEOUT)
+            timeout_s = max(1, int(timeout or self.tool_timeout))
+            ready, _, _ = _sel_mod.select([self._proc.stdout], [], [], timeout_s)
             if not ready:
                 raise RuntimeError(
-                    f"MCP server '{self.name}' did not respond within {self.MCP_SEND_TIMEOUT}s. "
+                    f"MCP server '{self.name}' did not respond within {timeout_s}s. "
                     f"The server may still be starting (e.g. npx downloading packages). "
                     f"Try running the MCP command manually first: {self.command} {' '.join(self.args)}"
                 )
@@ -8766,7 +9000,7 @@ class MCPClient:
             "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {"name": "eve-coder", "version": __version__}
-        })
+        }, timeout=self.startup_timeout)
         # Send initialized notification (no response expected)
         notif = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
         try:
@@ -8778,14 +9012,14 @@ class MCPClient:
 
     def list_tools(self):
         """Discover available tools from the MCP server."""
-        result = self._send("tools/list")
+        result = self._send("tools/list", timeout=self.startup_timeout)
         tools = result.get("tools", [])
         self._tools = {t["name"]: t for t in tools}
         return tools
 
     def call_tool(self, name, arguments):
         """Call a tool on the MCP server."""
-        result = self._send("tools/call", {"name": name, "arguments": arguments})
+        result = self._send("tools/call", {"name": name, "arguments": arguments}, timeout=self.tool_timeout)
         # Extract text content from MCP response
         content = result.get("content", [])
         texts = []
@@ -9024,6 +9258,38 @@ def _is_allowed_mcp_command(command):
     """Check if MCP server command is in the allowlist."""
     base = os.path.basename(command.split()[0]) if command else ""
     return base in _MCP_COMMAND_ALLOWLIST
+
+
+def _normalize_mcp_server_config(name, srv):
+    if not isinstance(srv, dict) or "command" not in srv:
+        return None
+    enabled_tools = [str(item).strip() for item in srv.get("enabled_tools", []) if str(item).strip()]
+    disabled_tools = [str(item).strip() for item in srv.get("disabled_tools", []) if str(item).strip()]
+    env = srv.get("env", {})
+    if not isinstance(env, dict):
+        env = {}
+    env_vars = [str(item).strip() for item in srv.get("env_vars", []) if str(item).strip()]
+    try:
+        startup_timeout = max(1, int(srv.get("startup_timeout_sec", 30)))
+    except (TypeError, ValueError):
+        startup_timeout = 30
+    try:
+        tool_timeout = max(1, int(srv.get("tool_timeout_sec", 30)))
+    except (TypeError, ValueError):
+        tool_timeout = 30
+    return {
+        "name": name,
+        "command": srv["command"],
+        "args": srv.get("args", []),
+        "env": {str(k): str(v) for k, v in env.items()},
+        "env_vars": env_vars,
+        "enabled": bool(srv.get("enabled", True)),
+        "required": bool(srv.get("required", False)),
+        "enabled_tools": enabled_tools,
+        "disabled_tools": disabled_tools,
+        "startup_timeout_sec": startup_timeout,
+        "tool_timeout_sec": tool_timeout,
+    }
 
 
 def _repo_key(config):
@@ -9269,8 +9535,9 @@ def _load_mcp_servers(config):
                 data = json.load(f)
             if isinstance(data, dict) and "mcpServers" in data:
                 for name, srv in data["mcpServers"].items():
-                    if isinstance(srv, dict) and "command" in srv:
-                        servers[name] = srv
+                    normalized = _normalize_mcp_server_config(name, srv)
+                    if normalized:
+                        servers[name] = normalized
         except (OSError, json.JSONDecodeError) as e:
             print(f"{C.YELLOW}{t('warnings.mcp_json_load_failed', default=f'Warning: Could not load mcp.json: {e}')}{C.RESET}", file=sys.stderr)
     # Project-level MCP requires explicit trust
@@ -9282,10 +9549,11 @@ def _load_mcp_servers(config):
                     data = json.load(f)
                 if isinstance(data, dict) and "mcpServers" in data:
                     for name, srv in data["mcpServers"].items():
-                        if isinstance(srv, dict) and "command" in srv:
-                            cmd = srv["command"]
+                        normalized = _normalize_mcp_server_config(name, srv)
+                        if normalized:
+                            cmd = normalized["command"]
                             if _is_allowed_mcp_command(cmd):
-                                servers[name] = srv
+                                servers[name] = normalized
                             else:
                                 msg = t('warnings.mcp_server_blocked', default=f"MCP server '{name}' blocked — command '{cmd}' is not in allowlist")
                                 print(f"{C.YELLOW}{msg}{C.RESET}",
@@ -9298,10 +9566,11 @@ def _load_mcp_servers(config):
     try:
         ext_mgr = ExtensionManager(config)
         for name, srv in ext_mgr.load_mcp_configs().items():
-            if isinstance(srv, dict) and "command" in srv:
-                cmd = srv["command"]
+            normalized = _normalize_mcp_server_config(name, srv)
+            if normalized:
+                cmd = normalized["command"]
                 if _is_allowed_mcp_command(cmd):
-                    servers[name] = srv
+                    servers[name] = normalized
                 else:
                     msg = t('warnings.mcp_server_blocked', default=f"MCP server '{name}' blocked — command '{cmd}' is not in allowlist")
                     print(f"{C.YELLOW}{msg}{C.RESET}", file=sys.stderr)
@@ -9329,16 +9598,30 @@ def _init_mcp_clients(config, registry, permissions):
     clients = []
     mcp_server_configs = _load_mcp_servers(config)
     for srv_name, srv_config in mcp_server_configs.items():
+        if not srv_config.get("enabled", True):
+            continue
         try:
+            full_env = dict(srv_config.get("env", {}))
+            for env_name in srv_config.get("env_vars", []):
+                if env_name in os.environ:
+                    full_env[env_name] = os.environ[env_name]
             mcp = MCPClient(
                 name=srv_name,
                 command=srv_config["command"],
                 args=srv_config.get("args", []),
-                env=srv_config.get("env", {}),
+                env=full_env,
+                startup_timeout=srv_config.get("startup_timeout_sec", 30),
+                tool_timeout=srv_config.get("tool_timeout_sec", 30),
             )
             mcp.start()
             mcp.initialize()
             tools = mcp.list_tools()
+            enabled_tools = set(srv_config.get("enabled_tools", []))
+            disabled_tools = set(srv_config.get("disabled_tools", []))
+            if enabled_tools:
+                tools = [tool_schema for tool_schema in tools if tool_schema.get("name") in enabled_tools]
+            if disabled_tools:
+                tools = [tool_schema for tool_schema in tools if tool_schema.get("name") not in disabled_tools]
             for tool_schema in tools:
                 mcp_tool = MCPTool(mcp, tool_schema)
                 registry.register(mcp_tool)
@@ -9347,6 +9630,8 @@ def _init_mcp_clients(config, registry, permissions):
             if config.debug:
                 print(f"{C.DIM}[debug] MCP '{srv_name}': {len(tools)} tools registered{C.RESET}", file=sys.stderr)
         except Exception as e:
+            if srv_config.get("required"):
+                raise RuntimeError(f"Required MCP server '{srv_name}' failed: {e}")
             print(f"{C.YELLOW}Warning: MCP server '{srv_name}' failed: {e}{C.RESET}", file=sys.stderr)
     return clients
 
@@ -9819,6 +10104,16 @@ def _load_skills(config):
         skills.update(ext_skills)
     except Exception:
         pass  # extension loading failure is non-fatal
+
+    if config.skill_enable_patterns or config.skill_disable_patterns:
+        skills = {
+            name: info for name, info in skills.items()
+            if _skill_is_enabled(
+                config,
+                name,
+                info.get("path") or os.path.join(info.get("skill_dir", ""), f"{name}.md"),
+            )
+        }
 
     return skills
 
@@ -12155,6 +12450,11 @@ def _format_route_report(route_report):
         f"mode: {'plan' if route_report.get('plan_mode') else 'act'}",
         f"prefilter: {'enabled' if route_report.get('prefilter_active') else 'disabled'}",
     ]
+    reasoning = route_report.get("reasoning") or {}
+    if reasoning:
+        lines.append(
+            f"reasoning: think={reasoning.get('think_mode')} budget={reasoning.get('thinking_budget')} effort={reasoning.get('effort')}"
+        )
     if route_report.get("parallel_tasks"):
         lines.append(f"parallel_tasks: {len(route_report['parallel_tasks'])}")
     candidates = route_report.get("candidates", [])
@@ -12239,6 +12539,7 @@ def _build_command_graph_lines(config, agent, registry, prompt_text=""):
                 allowed_tool_names=agent._get_allowed_tool_names() if agent else registry.names(),
                 plan_mode=bool(getattr(agent, "_plan_mode", False)),
             ),
+            "reasoning": agent._active_reasoning_profile() if agent else {},
         }
         report["prefilter_active"] = bool(_derive_route_prefilter(report["candidates"], agent._get_allowed_tool_names() if agent else None))
     elif agent and getattr(agent, "_last_route_report", None):
@@ -12267,8 +12568,9 @@ def _build_bootstrap_graph_lines(config, client, registry, permissions, hook_mgr
         f"[6] approvals            OK    project={sum(permissions.policy_summary().values())}",
         f"[7] mcp.init             {'OK' if mcp_clients else 'SKIP'}  clients={len(mcp_clients)}",
         f"[8] hooks.init           {'OK' if hook_mgr.has_hooks else 'SKIP'}  hooks={len(getattr(hook_mgr, '_hooks', []))}",
-        f"[9] channels.init        {'OK' if channel_manager else 'SKIP'}  channels={','.join(config.channels) if config.channels else '(none)'}",
-        "[10] agent.ready         OK",
+        f"[9] notify.init          {'OK' if config.notify_command else 'SKIP'}  events={','.join(config.notify_on)}",
+        f"[10] channels.init       {'OK' if channel_manager else 'SKIP'}  channels={','.join(config.channels) if config.channels else '(none)'}",
+        "[11] agent.ready         OK",
     ]
     return lines
 
@@ -12337,12 +12639,18 @@ def _build_doctor_lines(config, client, registry, permissions, session, agent, h
         f"  connection:         {'ok' if conn_ok else 'failed'}",
         f"  model_available:    {'yes' if client.check_model(config.model, available_models=models if conn_ok else None) else 'no'}",
         f"  think_mode:         {config.think_mode}",
+        f"  plan_reasoning:     {config.plan_mode_reasoning_effort or '(default)'}",
         f"  context_window:     {config.context_window}",
         f"  pricing:            in={config.prompt_cost_per_mtok}/M out={config.completion_cost_per_mtok}/M",
+        f"  shell_env_policy:   {config.shell_env_policy}",
+        f"  hook_env_policy:    {config.hook_env_policy}",
+        f"  notifier:           {config.notify_command or '(disabled)'}",
+        f"  notify_on:          {', '.join(config.notify_on)}",
         f"  approvals:          global={policy['global_tool_rules'] + policy['global_category_rules'] + policy['global_path_rules']} "
         f"project={policy['project_tool_rules'] + policy['project_category_rules'] + policy['project_path_rules']}",
         f"  trusted_scopes:     {', '.join(trusted_scopes) if trusted_scopes else '(none)'}",
         f"  skills:             {len(skills)}",
+        f"  skill_filters:      enable={len(config.skill_enable_patterns)} disable={len(config.skill_disable_patterns)}",
         f"  custom_commands:    {len(custom_commands)}",
         f"  hooks:              {len(getattr(hook_mgr, '_hooks', [])) if hook_mgr else 0}",
         f"  mcp_clients:        {len(mcp_clients)}",
@@ -12807,46 +13115,8 @@ class HookManager:
         self._load_hooks()
 
     def _build_clean_env(self):
-        """Build sanitized environment dict, stripping secrets."""
-        _ALWAYS_ALLOW = {
-            "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG",
-            "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TMPDIR", "TMP", "TEMP",
-            "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_DATA_HOME",
-            "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "SSH_AUTH_SOCK",
-            "EDITOR", "VISUAL", "PAGER", "HOSTNAME", "PWD", "OLDPWD", "SHLVL",
-            "COLORTERM", "TERM_PROGRAM", "COLUMNS", "LINES", "NO_COLOR",
-            "FORCE_COLOR", "CC", "CXX", "CFLAGS", "LDFLAGS", "PKG_CONFIG_PATH",
-            "GOPATH", "GOROOT", "CARGO_HOME", "RUSTUP_HOME", "JAVA_HOME",
-            "NVM_DIR", "PYENV_ROOT", "VIRTUAL_ENV", "CONDA_DEFAULT_ENV",
-            "OLLAMA_HOST", "PYTHONPATH", "NODE_PATH", "GEM_HOME", "RBENV_ROOT",
-        }
-        _SENSITIVE_PREFIXES = ("CLAUDECODE", "CLAUDE_CODE", "ANTHROPIC",
-                               "OPENAI", "AWS_SECRET", "AWS_SESSION",
-                               "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_",
-                               "HF_TOKEN", "AZURE_")
-        _SENSITIVE_SUBSTRINGS = ("_SECRET", "_TOKEN", "_KEY", "_PASSWORD",
-                                 "_CREDENTIAL", "_API_KEY", "DATABASE_URL",
-                                 "REDIS_URL", "MONGO_URI", "PRIVATE_KEY",
-                                 "_AUTH", "KUBECONFIG")
-        clean_env = {}
-        for k, v in os.environ.items():
-            if k in _ALWAYS_ALLOW:
-                clean_env[k] = v
-                continue
-            k_upper = k.upper()
-            if k_upper.startswith(_SENSITIVE_PREFIXES):
-                continue
-            if any(sub in k_upper for sub in _SENSITIVE_SUBSTRINGS):
-                continue
-            clean_env[k] = v
-        if "PATH" not in clean_env:
-            if os.name == "nt":
-                clean_env["PATH"] = os.environ.get("PATH", "")
-            else:
-                clean_env["PATH"] = "/usr/local/bin:/usr/bin:/bin"
-        if os.name != "nt":
-            clean_env.setdefault("LANG", "en_US.UTF-8")
-        return clean_env
+        """Build sanitized environment dict, applying hook env policy."""
+        return _build_sanitized_env(self.config, kind="hook")
 
     # Allowlisted hook commands (base names only)
     _HOOK_COMMAND_ALLOWLIST = frozenset({
@@ -13176,6 +13446,54 @@ class HookManager:
                 f"{matcher_str} (timeout={h.get('timeout', self.DEFAULT_TIMEOUT)}s, {source})"
             )
         return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Notifications
+# ════════════════════════════════════════════════════════════════════════════════
+
+class NotificationManager:
+    """Dedicated notifier command with JSON payload over stdin."""
+
+    MAX_PAYLOAD = 16_384
+
+    def __init__(self, config):
+        self.config = config
+        self.command = (config.notify_command or "").strip()
+        self.events = set(_normalize_notify_events(getattr(config, "notify_on", [])))
+
+    @property
+    def enabled(self):
+        return bool(self.command)
+
+    def should_notify(self, event_name):
+        return self.enabled and event_name in self.events
+
+    def notify(self, event_name, payload):
+        if not self.should_notify(event_name):
+            return False
+        try:
+            cmd_list = shlex.split(self.command)
+        except ValueError:
+            return False
+        if not cmd_list:
+            return False
+        try:
+            body = json.dumps(payload, ensure_ascii=False)[:self.MAX_PAYLOAD]
+            proc = subprocess.run(
+                cmd_list,
+                input=body,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=self.config.cwd,
+                env=_build_sanitized_env(self.config, kind="hook"),
+            )
+            if self.config.debug and proc.stderr:
+                _scroll_aware_print(f"{C.DIM}[notify:{event_name}] {proc.stderr.strip()[:200]}{C.RESET}")
+            return proc.returncode == 0
+        except Exception:
+            return False
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -16309,6 +16627,26 @@ class Agent:
                 self.session.runtime_state.record_resume_event("stop_reason", f"{reason}: {detail or '-'}")
             except Exception:
                 pass
+        if reason == "error" and _active_notifier is not None:
+            _active_notifier.notify("error", {
+                "event": "error",
+                "reason": reason,
+                "detail": detail or "",
+                "model": self.config.model,
+                "cwd": self.config.cwd,
+                "session_id": self.session.session_id,
+            })
+
+    def _active_reasoning_profile(self):
+        think_mode, thinking_budget, effort = _resolve_reasoning_settings(
+            self.config,
+            plan_mode=self._plan_mode,
+        )
+        return {
+            "think_mode": think_mode,
+            "thinking_budget": thinking_budget,
+            "effort": effort or "(default)",
+        }
 
     def _run_impl(self, user_input, skip_add=False):
         """Internal agent loop implementation."""
@@ -16368,6 +16706,7 @@ class Agent:
             "parallel_tasks": _parallel_tasks,
             "candidates": _route_candidates,
             "prefilter_active": bool(self._route_prefilter_names),
+            "reasoning": self._active_reasoning_profile(),
         }
         if self.session.runtime_state:
             try:
@@ -16439,7 +16778,12 @@ class Agent:
                 response = None
                 last_error = None
                 for retry in range(self.MAX_RETRIES + 1):
+                    _reasoning = self._active_reasoning_profile()
+                    _prev_think_mode = self.client.think_mode
+                    _prev_thinking_budget = self.client.thinking_budget
                     try:
+                        self.client.think_mode = _reasoning["think_mode"]
+                        self.client.thinking_budget = _reasoning["thinking_budget"]
                         response = self.client.chat(
                             model=self.config.model,
                             messages=self.session.get_messages(),
@@ -16455,6 +16799,9 @@ class Agent:
                             time.sleep(1 + retry)  # increasing backoff
                             continue
                         raise
+                    finally:
+                        self.client.think_mode = _prev_think_mode
+                        self.client.thinking_budget = _prev_thinking_budget
 
                 self.tui.stop_spinner()
 
@@ -17035,6 +17382,16 @@ class Agent:
             )
         if self.hook_mgr and self.hook_mgr.has_hooks:
             self.hook_mgr.fire("Stop", {"model": self.config.model, "cwd": self.config.cwd})
+        if _active_notifier is not None:
+            _active_notifier.notify("stop", {
+                "event": "stop",
+                "reason": (self._last_stop_reason or {}).get("reason", "completed"),
+                "detail": (self._last_stop_reason or {}).get("detail", ""),
+                "model": self.config.model,
+                "cwd": self.config.cwd,
+                "session_id": self.session.session_id,
+                "plan_mode": self._plan_mode,
+            })
 
         # Stop ESC monitor (scroll region stays active — managed by main loop)
         _esc_monitor.stop()
@@ -17894,12 +18251,19 @@ def main():
     registry.register(ParallelAgentTool(coordinator))
 
     # Initialize MCP servers
-    _mcp_clients = _init_mcp_clients(config, registry, permissions)
+    try:
+        _mcp_clients = _init_mcp_clients(config, registry, permissions)
+    except RuntimeError as e:
+        print(f"{C.RED}{e}{C.RESET}", file=sys.stderr)
+        sys.exit(1)
 
     # Initialize hooks system
     hook_mgr = HookManager(config)
     if hook_mgr.has_hooks and config.debug:
         print(f"{C.DIM}[debug] Loaded {len(hook_mgr._hooks)} hooks{C.RESET}", file=sys.stderr)
+    notifier = NotificationManager(config)
+    global _active_notifier
+    _active_notifier = notifier
 
     agent = Agent(config, client, registry, permissions, session, tui,
                   rag_engine=_rag_engine, hook_mgr=hook_mgr, code_intel=_code_intel)
@@ -19657,6 +20021,10 @@ def main():
                     print(f"  {_c87x}Context{C.RESET}       {config.context_window}")
                     print(f"  {_c87x}Prompt $/M{C.RESET}    {config.prompt_cost_per_mtok}")
                     print(f"  {_c87x}Output $/M{C.RESET}    {config.completion_cost_per_mtok}")
+                    print(f"  {_c87x}Plan think{C.RESET}    {config.plan_mode_reasoning_effort or '(default)'}")
+                    print(f"  {_c87x}Shell env{C.RESET}     {config.shell_env_policy}")
+                    print(f"  {_c87x}Hook env{C.RESET}      {config.hook_env_policy}")
+                    print(f"  {_c87x}Notify{C.RESET}        {config.notify_command or '(disabled)'}")
                     print(f"  {_c87x}Auto-approve{C.RESET}  {'ON' if config.yes_mode else 'OFF'}")
                     print(f"  {_c87x}Debug{C.RESET}         {'ON' if config.debug else 'OFF'}")
                     print(f"\n  {_c240x}Config: {config.config_file}{C.RESET}")

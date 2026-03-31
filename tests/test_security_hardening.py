@@ -119,6 +119,19 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertIn("global", loaded)
         self.assertNotIn("repo", loaded)
 
+    def test_skill_filters_allow_only_matching_entries(self):
+        config = self.make_config()
+        config.skill_enable_patterns = ["design*"]
+        global_skills = Path(self.config_dir, "skills")
+        global_skills.mkdir(parents=True, exist_ok=True)
+        (global_skills / "design.md").write_text("design skill", encoding="utf-8")
+        (global_skills / "bugfix.md").write_text("bugfix skill", encoding="utf-8")
+
+        loaded = eve_coder._load_skills(config)
+
+        self.assertIn("design", loaded)
+        self.assertNotIn("bugfix", loaded)
+
     def test_expand_shell_injections_blocks_untrusted_content_without_running_shell(self):
         with patch.object(eve_coder.subprocess, "run", side_effect=AssertionError("shell must not run")):
             expanded, error = eve_coder._expand_shell_injections(
@@ -187,6 +200,11 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertIn("EVE_CLI_INSTALL_REF", content)
         self.assertIn("Confirm-UnverifiedRemoteInstaller", content)
         self.assertIn("EVE_CLI_OLLAMA_SETUP_SHA256", content)
+
+    def test_shell_wrapper_allows_official_ollama_cloud_and_version_passthrough(self):
+        content = Path(SCRIPT_DIR, "eve-cli.sh").read_text(encoding="utf-8")
+        self.assertIn("https://(ollama\\.com|www\\.ollama\\.com)(/api)?/?$", content)
+        self.assertIn('if [[ "$arg" == "--version" ]]', content)
 
     def test_extension_manifest_rejects_unsupported_agent_type(self):
         mgr = eve_coder.ExtensionManager(SimpleNamespace(config_dir=self.config_dir))
@@ -345,6 +363,48 @@ class TestSecurityHardening(unittest.TestCase):
         import inspect
         source = inspect.getsource(hooks_mgr.fire)
         self.assertIn("_build_clean_env()", source)
+
+    def test_shell_env_policy_can_explicitly_include_secret(self):
+        config = self.make_config()
+        config.shell_env_policy = "inherit"
+        config.shell_env_include = ["OPENAI_API_KEY"]
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "secret", "SAFE_FLAG": "1"}, clear=True):
+            env = eve_coder._build_sanitized_env(config, kind="shell")
+        self.assertEqual(env["OPENAI_API_KEY"], "secret")
+        self.assertEqual(env["SAFE_FLAG"], "1")
+
+    def test_hook_env_policy_can_exclude_variable(self):
+        config = self.make_config()
+        config.hook_env_policy = "inherit"
+        config.hook_env_exclude = ["CI"]
+        with patch.dict(os.environ, {"CI": "true", "TERM": "xterm"}, clear=True):
+            env = eve_coder._build_sanitized_env(config, kind="hook")
+        self.assertNotIn("CI", env)
+        self.assertEqual(env["TERM"], "xterm")
+
+    def test_mcp_client_only_receives_minimal_env_plus_explicit_vars(self):
+        captured = {}
+
+        class DummyProc:
+            stdin = None
+            stdout = None
+            stderr = None
+
+            def poll(self):
+                return None
+
+        def fake_popen(args, stdin, stdout, stderr, env, start_new_session):
+            captured["env"] = env
+            return DummyProc()
+
+        client = eve_coder.MCPClient("demo", "python3", env={"SAFE_TOKEN": "x"})
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "secret", "PATH": "/usr/bin", "HOME": "/tmp/home"}, clear=True), \
+             patch.object(eve_coder.subprocess, "Popen", side_effect=fake_popen):
+            client.start()
+
+        self.assertEqual(captured["env"]["SAFE_TOKEN"], "x")
+        self.assertEqual(captured["env"]["PATH"], "/usr/bin")
+        self.assertNotIn("OPENAI_API_KEY", captured["env"])
 
     def test_webhook_requires_api_key(self):
         adapter = eve_coder.WebhookAdapter(api_key="")
