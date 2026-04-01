@@ -16,6 +16,7 @@ EvE CLI のカスタマイズや高度な設定について解説します。
 - [コードインテリジェンス](#コードインテリジェンス)
 - [ブラウザ操作（MCP）](#ブラウザ操作mcp)
 - [Agent Teams](#agent-teams)
+- [KAIROS（プロアクティブ監督）](#kairosプロアクティブ監督)
 - [Channels（外部チャンネル連携）](#channels外部チャンネル連携)
 - [環境変数・設定ファイル一覧](#環境変数設定ファイル一覧)
 
@@ -363,6 +364,110 @@ eve-cli
 
 ---
 
+## KAIROS（プロアクティブ監督）
+
+KAIROS は、EvE CLI のバックグラウンド supervisor です。一定間隔で heartbeat を回し、リポジトリ状態、テスト失敗、PR イベント、保留中 approval などを観測して、通知・提案・低リスク自動実行を切り替えます。
+
+### モード
+
+| モード | 振る舞い |
+|-------|----------|
+| `observe` | 実行しません。必要があれば通知だけ出します |
+| `suggest` | 実行計画は立てますが、実行前に approval queue へ入れます |
+| `active` | allowlist に入っている低リスク tool だけ即時実行します |
+
+### 有効化
+
+対話中に手動で起動できます。
+
+```text
+> /kairos on
+> /kairos status
+```
+
+起動時から有効にしたい場合は `kairos.json` に `enabled: true` を入れるか、環境変数 `EVE_CLI_PROACTIVE=1` を付けて起動します。
+
+```bash
+EVE_CLI_PROACTIVE=1 eve-cli
+```
+
+### 設定ファイル
+
+KAIROS の設定は次の順でマージされます。
+
+1. 内部デフォルト
+2. `~/.config/eve-cli/kairos.json`
+3. `.eve-cli/kairos.json`
+4. 環境変数 `EVE_CLI_PROACTIVE=1`（`enabled` を強制有効化）
+
+設定例:
+
+```json
+{
+  "enabled": true,
+  "mode": "observe",
+  "heartbeat_seconds": 300,
+  "active_hours": "workhours",
+  "allow_proactive_tools": [
+    "Read",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskList",
+    "TaskGet"
+  ],
+  "approval_policy": {
+    "low": "allow",
+    "medium": "prompt",
+    "high": "deny"
+  },
+  "pr_watch": {
+    "enabled": true
+  },
+  "dream": {
+    "enabled": true,
+    "schedule": "03:00"
+  },
+  "notification": {
+    "cooldown_sec": 300
+  }
+}
+```
+
+主な項目:
+- `mode`: `observe` / `suggest` / `active`
+- `heartbeat_seconds`: heartbeat 間隔。実装上は 30 秒未満にできません
+- `active_hours`: `always` / `workhours` / `custom`
+- `allow_proactive_tools`: `active` モードで自動実行してよい tool の allowlist
+- `approval_policy`: `low` / `medium` / `high` ごとの扱い
+- `dream.schedule`: `autoDream` の実行時刻（ローカル時刻、`HH:MM`）
+
+### PR 監視
+
+`/kairos watch pr add <repo> <num>` で PR を監視できます。GitHub API のポーリングには `EVE_CLI_GITHUB_TOKEN` が必要です。
+
+監視状態はプロジェクト配下に保存されます。
+
+- `.eve-cli/kairos/watchers.json`
+
+### 状態・ログの保存先
+
+KAIROS は state ディレクトリ配下に実行状態を保存します。既定では macOS / Linux で `~/.local/state/eve-cli/kairos/`、`XDG_STATE_HOME` を設定している場合はその配下です。
+
+| パス | 内容 |
+|------|------|
+| `.../kairos/state.json` | supervisor の状態、last heartbeat、pause 状態 |
+| `.../kairos/approvals.json` | approval queue |
+| `.../kairos/dedupe.json` | 重複実行の cooldown キャッシュ |
+| `.../kairos/audit/YYYY-MM-DD.jsonl` | 監査ログ |
+| `.../kairos/dream/YYYY-MM-DD.md` | `autoDream` レポート |
+
+`/kairos log` は `audit/*.jsonl` を読み、`/kairos dream now` は `dream/*.md` を生成します。
+
+---
+
 ## Channels（外部チャンネル連携）
 
 Discord・Slack・汎用 Webhook から、**実行中の EvE CLI セッションにメッセージを送受信**できる機能です。
@@ -558,12 +663,14 @@ eve-cli --channels discord,slack,webhook
 | `EVE_CLI_PROMPT_COST_PER_MTOK` | 入力 100 万 tokens あたりの推定コスト（USD） | `0.15` |
 | `EVE_CLI_COMPLETION_COST_PER_MTOK` | 出力 100 万 tokens あたりの推定コスト（USD） | `0.60` |
 | `EVE_CLI_PLAN_MODE_REASONING_EFFORT` | Plan mode 用の reasoning 強度 | `high` |
+| `EVE_CLI_PROACTIVE` | KAIROS を強制有効化 | `1` |
 | `EVE_CLI_SHELL_ENV_POLICY` | Bash 実行時の環境変数ポリシー | `inherit` |
 | `EVE_CLI_HOOK_ENV_POLICY` | Hook 実行時の環境変数ポリシー | `inherit` |
 | `EVE_CLI_NOTIFY_COMMAND` | 通知用コマンド | `python3 ~/.config/eve-cli/notify.py` |
 | `EVE_CLI_NOTIFY_ON` | 通知イベント | `stop,error` |
 | `EVE_CLI_SKILLS_ENABLE` | 読み込む skill パターン | `design*,review` |
 | `EVE_CLI_SKILLS_DISABLE` | 除外する skill パターン | `bugfix` |
+| `EVE_CLI_GITHUB_TOKEN` | KAIROS の PR 監視に使う GitHub token | `ghp_...` |
 | `OLLAMA_HOST` | Ollama ホスト URL | `http://localhost:11434` / `https://ollama.com/api` |
 | `OLLAMA_API_KEY` | Ollama Cloud API キー | `ollama_...` |
 
@@ -607,8 +714,11 @@ eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
 | ファイル | 内容 |
 |---------|------|
 | `~/.config/eve-cli/config` | メイン設定 |
+| `~/.config/eve-cli/kairos.json` | KAIROS のグローバル設定 |
 | `~/.config/eve-cli/permissions.json` | グローバルなツール許可・拒否・確認（自動保存） |
 | `.eve-cli/permissions.json` | プロジェクト単位の approval policy（tool / category / path ルール） |
+| `.eve-cli/kairos.json` | KAIROS のプロジェクト設定 |
+| `.eve-cli/kairos/watchers.json` | PR 監視対象の保存 |
 | `~/.config/eve-cli/memory/memory.json` | 長期メモリ |
 | `~/.config/eve-cli/hooks.json` | グローバルフック |
 | `~/.config/eve-cli/mcp.json` | MCP サーバー設定 |
@@ -616,6 +726,7 @@ eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
 | `~/.config/eve-cli/skills/*.md` | カスタムスキル |
 | `~/.config/eve-cli/trusted_repos.json` | 信頼済みリポジトリ |
 | `~/.config/eve-cli/trusted_hooks.json` | 信頼済みフック |
+| `~/.local/state/eve-cli/kairos/` | KAIROS の state, approvals, audit, dream レポート |
 
 `permissions.json` は従来の `{ "ToolName": "allow|deny|prompt" }` 形式に加えて、`tools` / `categories` / `paths` を持つ構造化形式も読めます。
 `prompt` は明示的な確認ポリシーで、`-y` や Guardian auto-mode より優先されます。

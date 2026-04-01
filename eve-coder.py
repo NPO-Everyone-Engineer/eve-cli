@@ -12468,6 +12468,9 @@ class ChannelManager:
             return True
         return msg.sender_id in self._allowlists.get(msg.channel, set())
 
+    def get_adapter(self, channel_name):
+        return self._adapters.get(channel_name)
+
     def add_sender(self, channel_name, sender_id):
         self._allowlists.setdefault(channel_name, set()).add(sender_id)
         self._save_allowlist(channel_name)
@@ -14390,6 +14393,27 @@ class EvolutionEngine:
         else:
             entry["manual_fixed"] += 1
 
+    def record_failure_patterns(self, patterns):
+        error_patterns = self._data.setdefault("error_patterns", {})
+        for pattern in patterns:
+            key = pattern.get("content", "kairos_failure")[:120]
+            entry = error_patterns.setdefault(key, {"count": 0, "auto_fixed": 0, "manual_fixed": 0})
+            entry["count"] += 1
+        self._save()
+
+    def record_success_patterns(self, patterns):
+        workflow_patterns = self._data.setdefault("workflow_patterns", [])
+        for pattern in patterns:
+            content = pattern.get("content", "")
+            existing = next((item for item in workflow_patterns if item.get("sequence") == [content]), None)
+            if existing:
+                existing["count"] = existing.get("count", 0) + 1
+            else:
+                workflow_patterns.append({"sequence": [content], "count": 1})
+        workflow_patterns.sort(key=lambda item: item.get("count", 0), reverse=True)
+        self._data["workflow_patterns"] = workflow_patterns[:20]
+        self._save()
+
     def record_session_end(self, file_types=None):
         self._data["total_sessions"] = self._data.get("total_sessions", 0) + 1
         self._update_workflow_patterns()
@@ -14535,7 +14559,2052 @@ class EvolutionEngine:
 # ════════════════════════════════════════════════════════════════════════════════
 # Session — Conversation history management
 # ════════════════════════════════════════════════════════════════════════════════
+# KAIROS — Proactive Supervisor for EvE CLI (Phase 1 MVP)
+# ════════════════════════════════════════════════════════════════════════════════
+# KAIROS is a 24/7 proactive agent that periodically checks "what's worth doing"
+# and takes action or stays quiet based on context.
+# 
+# Phase 1 MVP: State management, audit logging, heartbeat scheduler
+# ════════════════════════════════════════════════════════════════════════════════
 
+import json
+import os
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+KAIROS_DEFAULTS = {
+    "enabled": False,
+    "mode": "observe",
+    "heartbeat_seconds": 300,
+    "active_hours": "always",
+    "channels": ["desktop"],
+    "allow_proactive_tools": [
+        "Read", "Glob", "Grep", "WebFetch",
+        "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
+    ],
+    "approval_policy": {
+        "low": "allow",
+        "medium": "prompt",
+        "high": "deny",
+    },
+    "pr_watch": {
+        "enabled": False,
+        "repositories": [],
+        "events": ["opened", "review_requested", "check_suite_failed"],
+        "allow_comment": False,
+        "allow_push": False,
+    },
+    "file_delivery": {
+        "enabled": False,
+        "destinations": [],
+        "max_size_mb": 10,
+    },
+    "dream": {
+        "enabled": True,
+        "schedule": "03:00",
+    },
+    "notification": {
+        "cooldown_sec": 300,
+        "ntfy_topic": "",
+        "redact_diffs": True,
+    },
+}
+
+
+def _deep_copy_dict(value):
+    if isinstance(value, dict):
+        return {k: _deep_copy_dict(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_deep_copy_dict(v) for v in value]
+    return value
+
+
+def _deep_merge_dict(base, override):
+    if not isinstance(override, dict):
+        return base
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge_dict(base[key], value)
+        else:
+            base[key] = _deep_copy_dict(value)
+    return base
+
+
+def _env_truthy(name):
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_json_file(path):
+    if not path or not os.path.isfile(path) or os.path.islink(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _config_value(config, key, default=None):
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _kairos_settings(config):
+    """Return merged KAIROS settings from defaults, JSON config, and env."""
+    settings = _deep_copy_dict(KAIROS_DEFAULTS)
+    if isinstance(config, dict):
+        raw = config.get("kairos", config if "heartbeat_seconds" in config else {})
+        if isinstance(raw, dict):
+            _deep_merge_dict(settings, raw)
+    else:
+        config_dir = _config_value(config, "config_dir", os.path.join(os.path.expanduser("~"), ".config", "eve-cli"))
+        cwd = _config_value(config, "cwd", os.getcwd())
+        _deep_merge_dict(settings, _load_json_file(os.path.join(config_dir, "kairos.json")))
+        _deep_merge_dict(settings, _load_json_file(os.path.join(cwd, ".eve-cli", "kairos.json")))
+    if _env_truthy("EVE_CLI_PROACTIVE"):
+        settings["enabled"] = True
+    return settings
+
+
+def _get_kairos_state_dir(config=None):
+    """Return the state directory for KAIROS files."""
+    state_root = _config_value(config, "state_dir") if config is not None else None
+    if state_root:
+        state_dir = os.path.join(state_root, "kairos")
+    else:
+        xdg_state = os.environ.get("XDG_STATE_HOME")
+        if xdg_state:
+            base = os.path.join(xdg_state, "eve-cli")
+        elif os.name == "nt":
+            base = os.path.join(os.path.expanduser("~"), "AppData", "Local", "eve-cli")
+        else:
+            base = os.path.join(os.path.expanduser("~"), ".local", "state", "eve-cli")
+        state_dir = os.path.join(base, "kairos")
+    os.makedirs(state_dir, exist_ok=True)
+    return state_dir
+
+
+def _get_kairos_project_dir(config=None):
+    cwd = _config_value(config, "cwd", os.getcwd()) if config is not None else os.getcwd()
+    path = os.path.join(cwd, ".eve-cli", "kairos")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+class KairosStateStore:
+    """
+    Persists KAIROS supervisor state across restarts.
+    Uses atomic write (tmp file → replace) for crash safety.
+    """
+    
+    VERSION = 1
+    
+    def __init__(self, config):
+        self.config = config
+        self.state_path = os.path.join(_get_kairos_state_dir(config), 'state.json')
+        self.state = self._load()
+    
+    def _default_state(self):
+        return {
+            "version": self.VERSION,
+            "enabled": False,
+            "mode": "observe",
+            "supervisor_state": "idle",
+            "heartbeat_cursor": None,
+            "last_heartbeat": None,
+            "next_heartbeat": None,
+            "last_dream": None,
+            "pause_until": None,
+            "active_watchers": [],
+            "last_action": None,
+            "last_error": None,
+            "created_at": datetime.now().isoformat(),
+        }
+    
+    def _load(self):
+        """Loads state from file, or returns default if not exists"""
+        if os.path.exists(self.state_path):
+            try:
+                with open(self.state_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # Merge with defaults for backward compatibility
+                    default = self._default_state()
+                    default.update(data)
+                    return default
+            except (json.JSONDecodeError, IOError):
+                pass
+        return self._default_state()
+    
+    def save(self):
+        """Saves state atomically (tmp → replace)"""
+        tmp_path = self.state_path + '.tmp'
+        try:
+            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.state_path)
+        except OSError:
+            # Clean up tmp file on error
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+    
+    def get(self, key, default=None):
+        return self.state.get(key, default)
+    
+    def set(self, key, value):
+        self.state[key] = value
+    
+    def reset(self):
+        """Resets state to defaults"""
+        self.state = self._default_state()
+        self.save()
+
+    def _aux_path(self, name):
+        return os.path.join(_get_kairos_state_dir(self.config), name)
+
+    def load_aux_json(self, name, default):
+        path = self._aux_path(name)
+        if not os.path.exists(path):
+            return _deep_copy_dict(default)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, type(default)) else _deep_copy_dict(default)
+        except (OSError, json.JSONDecodeError):
+            return _deep_copy_dict(default)
+
+    def save_aux_json(self, name, data):
+        path = self._aux_path(name)
+        tmp_path = path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+
+class KairosAuditLog:
+    """
+    Append-only audit log for KAIROS actions (JSONL format).
+    Each line is a complete JSON record for crash resilience.
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self.log_dir = os.path.join(_get_kairos_state_dir(config), 'audit')
+        os.makedirs(self.log_dir, exist_ok=True)
+    
+    def _today_path(self):
+        """Returns today's log file path"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        return os.path.join(self.log_dir, f'{today}.jsonl')
+    
+    def _date_path(self, date_str):
+        """Returns log file path for specified date"""
+        return os.path.join(self.log_dir, f'{date_str}.jsonl')
+    
+    def append(self, entry):
+        """
+        Appends a log entry (must be dict).
+        Uses O_APPEND mode for append-only guarantee.
+        """
+        path = self._today_path()
+        entry = dict(entry)
+        timestamp = entry.get("timestamp") or datetime.now().isoformat()
+        entry["timestamp"] = timestamp
+        entry["_timestamp"] = timestamp
+        try:
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        except IOError as e:
+            # Log to stderr but don't crash
+            print(f"KAIROS audit log write error: {e}", file=sys.stderr)
+    
+    def read_today(self):
+        """Reads all entries from today's log"""
+        return self._read_file(self._today_path())
+    
+    def read_date(self, date_str):
+        """Reads all entries from specified date (YYYY-MM-DD)"""
+        return self._read_file(self._date_path(date_str))
+    
+    def _read_file(self, path):
+        """Reads JSONL file, skipping invalid lines"""
+        if not os.path.exists(path):
+            return []
+        entries = []
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass  # Skip corrupted lines
+        except IOError:
+            pass
+        return entries
+    
+    def list_dates(self):
+        """Lists all dates with log files"""
+        dates = []
+        if os.path.exists(self.log_dir):
+            for f in os.listdir(self.log_dir):
+                if f.endswith('.jsonl'):
+                    dates.append(f[:-6])  # Remove .jsonl
+        return sorted(dates, reverse=True)
+
+
+class HeartbeatScheduler:
+    """
+    Manages periodic heartbeat ticks using threading.Timer.
+    Prevents overlapping executions and supports dynamic interval changes.
+    """
+    
+    DEFAULT_INTERVAL = 300  # 5 minutes
+    MIN_INTERVAL = 30       # 30 seconds
+    MAX_INTERVAL = 3600     # 1 hour
+    
+    def __init__(self, interval=None, callback=None):
+        self.interval = interval or self.DEFAULT_INTERVAL
+        self.interval = max(self.MIN_INTERVAL, min(self.interval, self.MAX_INTERVAL))
+        self.callback = callback
+        self.timer = None
+        self.running = False
+        self.lock = threading.Lock()
+        self.last_run = None
+        self.next_run_at = None
+        self._callback_in_progress = False
+    
+    def start(self):
+        """Starts the heartbeat scheduler in background"""
+        with self.lock:
+            if self.running:
+                return
+            self.running = True
+        self._schedule_next()
+    
+    def stop(self):
+        """Stops the heartbeat scheduler"""
+        with self.lock:
+            self.running = False
+            self.next_run_at = None
+            if self.timer:
+                self.timer.cancel()
+                self.timer = None
+    
+    def _schedule_next(self):
+        """Schedules the next heartbeat tick"""
+        with self.lock:
+            if not self.running:
+                return
+            self.next_run_at = time.time() + self.interval
+            self.timer = threading.Timer(self.interval, self._run)
+            self.timer.daemon = True
+            self.timer.start()
+    
+    def _run(self):
+        """Executes the heartbeat callback with overlap prevention"""
+        now = time.time()
+        
+        with self.lock:
+            if not self.running or self._callback_in_progress:
+                return
+            # Prevent overlapping executions
+            if self.last_run and (now - self.last_run) < self.interval:
+                return
+            self.last_run = now
+            self._callback_in_progress = True
+        
+        try:
+            if self.callback:
+                self.callback()
+        except Exception as e:
+            # Log error but don't stop the scheduler
+            print(f"Heartbeat callback error: {e}", file=sys.stderr)
+        finally:
+            with self.lock:
+                self._callback_in_progress = False
+            self._schedule_next()
+    
+    def set_interval(self, interval):
+        """Changes the heartbeat interval (takes effect on next tick)"""
+        self.interval = max(self.MIN_INTERVAL, min(interval, self.MAX_INTERVAL))
+
+    def next_run_iso(self):
+        if not self.next_run_at:
+            return None
+        return datetime.fromtimestamp(self.next_run_at).isoformat()
+
+
+class ObservationCollector:
+    """
+    Collects current context and signals during heartbeat.
+    Integrates with existing EvE CLI components.
+    """
+    
+    def __init__(self, config, session=None, git_checkpoint=None,
+                 file_watcher=None, test_runner=None, approval_queue=None,
+                 pr_gateway=None, notifier=None, change_tracker=None):
+        self.config = config
+        self.session = session
+        self.git_checkpoint = git_checkpoint
+        self.file_watcher = file_watcher
+        self.test_runner = test_runner
+        self.approval_queue = approval_queue
+        self.pr_gateway = pr_gateway
+        self.notifier = notifier
+        self.change_tracker = change_tracker
+    
+    def collect(self):
+        """Collects current observation data"""
+        settings = _kairos_settings(self.config)
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "mode": settings.get("mode", "observe"),
+            "repo": self._collect_repo(),
+            "signals": self._collect_signals(),
+            "recent_actions": self._collect_recent_actions(),
+            "recent_notifications": self._collect_recent_notifications(),
+        }
+    
+    def _collect_repo(self):
+        """Collects repository state"""
+        try:
+            import subprocess
+            # Get current branch
+            branch = "unknown"
+            try:
+                result = subprocess.run(
+                    ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    branch = result.stdout.strip()
+            except:
+                pass
+            
+            staged_files = []
+            unstaged_files = []
+            dirty = False
+            try:
+                result = subprocess.run(
+                    ['git', 'status', '--porcelain'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        if not line:
+                            continue
+                        dirty = True
+                        status = line[:2]
+                        path = line[3:] if len(line) > 3 else ""
+                        if status[0] != " " and path:
+                            staged_files.append(path)
+                        if status[1] != " " and path:
+                            unstaged_files.append(path)
+            except:
+                pass
+            
+            return {
+                "cwd": os.getcwd(),
+                "git_branch": branch,
+                "dirty": dirty,
+                "staged_files": staged_files,
+                "unstaged_files": unstaged_files,
+            }
+        except Exception as e:
+            return {"cwd": os.getcwd(), "git_branch": "error", "dirty": False, "error": str(e)}
+    
+    def _collect_signals(self):
+        """Collects event signals from various sources"""
+        signals = {
+            "file_events": [],
+            "test_failures": [],
+            "pr_events": [],
+            "pending_approvals": 0,
+            "recent_errors": [],
+            "notification_failures": [],
+        }
+        
+        # File watcher events
+        if self.file_watcher and hasattr(self.file_watcher, 'get_recent_events'):
+            try:
+                signals["file_events"] = self.file_watcher.get_recent_events()
+            except:
+                pass
+        elif self.file_watcher and hasattr(self.file_watcher, 'get_pending_changes'):
+            try:
+                pending = self.file_watcher.get_pending_changes()
+                signals["file_events"] = [
+                    {"type": change_type, "path": path}
+                    for change_type, path in pending[:20]
+                ]
+            except:
+                pass
+        
+        # Test failures
+        if self.test_runner and hasattr(self.test_runner, 'get_recent_failures'):
+            try:
+                signals["test_failures"] = self.test_runner.get_recent_failures()
+            except:
+                pass
+        elif self.session and hasattr(self.session, "get_resume_summary"):
+            try:
+                latest_verifier = self.session.get_resume_summary().get("latest_verifier") or {}
+                if latest_verifier and latest_verifier.get("status") not in (None, "passed"):
+                    signals["test_failures"] = [latest_verifier]
+            except:
+                pass
+        
+        # Session errors
+        if self.session and hasattr(self.session, 'get_recent_errors'):
+            try:
+                signals["recent_errors"] = self.session.get_recent_errors()
+            except:
+                pass
+        elif self.session and hasattr(self.session, "get_resume_summary"):
+            try:
+                recent_events = self.session.get_resume_summary().get("recent_events") or []
+                signals["recent_errors"] = [
+                    event for event in recent_events
+                    if "error" in (event.get("message", "") or "").lower()
+                ][:5]
+            except:
+                pass
+
+        if self.approval_queue:
+            try:
+                signals["pending_approvals"] = len(self.approval_queue.get_pending())
+            except:
+                pass
+
+        if self.pr_gateway:
+            try:
+                signals["pr_events"] = []
+            except:
+                pass
+
+        if self.notifier and hasattr(self.notifier, "recent_failures"):
+            signals["notification_failures"] = list(self.notifier.recent_failures)
+        
+        return signals
+
+    def _collect_recent_actions(self):
+        if self.change_tracker and hasattr(self.change_tracker, "format_recent"):
+            try:
+                return self.change_tracker.format_recent(limit=5)
+            except Exception:
+                return []
+        return []
+
+    def _collect_recent_notifications(self):
+        if self.notifier and hasattr(self.notifier, "recent_notifications"):
+            return list(self.notifier.recent_notifications[-5:])
+        return []
+
+
+class NotificationGateway:
+    """
+    Sends desktop notifications for KAIROS events.
+    Supports macOS (osascript), Linux (notify-send), and Windows (toast).
+    """
+    
+    MAX_HISTORY = 20
+
+    def __init__(self, config, channel_manager=None):
+        self.config = config
+        self.channel_manager = channel_manager
+        settings = _kairos_settings(config)
+        self.channels = settings.get("channels", ["desktop"])
+        self.cooldown_sec = settings.get('notification', {}).get('cooldown_sec', 300)
+        self.last_notify = {}
+        self.lock = threading.Lock()
+        self.recent_notifications = []
+        self.recent_failures = []
+    
+    def send(self, title, body, category='general'):
+        """
+        Sends a notification with cooldown protection.
+        
+        Args:
+            title: Notification title
+            body: Notification body text
+            category: Category for cooldown grouping (default: 'general')
+        """
+        # Check cooldown
+        now = time.time()
+        with self.lock:
+            if category in self.last_notify:
+                if (now - self.last_notify[category]) < self.cooldown_sec:
+                    return False  # Cooldown active
+            self.last_notify[category] = now
+        
+        # Send based on platform
+        try:
+            sent = False
+            if "desktop" in self.channels and sys.platform == 'darwin':
+                self._send_macos(title, body)
+                sent = True
+            elif "desktop" in self.channels and sys.platform == 'linux':
+                self._send_linux(title, body)
+                sent = True
+            elif "desktop" in self.channels and sys.platform == 'win32':
+                self._send_windows(title, body)
+                sent = True
+            if sent:
+                self._record_notification(title, body, category)
+            return sent
+        except Exception as e:
+            self._record_failure(str(e))
+            print(f"Notification send error: {e}", file=sys.stderr)
+            return False
+    
+    def _send_macos(self, title, body):
+        """Sends notification via macOS osascript"""
+        # Escape special characters for AppleScript
+        title_escaped = title.replace('"', '\\\"').replace('\\', '\\\\')
+        body_escaped = body.replace('"', '\\\"').replace('\\', '\\\\')
+        
+        script = f'''
+        display notification "{body_escaped}" with title "{title_escaped}"
+        '''
+        subprocess.run(['osascript', '-e', script], capture_output=True, timeout=5)
+    
+    def _send_linux(self, title, body):
+        """Sends notification via Linux notify-send"""
+        subprocess.run(
+            ['notify-send', title, body],
+            capture_output=True, timeout=5
+        )
+    
+    def _send_windows(self, title, body):
+        """Sends notification via Windows toast (placeholder)"""
+        # TODO: Implement Windows toast notification
+        pass
+
+    def _record_notification(self, title, body, category):
+        self.recent_notifications.append({
+            "timestamp": datetime.now().isoformat(),
+            "title": title,
+            "body": body[:200],
+            "category": category,
+        })
+        self.recent_notifications = self.recent_notifications[-self.MAX_HISTORY:]
+
+    def _record_failure(self, message):
+        self.recent_failures.append({
+            "timestamp": datetime.now().isoformat(),
+            "error": message[:200],
+        })
+        self.recent_failures = self.recent_failures[-self.MAX_HISTORY:]
+
+
+class KairosSupervisor:
+    """
+    Core KAIROS supervisor that orchestrates all components.
+    Manages heartbeat loop, state persistence, and audit logging.
+    """
+    
+    def __init__(self, config, session=None, state_store=None, audit_log=None,
+                 scheduler=None, collector=None, notifier=None):
+        self.config = config
+        self.session = session
+        self.state_store = state_store or KairosStateStore(config)
+        self.audit_log = audit_log or KairosAuditLog(config)
+        self.collector = collector
+        self.notifier = notifier or NotificationGateway(config)
+        self.settings = _kairos_settings(config)
+        
+        # Create scheduler with callback
+        interval = self.settings.get('heartbeat_seconds', 300)
+        self.scheduler = scheduler or HeartbeatScheduler(interval)
+        self.scheduler.callback = self._on_heartbeat
+        
+        self.running = False
+    
+    def start(self):
+        """Starts the KAIROS supervisor"""
+        if self.running:
+            return
+        
+        self.state_store.set('enabled', True)
+        self.state_store.set('supervisor_state', 'idle')
+        self.state_store.set('mode', self.settings.get('mode', 'observe'))
+        self.state_store.set('next_heartbeat', (datetime.now() + timedelta(seconds=self.scheduler.interval)).isoformat())
+        self.state_store.save()
+        
+        self.scheduler.start()
+        self.running = True
+        
+        # Log startup
+        self.audit_log.append({
+            "event": "kairos_started",
+            "mode": self.state_store.get('mode', 'observe'),
+        })
+        
+        # Send startup notification
+        self.notifier.send("KAIROS started", "Proactive supervisor is now running", "startup")
+    
+    def stop(self):
+        """Stops the KAIROS supervisor"""
+        if not self.running:
+            return
+        
+        self.running = False
+        self.scheduler.stop()
+        
+        self.state_store.set('enabled', False)
+        self.state_store.set('supervisor_state', 'stopped')
+        self.state_store.set('next_heartbeat', None)
+        self.state_store.save()
+        
+        # Log shutdown
+        self.audit_log.append({
+            "event": "kairos_stopped",
+        })
+    
+    def _on_heartbeat(self):
+        """
+        Heartbeat callback - collects observation and logs state.
+        Phase 1 MVP: Only logs, no decision engine or actions.
+        """
+        heartbeat_id = self._generate_heartbeat_id()
+        if self._skip_heartbeat(heartbeat_id):
+            return
+        
+        # Update state
+        self.state_store.set('supervisor_state', 'collecting')
+        self.state_store.set('last_heartbeat', datetime.now().isoformat())
+        self.state_store.save()
+        
+        # Collect observation
+        observation = {}
+        error = None
+        try:
+            if self.collector:
+                observation = self.collector.collect()
+            observation['heartbeat_id'] = heartbeat_id
+        except Exception as e:
+            error = str(e)
+            observation = {"heartbeat_id": heartbeat_id, "error": error}
+        
+        # MVP: Always "quiet" decision (no actions)
+        decision = "quiet"
+        observed_summary = json.dumps(observation, ensure_ascii=False)[:100]
+        
+        # Log to audit
+        self.audit_log.append({
+            "event": "heartbeat_tick",
+            "timestamp": datetime.now().isoformat(),
+            "heartbeat_id": heartbeat_id,
+            "observed_context_summary": observed_summary,
+            "decision": decision,
+            "risk_level": "low",
+            "approval_result": "auto_allowed",
+            "executed_actions": [],
+            "tool_calls": [],
+            "outputs_summary": "",
+            "notification_status": "skipped",
+            "error": error,
+        })
+        
+        # Update state
+        self.state_store.set('supervisor_state', 'idle')
+        self.state_store.set('heartbeat_cursor', heartbeat_id)
+        self.state_store.set('next_heartbeat', (datetime.now() + timedelta(seconds=self.scheduler.interval)).isoformat())
+        if error:
+            self.state_store.set('last_error', error)
+        self.state_store.save()
+    
+    def _generate_heartbeat_id(self):
+        """Generates heartbeat ID: hb_YYYYMMDD_HHMMSS_seq"""
+        now = datetime.now()
+        cursor = self.state_store.get('heartbeat_cursor', '')
+        seq = 1
+        
+        if cursor and isinstance(cursor, str) and cursor.startswith(f"hb_{now.strftime('%Y%m%d')}"):
+            try:
+                seq = int(cursor.split('_')[-1]) + 1
+            except:
+                seq = 1
+        
+        return f"hb_{now.strftime('%Y%m%d_%H%M%S')}_{seq:03d}"
+    
+    def get_status(self):
+        """Returns current status dict"""
+        return {
+            "enabled": self.state_store.get('enabled', False),
+            "mode": self.state_store.get('mode', 'observe'),
+            "state": self.state_store.get('supervisor_state', 'unknown'),
+            "last_heartbeat": self.state_store.get('last_heartbeat'),
+            "next_heartbeat": self.state_store.get('next_heartbeat') or self.scheduler.next_run_iso(),
+            "heartbeat_cursor": self.state_store.get('heartbeat_cursor'),
+            "last_action": self.state_store.get('last_action'),
+            "last_dream": self.state_store.get('last_dream'),
+            "last_error": self.state_store.get('last_error'),
+            "active_watchers": self.state_store.get('active_watchers', []),
+            "paused": self.is_paused(),
+            "pause_until": self.state_store.get('pause_until'),
+            "running": self.running,
+        }
+
+    def pause(self, minutes):
+        pause_until = datetime.now() + timedelta(minutes=max(1, int(minutes)))
+        self.state_store.set("pause_until", pause_until.isoformat())
+        self.state_store.set("supervisor_state", "paused")
+        self.state_store.save()
+        return pause_until
+
+    def resume(self):
+        self.state_store.set("pause_until", None)
+        self.state_store.set("supervisor_state", "idle")
+        self.state_store.save()
+
+    def is_paused(self):
+        pause_until = self.state_store.get("pause_until")
+        if not pause_until:
+            return False
+        try:
+            paused = datetime.now() < datetime.fromisoformat(pause_until)
+            if not paused:
+                self.state_store.set("pause_until", None)
+                if self.state_store.get("supervisor_state") == "paused":
+                    self.state_store.set("supervisor_state", "idle")
+                self.state_store.save()
+            return paused
+        except ValueError:
+            return False
+
+    def _skip_heartbeat(self, heartbeat_id):
+        if self.is_paused():
+            self.audit_log.append({
+                "event": "heartbeat_skipped",
+                "heartbeat_id": heartbeat_id,
+                "reason": "paused",
+            })
+            self.state_store.set('next_heartbeat', (datetime.now() + timedelta(seconds=self.scheduler.interval)).isoformat())
+            self.state_store.save()
+            return True
+        if not self._within_active_hours():
+            self.audit_log.append({
+                "event": "heartbeat_skipped",
+                "heartbeat_id": heartbeat_id,
+                "reason": "outside_active_hours",
+            })
+            self.state_store.set('next_heartbeat', (datetime.now() + timedelta(seconds=self.scheduler.interval)).isoformat())
+            self.state_store.save()
+            return True
+        return False
+
+    def _within_active_hours(self, now=None):
+        now = now or datetime.now()
+        active_hours = self.settings.get("active_hours", "always")
+        if active_hours == "always":
+            return True
+        if active_hours == "workhours":
+            return now.weekday() < 5 and 9 <= now.hour < 18
+        if active_hours != "custom":
+            return True
+        windows = self.settings.get("custom_hours", {}) or {}
+        day_key = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][now.weekday()]
+        for window in windows.get(day_key, []):
+            if not isinstance(window, (list, tuple)) or len(window) != 2:
+                continue
+            try:
+                start_hour, start_minute = [int(part) for part in window[0].split(":")]
+                end_hour, end_minute = [int(part) for part in window[1].split(":")]
+            except (TypeError, ValueError):
+                continue
+            start_minutes = start_hour * 60 + start_minute
+            end_minutes = end_hour * 60 + end_minute
+            current_minutes = now.hour * 60 + now.minute
+            if start_minutes <= current_minutes < end_minutes:
+                return True
+        return False
+# ════════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════════
+# KAIROS Phase 2: Decision Engine & Risk Evaluation
+# ════════════════════════════════════════════════════════════════════════════════
+
+class DecisionEngine:
+    """
+    Uses LLM to make proactive decisions based on observations.
+    Returns structured decision: quiet/notify_only/plan/act
+    """
+    
+    def __init__(self, config, client):
+        self.config = config
+        self.client = client  # OllamaClient
+    
+    def decide(self, observation: dict) -> 'DecisionResult':
+        """
+        Calls LLM to make a decision based on observation.
+        Returns DecisionResult with structured action plan.
+        """
+        prompt = self._build_prompt(observation)
+        
+        try:
+            if not self.client or not hasattr(self.client, "chat"):
+                raise ValueError("Ollama client is unavailable")
+            model = (_config_value(self.config, "sidecar_model", "")
+                     or _config_value(self.config, "model", ""))
+            if not model:
+                raise ValueError("No model configured for decision engine")
+            response = self.client.chat(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are EvE CLI's proactive supervisor (KAIROS). "
+                                   "Decide whether to take action or stay quiet based on observations. "
+                                   "Respond ONLY with valid JSON in the specified format.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                tools=None,
+                stream=False,
+            )
+            if isinstance(response, dict):
+                choices = response.get("choices") or []
+                if choices:
+                    response_text = choices[0].get("message", {}).get("content", "")
+                else:
+                    response_text = response.get("message", {}).get("content", "")
+            else:
+                response_text = str(response)
+            return self._parse_response(response_text)
+        except Exception as e:
+            # Fallback to quiet on error
+            return DecisionResult(
+                decision="quiet",
+                reason=f"Decision engine error: {str(e)}",
+                goal=None,
+                proposed_actions=[],
+                risk_level="low",
+                requires_approval=False,
+            )
+    
+    def _build_prompt(self, observation: dict) -> str:
+        """Builds the decision prompt"""
+        obs_summary = json.dumps(observation, ensure_ascii=False, indent=2)[:2000]
+        mode = observation.get("mode") or _kairos_settings(self.config).get("mode", "observe")
+        timestamp = observation.get("timestamp") or datetime.now().isoformat()
+        repo = observation.get("repo", {})
+        
+        return f"""You are EvE CLI's proactive supervisor (KAIROS).
+Decide whether to take action RIGHT NOW based on the observations.
+
+## Current Context
+time: {timestamp}
+mode: {mode}
+repo: {repo.get('cwd', '')} ({repo.get('git_branch', 'unknown')})
+
+## Observation
+{obs_summary}
+
+## Decision Options
+Choose ONE:
+- "quiet": Nothing urgent, stay idle
+- "notify_only": Notify user but don't act
+- "plan": Prepare action plan for approval
+- "act": Execute immediately (low-risk only)
+
+## Output Format (JSON ONLY)
+{{
+  "decision": "quiet|notify_only|plan|act",
+  "reason": "Why you chose this (50 chars max)",
+  "goal": "What you want to achieve (50 chars max)",
+  "proposed_actions": [
+    {{"tool": "ToolName", "params": {{"key": "value"}}}}
+  ],
+  "risk_level": "low|medium|high",
+  "requires_approval": true/false
+}}
+
+## Rules
+- Max 3 proposed_actions
+- High-risk actions always require approval
+- If uncertain, choose "quiet" or "notify_only"
+- Consider user's current work (don't interrupt)
+
+Respond with JSON only, no other text.
+"""
+    
+    def _parse_response(self, response: str) -> 'DecisionResult':
+        """Parses LLM response into DecisionResult"""
+        # Extract JSON from response
+        import re
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if not json_match:
+            raise ValueError("No JSON in response")
+        
+        data = json.loads(json_match.group(0))
+        
+        return DecisionResult(
+            decision=data.get('decision', 'quiet'),
+            reason=data.get('reason', '')[:50],
+            goal=data.get('goal'),
+            proposed_actions=data.get('proposed_actions', [])[:3],
+            risk_level=data.get('risk_level', 'low'),
+            requires_approval=data.get('requires_approval', False),
+        )
+
+
+class DecisionResult:
+    """Structured decision result from DecisionEngine"""
+    
+    def __init__(self, decision: str, reason: str, goal: str = None,
+                 proposed_actions: list = None, risk_level: str = "low",
+                 requires_approval: bool = False):
+        self.decision = decision
+        self.reason = reason
+        self.goal = goal
+        self.proposed_actions = proposed_actions or []
+        self.risk_level = risk_level
+        self.requires_approval = requires_approval
+
+
+class RiskEvaluator:
+    """
+    Evaluates risk level of proposed actions.
+    Classifies into low/medium/high based on tool and parameters.
+    """
+    
+    # Tool risk classification
+    LOW_RISK_TOOLS = frozenset({
+        "Read", "Glob", "Grep", "WebFetch", "WebSearch",
+        "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
+        "SubAgent",
+    })
+    
+    MEDIUM_RISK_TOOLS = frozenset({
+        "Write", "Edit", "ApplyPatch", "MultiEdit",
+        "NotebookEdit",
+    })
+    
+    HIGH_RISK_TOOLS = frozenset({
+        "Bash",
+    })
+    
+    # Dangerous patterns in Bash commands
+    DANGEROUS_PATTERNS = [
+        r"rm\s+(-[rf]+\s+)?/",
+        r"DROP\s+DATABASE",
+        r"DELETE\s+FROM\s+\w+\s*(WHERE\s+1\s*=\s*1)?",
+        r"chmod\s+777",
+        r"sudo\s+rm",
+        r"eval\s*\(",
+        r"exec\s*\(",
+    ]
+    
+    def __init__(self, config):
+        self.config = config
+        self.policy = _kairos_settings(config).get('approval_policy', {
+            'low': 'allow',
+            'medium': 'prompt',
+            'high': 'deny',
+        })
+    
+    def evaluate(self, action: dict) -> str:
+        """
+        Evaluates risk level of a single action.
+        Returns: "low" | "medium" | "high"
+        """
+        tool_name = action.get('tool', '')
+        params = action.get('params', {})
+        
+        # Check tool-based risk
+        if tool_name in self.HIGH_RISK_TOOLS:
+            return "high"
+        
+        if tool_name in self.MEDIUM_RISK_TOOLS:
+            return "medium"
+        
+        if tool_name in self.LOW_RISK_TOOLS:
+            return "low"
+        
+        # Unknown tool → medium risk
+        return "medium"
+    
+    def _has_dangerous_pattern(self, cmd: str) -> bool:
+        """Checks if command contains dangerous patterns"""
+        if not cmd:
+            return False
+        
+        import re
+        for pattern in self.DANGEROUS_PATTERNS:
+            if re.search(pattern, cmd, re.IGNORECASE):
+                return True
+        return False
+    
+    def requires_approval(self, risk_level: str) -> bool:
+        """Checks if risk level requires user approval"""
+        policy_action = self.policy.get(risk_level, 'prompt')
+        return policy_action != 'allow'
+    
+    def evaluate_batch(self, actions: list) -> str:
+        """
+        Evaluates overall risk of multiple actions.
+        Returns highest risk level.
+        """
+        if not actions:
+            return "low"
+        
+        risk_levels = {"low": 0, "medium": 1, "high": 2}
+        max_risk = "low"
+        
+        for action in actions:
+            risk = self.evaluate(action)
+            if risk_levels.get(risk, 0) > risk_levels.get(max_risk, 0):
+                max_risk = risk
+        
+        return max_risk
+
+
+class ApprovalQueue:
+    """
+    Manages approval queue for medium/high risk actions.
+    Supports timeout and user approval/denial.
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self.queue = []
+        self.lock = threading.Lock()
+        self.timeout_sec = _kairos_settings(config).get('approval_timeout', 300)
+        self._path = os.path.join(_get_kairos_state_dir(config), "approvals.json")
+        self._load()
+    
+    def add(self, decision: 'DecisionResult', heartbeat_id: str) -> str:
+        """
+        Adds decision to approval queue.
+        Returns approval_id.
+        """
+        approval_id = f"apr_{heartbeat_id}_{int(time.time())}"
+        
+        with self.lock:
+            self.queue.append({
+                'approval_id': approval_id,
+                'decision': {
+                    'decision': decision.decision,
+                    'reason': decision.reason,
+                    'goal': decision.goal,
+                    'proposed_actions': decision.proposed_actions,
+                    'risk_level': decision.risk_level,
+                    'requires_approval': decision.requires_approval,
+                },
+                'heartbeat_id': heartbeat_id,
+                'created_at': time.time(),
+                'status': 'pending',  # pending, approved, denied, timeout
+                'user_response': None,
+            })
+            self._save()
+        
+        return approval_id
+    
+    def get(self, approval_id: str) -> dict:
+        """Gets approval request by ID"""
+        with self.lock:
+            for item in self.queue:
+                if item['approval_id'] == approval_id:
+                    return item
+        return None
+    
+    def approve(self, approval_id: str) -> bool:
+        """Marks approval as approved"""
+        with self.lock:
+            for item in self.queue:
+                if item['approval_id'] == approval_id:
+                    item['status'] = 'approved'
+                    item['user_response'] = 'approved'
+                    self._save()
+                    return True
+        return False
+    
+    def deny(self, approval_id: str) -> bool:
+        """Marks approval as denied"""
+        with self.lock:
+            for item in self.queue:
+                if item['approval_id'] == approval_id:
+                    item['status'] = 'denied'
+                    item['user_response'] = 'denied'
+                    self._save()
+                    return True
+        return False
+    
+    def check_timeouts(self) -> list:
+        """Checks and marks timed-out approvals"""
+        now = time.time()
+        timed_out = []
+        
+        with self.lock:
+            for item in self.queue:
+                if item['status'] == 'pending':
+                    if (now - item['created_at']) > self.timeout_sec:
+                        item['status'] = 'timeout'
+                        item['user_response'] = 'timeout'
+                        timed_out.append(item['approval_id'])
+            if timed_out:
+                self._save()
+        
+        return timed_out
+    
+    def get_pending(self) -> list:
+        """Gets all pending approvals"""
+        with self.lock:
+            return [item for item in self.queue if item['status'] == 'pending']
+    
+    def cleanup_old(self, max_age_sec: int = 3600):
+        """Removes old approvals from queue"""
+        now = time.time()
+        with self.lock:
+            self.queue = [
+                item for item in self.queue
+                if (now - item['created_at']) < max_age_sec
+            ]
+            self._save()
+
+    def _load(self):
+        if not os.path.exists(self._path):
+            return
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self.queue = data
+        except (OSError, json.JSONDecodeError):
+            self.queue = []
+
+    def _save(self):
+        tmp_path = self._path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.queue, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+
+class ActionExecutor:
+    """
+    Executes approved actions using ToolRegistry.
+    Handles idempotency and execution logging.
+    """
+    
+    def __init__(self, config, registry, permissions, state_store):
+        self.config = config
+        self.registry = registry
+        self.permissions = permissions
+        self.state_store = state_store
+        self.dedupe_cache = state_store.load_aux_json("dedupe.json", {}) if state_store else {}
+        self.cooldown_sec = _kairos_settings(config).get('dedupe_cooldown', 300)
+        
+        # Load allowlist
+        self.allowlist = set(_kairos_settings(config).get('allow_proactive_tools', []))
+    
+    def can_execute(self, action: dict) -> tuple:
+        """
+        Checks if action can be executed.
+        Returns: (can_execute: bool, reason: str)
+        """
+        tool_name = action.get('tool', '')
+        
+        # Check allowlist
+        if tool_name not in self.allowlist:
+            return False, f"Tool '{tool_name}' not in proactive allowlist"
+        
+        # Check idempotency
+        dedupe_key = self._make_dedupe_key(action)
+        if self._is_duplicate(dedupe_key):
+            return False, f"Duplicate action (cooldown: {self.cooldown_sec}s)"
+        
+        # Check permissions
+        if self.permissions and hasattr(self.permissions, "check"):
+            if not self.permissions.check(tool_name, params, tui=None):
+                return False, f"Tool '{tool_name}' not permitted"
+
+        return True, "OK"
+    
+    def execute(self, action: dict, heartbeat_id: str) -> dict:
+        """
+        Executes a single action.
+        Returns execution result.
+        """
+        tool_name = action.get('tool', '')
+        params = action.get('params', {})
+        allowed, reason = self.can_execute(action)
+        if not allowed:
+            return {
+                'success': False,
+                'error': reason,
+                'result': None,
+            }
+        
+        # Get tool
+        tool = self.registry.get(tool_name)
+        if not tool:
+            return {
+                'success': False,
+                'error': f"Tool '{tool_name}' not found",
+                'result': None,
+            }
+        
+        try:
+            # Execute
+            result = tool.execute(params)
+            
+            # Record for idempotency
+            dedupe_key = self._make_dedupe_key(action)
+            self._record_execution(dedupe_key, heartbeat_id)
+            
+            return {
+                'success': True,
+                'error': None,
+                'result': result,
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'result': None,
+            }
+    
+    def execute_batch(self, actions: list, heartbeat_id: str) -> list:
+        """Executes multiple actions, returns results"""
+        self.cleanup_dedupe_cache()
+        results = []
+        for action in actions:
+            result = self.execute(action, heartbeat_id)
+            result['action'] = action
+            results.append(result)
+        return results
+    
+    def _make_dedupe_key(self, action: dict) -> str:
+        """Creates idempotency key for action"""
+        import hashlib
+        tool = action.get('tool', '')
+        params = json.dumps(action.get('params', {}), sort_keys=True)
+        raw = f"{tool}:{params}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    
+    def _is_duplicate(self, dedupe_key: str) -> bool:
+        """Checks if action is duplicate within cooldown"""
+        if dedupe_key not in self.dedupe_cache:
+            return False
+        
+        item = self.dedupe_cache[dedupe_key]
+        last_exec = float(item.get("timestamp", 0))
+        if (time.time() - last_exec) < self.cooldown_sec:
+            return True
+        
+        return False
+    
+    def _record_execution(self, dedupe_key: str, heartbeat_id: str):
+        """Records action execution for idempotency"""
+        self.dedupe_cache[dedupe_key] = {
+            "timestamp": time.time(),
+            "heartbeat_id": heartbeat_id,
+        }
+        if self.state_store:
+            self.state_store.save_aux_json("dedupe.json", self.dedupe_cache)
+    
+    def cleanup_dedupe_cache(self):
+        """Cleans up old dedupe cache entries"""
+        now = time.time()
+        keys_to_remove = [
+            k for k, item in self.dedupe_cache.items()
+            if (now - float(item.get("timestamp", 0))) > self.cooldown_sec * 2
+        ]
+        for k in keys_to_remove:
+            del self.dedupe_cache[k]
+        if keys_to_remove and self.state_store:
+            self.state_store.save_aux_json("dedupe.json", self.dedupe_cache)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# KAIROS Phase 3: External Integrations (PR, File Delivery)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class PRSubscriptionGateway:
+    """
+    Polls GitHub for PR events.
+    Supports: opened, synchronized, review_requested, check_suite_failed
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self.token = os.environ.get('EVE_CLI_GITHUB_TOKEN')
+        self.subscriptions = []  # List of {repo, pr_number, events}
+        self.last_poll = {}
+        self.poll_interval = _kairos_settings(config).get('pr_poll_interval', 300)
+        self._path = os.path.join(_get_kairos_project_dir(config), "watchers.json")
+        self._load()
+    
+    def add_subscription(self, repo: str, pr_number: int, events: list = None):
+        """Adds PR subscription"""
+        if events is None:
+            events = ['opened', 'synchronized', 'review_requested', 'review_submitted', 'issue_comment', 'check_suite_failed', 'merged']
+        self.remove_subscription(repo, pr_number)
+        self.subscriptions.append({
+            'repo': repo,
+            'pr_number': pr_number,
+            'events': events,
+        })
+        self._save()
+    
+    def remove_subscription(self, repo: str, pr_number: int):
+        """Removes PR subscription"""
+        self.subscriptions = [
+            s for s in self.subscriptions
+            if not (s['repo'] == repo and s['pr_number'] == pr_number)
+        ]
+        self._save()
+    
+    def poll(self) -> list:
+        """
+        Polls GitHub for new events.
+        Returns list of events.
+        """
+        if not self.token:
+            return []  # No token, skip polling
+        
+        events = []
+        now = time.time()
+        
+        for sub in self.subscriptions:
+            # Rate limiting
+            key = f"{sub['repo']}:{sub['pr_number']}"
+            if key in self.last_poll:
+                if (now - self.last_poll[key]) < self.poll_interval:
+                    continue
+            
+            # Poll
+            sub_events = self._poll_pr(sub)
+            events.extend(sub_events)
+            self.last_poll[key] = now
+        
+        return events
+    
+    def _poll_pr(self, sub: dict) -> list:
+        """Polls single PR for events"""
+        import urllib.request
+        import urllib.error
+        
+        repo = sub['repo']
+        pr_number = sub['pr_number']
+        events = []
+        
+        try:
+            # Get PR timeline
+            url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/timeline"
+            req = urllib.request.Request(url)
+            req.add_header('Authorization', f'Bearer {self.token}')
+            req.add_header('Accept', 'application/vnd.github+json')
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                last_seen = self.last_poll.get(f"{repo}:{pr_number}:seen")
+                
+                # Filter by subscribed events
+                for event in data:
+                    event_type = event.get('event', '')
+                    if event_type in sub['events']:
+                        event_id = event.get("id")
+                        created_at = event.get('created_at', '')
+                        fingerprint = str(event_id or created_at)
+                        if last_seen:
+                            if fingerprint.isdigit() and str(last_seen).isdigit():
+                                if int(fingerprint) <= int(last_seen):
+                                    continue
+                            elif fingerprint <= str(last_seen):
+                                continue
+                        events.append({
+                            'provider': 'github',
+                            'repo': repo,
+                            'pr_number': pr_number,
+                            'event': event_type,
+                            'timestamp': event.get('created_at', ''),
+                            'metadata': event,
+                        })
+                if data:
+                    last_event = data[-1]
+                    self.last_poll[f"{repo}:{pr_number}:seen"] = str(last_event.get("id") or last_event.get("created_at", ""))
+        except Exception as e:
+            # Log error but don't crash
+            pass
+        
+        return events
+    
+    def get_status(self) -> dict:
+        """Gets subscription status"""
+        return {
+            'token_configured': bool(self.token),
+            'subscriptions': len(self.subscriptions),
+            'last_poll': self.last_poll,
+        }
+
+    def _load(self):
+        if not os.path.exists(self._path):
+            return
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.subscriptions = data.get("subscriptions", [])
+        except (OSError, json.JSONDecodeError):
+            self.subscriptions = []
+
+    def _save(self):
+        tmp_path = self._path + ".tmp"
+        payload = {"subscriptions": self.subscriptions}
+        try:
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+
+class FileDeliveryGateway:
+    """
+    Delivers files to users via various channels.
+    Supports: email, cloud storage, SFTP, webhook
+    """
+    
+    def __init__(self, config, channel_manager=None):
+        self.config = config
+        self.channel_manager = channel_manager
+        settings = _kairos_settings(config)
+        self.enabled = settings.get('file_delivery', {}).get('enabled', False)
+        self.destinations = settings.get('file_delivery', {}).get('destinations', [])
+        self.max_size_mb = settings.get('file_delivery', {}).get('max_size_mb', 10)
+        self.cwd = _config_value(config, "cwd", os.getcwd())
+    
+    def validate_file(self, file_path: str) -> tuple:
+        """
+        Validates file for delivery.
+        Returns: (valid: bool, reason: str)
+        """
+        # Check file exists
+        if not os.path.exists(file_path):
+            return False, "File does not exist"
+        
+        # Check not symlink
+        if os.path.islink(file_path):
+            return False, "Symlinks not allowed"
+
+        real_path = os.path.realpath(file_path)
+        cwd_real = os.path.realpath(self.cwd)
+        if not real_path.startswith(cwd_real + os.sep):
+            return False, "File must remain inside the repository"
+        
+        # Check size
+        size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        if size_mb > self.max_size_mb:
+            return False, f"File too large ({size_mb:.1f}MB > {self.max_size_mb}MB)"
+        
+        # Check MIME type (basic)
+        allowed_extensions = {'.txt', '.md', '.json', '.py', '.js', '.ts', '.log', '.pdf', '.png', '.jpg'}
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in allowed_extensions:
+            return False, f"File type '{ext}' not allowed"
+        
+        return True, "OK"
+    
+    def deliver(self, file_path: str, destination: str = None) -> dict:
+        """
+        Delivers file to destination.
+        Returns delivery result.
+        """
+        # Validate
+        valid, reason = self.validate_file(file_path)
+        if not valid:
+            return {'success': False, 'error': reason}
+        
+        # Use configured destination or default
+        dest = destination or (self.destinations[0] if self.destinations else None)
+        if not dest:
+            return {'success': False, 'error': 'No destination configured'}
+        if dest not in self.destinations:
+            return {'success': False, 'error': 'Destination is not trusted'}
+        
+        try:
+            # Deliver via channel manager if available
+            if self.channel_manager:
+                # Send via Discord/Slack
+                adapter = self.channel_manager.get_adapter('discord')
+                if adapter:
+                    adapter.send_file(file_path)
+                    return {'success': True, 'destination': dest, 'method': 'discord'}
+            
+            # Fallback: copy to destination path
+            if os.path.isdir(dest):
+                dest_path = os.path.join(dest, os.path.basename(file_path))
+                shutil.copy2(file_path, dest_path)
+                return {'success': True, 'destination': dest_path, 'method': 'copy'}
+            
+            return {'success': False, 'error': f'Unknown destination type: {dest}'}
+        
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# KAIROS Phase 4: autoDream (Memory Reorganization)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class DreamWorker:
+    """
+    Nightly batch job that reorganizes memory and generates daily summaries.
+    Runs during idle hours (22:00-06:00) when user is inactive.
+    """
+    
+    DEFAULT_SCHEDULE = "03:00"  # 3 AM local time
+    
+    def __init__(self, config, audit_log, memory=None, evolution_engine=None, state_store=None):
+        self.config = config
+        self.audit_log = audit_log
+        self.memory = memory
+        self.evolution_engine = evolution_engine
+        self.state_store = state_store
+        dream_settings = _kairos_settings(config).get('dream', {})
+        self.enabled = dream_settings.get("enabled", True)
+        self.schedule = dream_settings.get('schedule', self.DEFAULT_SCHEDULE)
+        self.last_run = None
+        self.timer = None
+    
+    def start(self):
+        """Starts dream scheduler"""
+        if not self.enabled:
+            return
+        self._schedule_next()
+    
+    def stop(self):
+        """Stops dream scheduler"""
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+    
+    def _schedule_next(self):
+        """Schedules next dream run"""
+        # Calculate next run time
+        now = datetime.now()
+        hour, minute = map(int, self.schedule.split(':'))
+        
+        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if next_run <= now:
+            # Already passed today, schedule for tomorrow
+            from datetime import timedelta
+            next_run += timedelta(days=1)
+        
+        delay = (next_run - now).total_seconds()
+        
+        self.timer = threading.Timer(delay, self._run)
+        self.timer.daemon = True
+        self.timer.start()
+    
+    def _run(self):
+        """Executes dream processing"""
+        try:
+            result = self.process()
+            
+            # Log completion
+            self.audit_log.append({
+                'event': 'autoDream_completed',
+                'summary': result.get('summary', '')[:200],
+                'learnings_count': result.get('learnings_count', 0),
+            })
+            
+            self.last_run = datetime.now().isoformat()
+            if self.state_store:
+                self.state_store.set("last_dream", datetime.now().strftime("%Y-%m-%d"))
+                self.state_store.save()
+        
+        except Exception as e:
+            self.audit_log.append({
+                'event': 'autoDream_failed',
+                'error': str(e),
+            })
+        
+        finally:
+            # Schedule next run
+            self._schedule_next()
+    
+    def process(self) -> dict:
+        """
+        Processes daily learnings and reorganizes memory.
+        Returns summary of actions taken.
+        """
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        # Read today's audit log
+        entries = self.audit_log.read_date(today)
+        if not entries:
+            return {'summary': 'No entries to process', 'learnings_count': 0}
+        
+        # Extract learnings
+        learnings = self._extract_learnings(entries)
+        
+        # Reorganize memory
+        if self.memory:
+            self._reorganize_memory(learnings)
+        
+        # Update evolution engine patterns
+        if self.evolution_engine:
+            self._update_patterns(learnings)
+        
+        # Generate summary
+        summary = self._generate_summary(learnings)
+        
+        # Save dream report
+        self._save_report(today, summary, learnings)
+        
+        return {
+            'summary': summary,
+            'learnings_count': len(learnings),
+            'report_path': os.path.join(_get_kairos_state_dir(self.config), 'dream', f'{today}.md'),
+        }
+    
+    def _extract_learnings(self, entries: list) -> list:
+        """Extracts learnings from audit log entries"""
+        learnings = []
+        
+        for entry in entries:
+            # Extract from failed actions
+            if entry.get('error') and entry.get('event') == 'heartbeat_tick':
+                learnings.append({
+                    'type': 'error_pattern',
+                    'source': entry.get('event'),
+                    'content': f"Error: {entry.get('error')}",
+                    'confidence': 0.7,
+                })
+            
+            # Extract from successful actions
+            if entry.get('actions') and len(entry.get('actions', [])) > 0:
+                learnings.append({
+                    'type': 'success_pattern',
+                    'source': entry.get('event'),
+                    'content': f"Success: {entry.get('decision')}",
+                    'confidence': 0.8,
+                })
+        
+        return learnings
+    
+    def _reorganize_memory(self, learnings: list):
+        """Reorganizes memory based on learnings"""
+        if not self.memory:
+            return
+        
+        # Add high-confidence learnings to memory
+        for learning in learnings:
+            if learning.get('confidence', 0) >= 0.8:
+                if hasattr(self.memory, "add"):
+                    self.memory.add(learning['content'], category="kairos")
+    
+    def _update_patterns(self, learnings: list):
+        """Updates workflow patterns in evolution engine"""
+        if not self.evolution_engine:
+            return
+        
+        # Extract error patterns and success patterns
+        error_patterns = [l for l in learnings if l['type'] == 'error_pattern']
+        success_patterns = [l for l in learnings if l['type'] == 'success_pattern']
+        
+        # Update evolution engine (implementation depends on EvolutionEngine API)
+        try:
+            if error_patterns:
+                self.evolution_engine.record_failure_patterns(error_patterns)
+            
+            if success_patterns:
+                self.evolution_engine.record_success_patterns(success_patterns)
+        except:
+            pass
+    
+    def _generate_summary(self, learnings: list) -> str:
+        """Generates human-readable summary"""
+        lines = [
+            f"# autoDream {datetime.now().strftime('%Y-%m-%d')}",
+            "",
+            "## 今日の要約",
+            f"- 処理したエントリー数: {len(learnings)}",
+            f"- 学習パターン数: {len([l for l in learnings if l.get('confidence', 0) >= 0.8])}",
+            "",
+            "## 学んだこと",
+        ]
+        
+        for i, learning in enumerate(learnings[:10], 1):  # Top 10
+            lines.append(f"{i}. [{learning.get('confidence', 0):.0%}] {learning.get('content', '')}")
+        
+        lines.append("")
+        lines.append("## 明日の watchlist")
+        lines.append("- 継続中のエラーパターンを監視")
+        lines.append("- 成功パターンの再現性を確認")
+        
+        return "\n".join(lines)
+    
+    def _save_report(self, date: str, summary: str, learnings: list):
+        """Saves dream report to file"""
+        dream_dir = os.path.join(_get_kairos_state_dir(self.config), 'dream')
+        os.makedirs(dream_dir, exist_ok=True)
+        
+        report_path = os.path.join(dream_dir, f'{date}.md')
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(summary)
+    
+    def run_now(self) -> dict:
+        """Runs dream processing immediately (for manual trigger)"""
+        result = self.process()
+        self.last_run = datetime.now().isoformat()
+        if self.state_store:
+            self.state_store.set("last_dream", datetime.now().strftime("%Y-%m-%d"))
+            self.state_store.save()
+        return result
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Updated KairosSupervisor with Full Integration
+# ════════════════════════════════════════════════════════════════════════════════
+
+class KairosSupervisorFull(KairosSupervisor):
+    """
+    Extended KAIROS supervisor with full Phase 1-4 features.
+    """
+    
+    def __init__(self, config, session=None, state_store=None, audit_log=None,
+                 scheduler=None, collector=None, notifier=None,
+                 decision_engine=None, risk_evaluator=None, approval_queue=None,
+                 action_executor=None, pr_gateway=None, file_gateway=None,
+                 dream_worker=None, registry=None, permissions=None,
+                 memory=None, evolution_engine=None, channel_manager=None):
+        # Initialize base class (Phase 1)
+        super().__init__(
+            config, session, state_store, audit_log, scheduler, collector, notifier
+        )
+        
+        # Phase 2 components
+        self.decision_engine = decision_engine
+        self.risk_evaluator = risk_evaluator
+        self.approval_queue = approval_queue or ApprovalQueue(config)
+        self.action_executor = action_executor
+        
+        # Phase 3 components
+        self.pr_gateway = pr_gateway
+        self.file_gateway = file_gateway
+        
+        # Phase 4 components
+        self.dream_worker = dream_worker
+        
+        # References
+        self.registry = registry
+        self.permissions = permissions
+        self.memory = memory
+        self.evolution_engine = evolution_engine
+        self.channel_manager = channel_manager
+    
+    def _on_heartbeat(self):
+        """
+        Enhanced heartbeat with decision engine and action execution.
+        """
+        heartbeat_id = self._generate_heartbeat_id()
+        if self._skip_heartbeat(heartbeat_id):
+            return
+        
+        # Update state
+        self.state_store.set('supervisor_state', 'collecting')
+        self.state_store.set('last_heartbeat', datetime.now().isoformat())
+        self.state_store.save()
+        
+        # Collect observation
+        observation = {}
+        error = None
+        try:
+            if self.collector:
+                observation = self.collector.collect()
+            observation['heartbeat_id'] = heartbeat_id
+            
+            # Poll PR events (Phase 3)
+            if self.pr_gateway:
+                pr_events = self.pr_gateway.poll()
+                if pr_events:
+                    observation.setdefault('signals', {}).setdefault('pr_events', [])
+                    observation['signals']['pr_events'] = pr_events
+        
+        except Exception as e:
+            error = str(e)
+            observation = {"heartbeat_id": heartbeat_id, "error": error}
+        
+        # Decision making (Phase 2)
+        self.state_store.set('supervisor_state', 'deciding')
+        self.state_store.save()
+        if self.decision_engine and not error:
+            decision_result = self.decision_engine.decide(observation)
+        else:
+            decision_result = DecisionResult(decision="quiet", reason="No decision engine or error")
+        
+        mode = self.state_store.get('mode', self.settings.get('mode', 'observe'))
+        risk_level = self.risk_evaluator.evaluate_batch(decision_result.proposed_actions) if self.risk_evaluator else "low"
+        approval_result = "auto_allowed"
+        tool_calls = []
+        outputs_summary = ""
+        actions_executed = []
+        notification_status = "skipped"
+
+        if mode == "observe" and decision_result.decision in ("plan", "act"):
+            decision_result = DecisionResult(
+                decision="notify_only",
+                reason=decision_result.reason,
+                goal=decision_result.goal,
+                proposed_actions=decision_result.proposed_actions,
+                risk_level=risk_level,
+                requires_approval=False,
+            )
+        elif mode == "suggest" and decision_result.decision == "act":
+            decision_result.decision = "plan"
+        
+        if decision_result.decision == "quiet":
+            pass  # Do nothing
+        
+        elif decision_result.decision == "notify_only":
+            # Send notification only
+            if self.notifier and decision_result.goal:
+                if self.notifier.send("KAIROS", decision_result.goal, "notify"):
+                    notification_status = "sent"
+        
+        elif decision_result.decision in ("plan", "act"):
+            requires_approval = True if mode == "suggest" else (
+                self.risk_evaluator.requires_approval(risk_level) if self.risk_evaluator else False
+            )
+
+            if decision_result.decision == "act" and risk_level == "high":
+                approval_result = "denied"
+                if self.notifier:
+                    body = decision_result.goal or decision_result.reason or "High-risk action was blocked."
+                    if self.notifier.send("KAIROS blocked high-risk action", body, "approval"):
+                        notification_status = "sent"
+            elif requires_approval:
+                # Add to approval queue
+                self.state_store.set('supervisor_state', 'waiting_approval')
+                approval_id = self.approval_queue.add(decision_result, heartbeat_id)
+                actions_executed.append(f"Approval requested: {approval_id}")
+                approval_result = "pending"
+                
+                # Notify user
+                if self.notifier:
+                    if self.notifier.send(
+                        "KAIROS Approval Required",
+                        f"{decision_result.reason} (ID: {approval_id})",
+                        "approval"
+                    ):
+                        notification_status = "sent"
+            else:
+                # Execute immediately
+                if self.action_executor:
+                    self.state_store.set('supervisor_state', 'acting')
+                    results = self.action_executor.execute_batch(
+                        decision_result.proposed_actions,
+                        heartbeat_id
+                    )
+                    actions_executed = [
+                        f"{r['action'].get('tool')}: {'OK' if r['success'] else r['error']}"
+                        for r in results
+                    ]
+                    tool_calls = [
+                        {
+                            "tool_name": r["action"].get("tool"),
+                            "args": r["action"].get("params", {}),
+                            "result_summary": "ok" if r["success"] else r["error"],
+                        }
+                        for r in results
+                    ]
+                    outputs_summary = "; ".join(actions_executed)[:200]
+                    if any(r["success"] for r in results):
+                        approval_result = "auto_allowed"
+                        self.state_store.set('last_action', datetime.now().isoformat())
+                    if any(not r["success"] for r in results) and not error:
+                        error = "; ".join(r["error"] for r in results if r["error"])
+        
+        # Log to audit
+        self.audit_log.append({
+            "event": "heartbeat_tick",
+            "timestamp": datetime.now().isoformat(),
+            "heartbeat_id": heartbeat_id,
+            "observed_context_summary": json.dumps(observation, ensure_ascii=False)[:100],
+            "decision": decision_result.decision,
+            "reason": decision_result.reason,
+            "risk_level": risk_level,
+            "approval_result": approval_result,
+            "executed_actions": actions_executed,
+            "tool_calls": tool_calls,
+            "outputs_summary": outputs_summary,
+            "notification_status": notification_status,
+            "error": error,
+        })
+        
+        # Update state
+        self.state_store.set('supervisor_state', 'idle')
+        self.state_store.set('heartbeat_cursor', heartbeat_id)
+        self.state_store.set('next_heartbeat', (datetime.now() + timedelta(seconds=self.scheduler.interval)).isoformat())
+        self.state_store.set('last_error', error)
+        self.state_store.set('active_watchers', self.pr_gateway.subscriptions if self.pr_gateway else [])
+        self.state_store.save()
+    
+    def get_status(self):
+        """Returns extended status"""
+        base_status = super().get_status()
+        
+        # Add Phase 2-4 status
+        base_status['approval_queue_size'] = len(self.approval_queue.get_pending()) if self.approval_queue else 0
+        base_status['pr_subscriptions'] = self.pr_gateway.get_status() if self.pr_gateway else {'subscriptions': 0}
+        base_status['dream_worker'] = {
+            'last_run': self.dream_worker.last_run if self.dream_worker else None,
+            'schedule': self.dream_worker.schedule if self.dream_worker else None,
+        }
+        
+        return base_status
+    
+    def stop(self):
+        """Stops all components"""
+        super().stop()
+        
+        if self.dream_worker:
+            self.dream_worker.stop()
+
+    def add_pr_subscription(self, repo, pr_number):
+        if not self.pr_gateway:
+            return False
+        self.pr_gateway.add_subscription(repo, int(pr_number))
+        self.state_store.set('active_watchers', self.pr_gateway.subscriptions)
+        self.state_store.save()
+        return True
+
+    def list_pr_subscriptions(self):
+        return list(self.pr_gateway.subscriptions) if self.pr_gateway else []
 class Session:
     """Manages conversation history with optional persistence and compaction."""
 
@@ -16974,7 +19043,7 @@ class Agent:
 
     def __init__(self, config, client, registry, permissions, session, tui,
                  rag_engine=None, hook_mgr=None, code_intel=None,
-                 output_collector=None):
+                 output_collector=None, channel_manager=None):
         self.config = config
         self.client = client
         self.registry = registry
@@ -16985,11 +19054,16 @@ class Agent:
         self.hook_mgr = hook_mgr
         self.code_intel = code_intel
         self.output_collector = output_collector  # HeadlessOutputCollector for CI/CD
+        self.channel_manager = channel_manager
         # Evolution engine for self-learning
         try:
             self._evolution = EvolutionEngine(config.config_dir)
         except Exception:
             self._evolution = None
+        try:
+            self._memory = Memory(config.config_dir)
+        except Exception:
+            self._memory = None
         self._interrupted = threading.Event()
         self._tui_lock = threading.Lock()
         self._plan_mode = False
@@ -17017,10 +19091,90 @@ class Agent:
 
         # Store last assistant output for loop mode completion detection
         self._last_output: str = ""
+        self.kairos = None
 
     def get_last_output(self) -> str:
         """Return the last assistant text output for loop mode completion detection."""
         return self._last_output
+
+    def _init_kairos(self):
+        """Initializes KAIROS supervisor with full Phase 1-4 features"""
+        try:
+            kairos_settings = _kairos_settings(self.config)
+            # Phase 1 components
+            state_store = KairosStateStore(self.config)
+            audit_log = KairosAuditLog(self.config)
+            notifier = NotificationGateway(self.config, channel_manager=self.channel_manager)
+            
+            # Phase 2 components
+            decision_engine = DecisionEngine(self.config, self.client)
+            risk_evaluator = RiskEvaluator(self.config)
+            approval_queue = ApprovalQueue(self.config)
+            action_executor = ActionExecutor(
+                self.config,
+                registry=self.registry,
+                permissions=self.permissions,
+                state_store=state_store,
+            )
+            
+            # Phase 3 components
+            pr_gateway = PRSubscriptionGateway(self.config)
+            file_gateway = FileDeliveryGateway(self.config, self.channel_manager)
+            collector = ObservationCollector(
+                self.config,
+                session=self.session,
+                git_checkpoint=self.git_checkpoint,
+                file_watcher=self.file_watcher,
+                test_runner=self.auto_test,
+                approval_queue=approval_queue,
+                pr_gateway=pr_gateway,
+                notifier=notifier,
+                change_tracker=self.change_tracker,
+            )
+            
+            # Phase 4 components
+            dream_worker = DreamWorker(
+                self.config,
+                audit_log=audit_log,
+                memory=self._memory,
+                evolution_engine=self._evolution,
+                state_store=state_store,
+            )
+            
+            # Create scheduler
+            interval = kairos_settings.get('heartbeat_seconds', 300)
+            scheduler = HeartbeatScheduler(interval)
+            
+            # Create supervisor with all components
+            self.kairos = KairosSupervisorFull(
+                config=self.config,
+                session=self.session,
+                state_store=state_store,
+                audit_log=audit_log,
+                scheduler=scheduler,
+                collector=collector,
+                notifier=notifier,
+                decision_engine=decision_engine,
+                risk_evaluator=risk_evaluator,
+                approval_queue=approval_queue,
+                action_executor=action_executor,
+                pr_gateway=pr_gateway,
+                file_gateway=file_gateway,
+                dream_worker=dream_worker,
+                registry=self.registry,
+                permissions=self.permissions,
+                memory=self._memory,
+                evolution_engine=self._evolution,
+                channel_manager=self.channel_manager,
+            )
+            
+            # Start dream worker
+            dream_worker.start()
+            
+        except Exception as e:
+            print(f"KAIROS initialization error: {e}")
+            self.kairos = None
+
 
     @staticmethod
     def _detect_parallel_tasks(user_input):
@@ -18880,6 +21034,11 @@ def main():
             print(f"  {_c240}Webhook listening on http://127.0.0.1:{config.channels_port}/webhook{C.RESET}")
         print()
         atexit.register(channel_manager.stop)
+    agent.channel_manager = channel_manager
+    if _kairos_settings(config).get("enabled"):
+        agent._init_kairos()
+        if agent.kairos:
+            agent.kairos.start()
 
     # Handle Ctrl+C gracefully
     def signal_handler(sig, frame):
@@ -19314,6 +21473,162 @@ def main():
                         continue
                 elif cmd == "/status":
                     tui.show_status(session, config, agent=agent)
+                    continue
+                elif cmd == "/kairos":
+                    # KAIROS supervisor command handler
+                    _kairos_args = user_input.split()[1:]
+                    if not _kairos_args:
+                        print(f"\n{C.BOLD}KAIROS commands:{C.RESET}")
+                        print("  /kairos on                          - Start proactive supervisor")
+                        print("  /kairos off                         - Stop supervisor")
+                        print("  /kairos status                      - Show current status")
+                        print("  /kairos pause <minutes>             - Pause heartbeat execution")
+                        print("  /kairos resume                      - Resume heartbeat execution")
+                        print("  /kairos log [--date YYYY-MM-DD]     - Show audit log")
+                        print("  /kairos approvals                   - Show pending approvals")
+                        print("  /kairos watch pr add <repo> <num>   - Add PR subscription")
+                        print("  /kairos watch pr list               - List PR subscriptions")
+                        print("  /kairos dream now                   - Run autoDream immediately")
+                        print("  /kairos reset                       - Reset state to defaults")
+                        print()
+                        continue
+                    
+                    _kairos_cmd = _kairos_args[0].lower()
+
+                    def _ensure_kairos():
+                        if agent.kairos is None:
+                            agent._init_kairos()
+                        return agent.kairos
+                    
+                    if _kairos_cmd == "on":
+                        # Initialize and start KAIROS
+                        if _ensure_kairos():
+                            agent.kairos.start()
+                            mode = agent.kairos.get_status().get('mode', 'observe')
+                            interval = agent.kairos.scheduler.interval
+                            print(f"\n{C.GREEN}KAIROS started (mode: {mode}, heartbeat: {interval}s){C.RESET}")
+                            print(f"{C.DIM}Audit log: {_get_kairos_state_dir(config)}/audit/{C.RESET}\n")
+                        else:
+                            print(f"{C.RED}Failed to initialize KAIROS{C.RESET}\n")
+                    
+                    elif _kairos_cmd == "off":
+                        if agent.kairos:
+                            agent.kairos.stop()
+                            print(f"\n{C.YELLOW}KAIROS stopped{C.RESET}\n")
+                        else:
+                            print(f"{C.DIM}KAIROS is not running{C.RESET}\n")
+                    
+                    elif _kairos_cmd == "status":
+                        if _ensure_kairos():
+                            status = agent.kairos.get_status()
+                            print(f"\n{C.BOLD}KAIROS Status:{C.RESET}")
+                            print(f"  enabled: {status.get('enabled', False)}")
+                            print(f"  mode: {status.get('mode', 'observe')}")
+                            print(f"  state: {status.get('state', 'unknown')}")
+                            print(f"  running: {status.get('running', False)}")
+                            print(f"  paused: {status.get('paused', False)}")
+                            print(f"  last heartbeat: {status.get('last_heartbeat') or 'never'}")
+                            print(f"  next heartbeat: {status.get('next_heartbeat') or 'unknown'}")
+                            print(f"  heartbeat cursor: {status.get('heartbeat_cursor') or 'none'}")
+                            print(f"  active watchers: {len(status.get('active_watchers', []))}")
+                            print(f"  queued approvals: {status.get('approval_queue_size', 0)}")
+                            print(f"  last action: {status.get('last_action') or 'never'}")
+                            print(f"  last dream: {status.get('last_dream') or 'never'}")
+                            print(f"  last error: {status.get('last_error') or '(none)'}")
+                            print()
+                        else:
+                            print(f"{C.DIM}KAIROS is not initialized{C.RESET}\n")
+
+                    elif _kairos_cmd == "pause":
+                        if len(_kairos_args) < 2:
+                            print(f"{C.YELLOW}Usage: /kairos pause <minutes>{C.RESET}\n")
+                        elif _ensure_kairos():
+                            try:
+                                _pause_minutes = int(_kairos_args[1])
+                                pause_until = agent.kairos.pause(_pause_minutes)
+                                print(f"\n{C.YELLOW}KAIROS paused until {pause_until.isoformat()}{C.RESET}\n")
+                            except ValueError:
+                                print(f"{C.RED}Minutes must be an integer{C.RESET}\n")
+
+                    elif _kairos_cmd == "resume":
+                        if _ensure_kairos():
+                            agent.kairos.resume()
+                            print(f"\n{C.GREEN}KAIROS resumed{C.RESET}\n")
+                    
+                    elif _kairos_cmd == "log":
+                        _log_date = datetime.now().strftime('%Y-%m-%d')
+                        if len(_kairos_args) >= 3 and _kairos_args[1] == "--date":
+                            _log_date = _kairos_args[2]
+                        elif len(_kairos_args) >= 2:
+                            _log_date = _kairos_args[1]
+                        if _ensure_kairos():
+                            entries = agent.kairos.audit_log.read_date(_log_date)
+                            if entries:
+                                print(f"\n{C.BOLD}KAIROS Audit Log ({_log_date}):{C.RESET}")
+                                for entry in entries[-20:]:  # Show last 20 entries
+                                    _ts = entry.get('_timestamp', entry.get('timestamp', '?'))[:19]
+                                    _evt = entry.get('event', '?')
+                                    _dec = entry.get('decision', '?')
+                                    _hb = entry.get('heartbeat_id', '')[:20]
+                                    print(f"  [{_ts}] {_evt:20s} {_dec:12s} {_hb}")
+                                print()
+                            else:
+                                print(f"{C.DIM}No log entries for {_log_date}{C.RESET}\n")
+                        else:
+                            print(f"{C.DIM}KAIROS is not initialized{C.RESET}\n")
+
+                    elif _kairos_cmd == "approvals":
+                        if _ensure_kairos():
+                            pending = agent.kairos.approval_queue.get_pending()
+                            if not pending:
+                                print(f"{C.DIM}No pending approvals{C.RESET}\n")
+                            else:
+                                print(f"\n{C.BOLD}Pending Approvals:{C.RESET}")
+                                for item in pending:
+                                    decision = item.get("decision", {})
+                                    print(f"  {item.get('approval_id')}  {decision.get('decision', 'plan'):12s}  {decision.get('reason', '')}")
+                                print()
+
+                    elif _kairos_cmd == "watch" and len(_kairos_args) >= 3 and _kairos_args[1].lower() == "pr":
+                        if _kairos_args[2].lower() == "add" and len(_kairos_args) >= 5:
+                            if _ensure_kairos() and agent.kairos.add_pr_subscription(_kairos_args[3], _kairos_args[4]):
+                                print(f"\n{C.GREEN}Watching PR {_kairos_args[3]}#{_kairos_args[4]}{C.RESET}\n")
+                            else:
+                                print(f"{C.RED}Failed to add PR subscription{C.RESET}\n")
+                        elif _kairos_args[2].lower() == "list":
+                            if _ensure_kairos():
+                                subs = agent.kairos.list_pr_subscriptions()
+                                if not subs:
+                                    print(f"{C.DIM}No PR subscriptions configured{C.RESET}\n")
+                                else:
+                                    print(f"\n{C.BOLD}PR Subscriptions:{C.RESET}")
+                                    for sub in subs:
+                                        print(f"  {sub.get('repo')}#{sub.get('pr_number')}  events={','.join(sub.get('events', []))}")
+                                    print()
+                        else:
+                            print(f"{C.YELLOW}Usage: /kairos watch pr add <repo> <num> | /kairos watch pr list{C.RESET}\n")
+
+                    elif _kairos_cmd == "dream" and len(_kairos_args) >= 2 and _kairos_args[1].lower() == "now":
+                        if _ensure_kairos() and agent.kairos.dream_worker:
+                            result = agent.kairos.dream_worker.run_now()
+                            agent.kairos.state_store.set("last_dream", datetime.now().strftime("%Y-%m-%d"))
+                            agent.kairos.state_store.save()
+                            print(f"\n{C.GREEN}autoDream completed{C.RESET}")
+                            print(f"  learnings: {result.get('learnings_count', 0)}")
+                            print(f"  report: {result.get('report_path')}")
+                            print()
+                    
+                    elif _kairos_cmd == "reset":
+                        if _ensure_kairos():
+                            agent.kairos.state_store.reset()
+                            print(f"\n{C.YELLOW}KAIROS state reset to defaults{C.RESET}\n")
+                        else:
+                            print(f"{C.DIM}KAIROS is not initialized{C.RESET}\n")
+                    
+                    else:
+                        print(f"{C.RED}Unknown KAIROS command: {_kairos_cmd}{C.RESET}")
+                        print("Use /kairos for available commands.\n")
+                    
                     continue
                 elif cmd == "/doctor":
                     print()

@@ -84,6 +84,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 
 - 学習モード（やさしく解説）
 - ループモード（完了まで自動で繰り返す）
+- **KAIROS** — リポジトリ状態を定期観測して、通知・承認待ちプラン・低リスク自動実行を切り替える proactive supervisor
 - **自動 Lint/Test** — ファイル変更のたびに ruff/flake8/eslint + pytest を自動実行・自動修正
 - **Repo Map** — プロジェクト構造を AI に注入して大規模コードベースでも正確に編集
 - **Thinking モード** — Qwen3.5 の拡張推論で複雑な問題を深く思考
@@ -110,6 +111,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | **開発支援** | コミット自動生成、テスト生成、自動 Lint/Test、Repo Map、コードレビュー（`/review`）、GitHub 連携 |
 | **CI/CD** | Headless モード（stdin パイプ対応）、JSON 出力、`--max-turns`、`--carry-session`、ループモード |
 | **コンテキスト** | プロジェクト自動解析（言語・FW・リンター・テストFW 検出）、キャッシュ、コードインテリジェンス |
+| **Proactive** | KAIROS supervisor。heartbeat ごとに状況を観測し、`observe` / `suggest` / `active` モードで通知・承認待ち・低リスク自動実行を制御 |
 | **使いやすさ** | 日本語 UX 完全対応、Tab 補完、画像添付、シンタックスハイライト、リッチ diff |
 | **カスタマイズ** | メモリ（長期記憶）、Skills、Hooks、MCP、Extensions（`eve-cli install`）、テーマ変更 |
 | **Channels** | Discord・Slack・Webhook から実行中のエージェントへ双方向通信。ペアリングコードで安全認証 |
@@ -136,6 +138,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | 完了まで自動で回す | `eve-cli -p "失敗テストを直して ALL_DONE と出して" --loop --done-string ALL_DONE -y` |
 | ループで履歴を維持 | `eve-cli -p "修正" --loop --carry-session -y` |
 | コードレビューする | 対話モードで `/review` または `/review 123`（PR番号） |
+| KAIROS を起動する | `eve-cli` 起動後に `/kairos on` |
 | サンドボックスで安全に | `eve-cli --sandbox docker --sandbox-no-network` |
 | 拡張機能を追加する | `eve-cli install https://github.com/user/eve-ext-name` |
 | Discord から操作する | `eve-cli --channels discord` |
@@ -189,6 +192,26 @@ eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
 補足:
 - `eve-cli` は Ollama の native API を使うため、`OLLAMA_HOST` に `https://ollama.com` と `https://ollama.com/api` のどちらを入れても動くように正規化されます。
 - 最近の Ollama docs では `ollama launch pi --model ...` のような統合エージェント導線がありますが、`eve-cli` は引き続き Ollama API に直接つなぐ構成です。
+
+KAIROS を常用する場合は、`~/.config/eve-cli/kairos.json` またはプロジェクト単位の `.eve-cli/kairos.json` に設定を書けます。
+
+```json
+{
+  "enabled": true,
+  "mode": "observe",
+  "heartbeat_seconds": 300,
+  "active_hours": "workhours",
+  "pr_watch": {
+    "enabled": true
+  },
+  "dream": {
+    "enabled": true,
+    "schedule": "03:00"
+  }
+}
+```
+
+`observe` は通知のみ、`suggest` は承認待ちプランまで、`active` は allowlist にある低リスク操作のみ自動実行します。`/kairos` コマンド一覧は [コマンドリファレンス](docs/commands.md)、設定項目と保存先は [高度な機能](docs/advanced.md) を参照してください。
 
 高度な設定項目は [高度な機能](docs/advanced.md) にまとめています。
 
