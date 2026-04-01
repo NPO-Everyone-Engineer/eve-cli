@@ -41,11 +41,16 @@ node_modules/
 # vibe-local RAG index (local, user-specific — not for version control)
 .vibe/rag/
 
-# EvE CLI local config (project-specific commands, hooks, memory — user-defined, never commit)
-.eve-cli/
-# Default template skills are distributed with the project (exception to above)
-!.eve-cli/skills/
-!.eve-cli/skills/*.md
+# EvE CLI — sensitive / ephemeral / user-specific (never commit)
+.eve-cli/channels/
+.eve-cli/context/
+.eve-cli/plans/
+.eve-cli/kairos/
+.eve-cli/config
+.eve-cli/memory.json
+
+# EvE CLI — team-shared config (track these)
+# CLAUDE.md, rules/, skills/, agents/, hooks.json, mcp.json, kairos.json は追跡対象
 
 # Local test artifacts
 tests/*.log
@@ -61,6 +66,11 @@ make.md
 *.md
 !README.md
 !docs/*.md
+!.eve-cli/CLAUDE.md
+!.eve-cli/rules/*.md
+!.eve-cli/skills/*.md
+!.eve-cli/commands/*.md
+!.eve-cli/agents/*.md
 
-# Docs
+# 00_Docs/ は開発者向けメモ（gitignore 対象）
 00_Docs/

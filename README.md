@@ -252,7 +252,7 @@ README は「最初の入口」に絞ってあります。
 | `scripts/` | リリースや保守に使う補助スクリプトです。現在は `install-manifest.json` 更新用スクリプトを含みます。 |
 | `00_Docs/` | 実装メモ、機能提案、作業記録などの内部ドキュメント置き場です。安定版の利用ガイドは `docs/` を参照してください。 |
 
-補足: `.eve-cli/` のようなローカル設定や Skills / Hooks / MCP 連携の詳細は、[高度な機能](docs/advanced.md) にまとめています。
+補足: `.eve-cli/` 配下の `rules/`（パスSスコープルール）、`skills/`、`agents/`、`hooks.json`、`mcp.json` はチーム共有のため git 追跡されます。`channels/`（Bot トークン）や `context/`（キャッシュ）は gitignore されます。詳細は [高度な機能](docs/advanced.md) をご覧ください。
 
 ---
 
