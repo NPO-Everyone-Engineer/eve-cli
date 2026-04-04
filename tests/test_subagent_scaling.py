@@ -99,6 +99,54 @@ class TestSubAgentScaling(unittest.TestCase):
         self.assertEqual(result["result"], "done")
         self.assertIn("summary", result)
 
+    def test_subagent_uses_configured_default_max_turns(self):
+        """Omitted max_turns should use the config default instead of hardcoded 10."""
+        class _FakeClient:
+            def __init__(self, finish_after):
+                self.calls = 0
+                self.finish_after = finish_after
+
+            def chat_sync(self, **kwargs):
+                self.calls += 1
+                if self.calls >= self.finish_after:
+                    return {"content": "done", "tool_calls": []}
+                return {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": f"call_{self.calls}",
+                        "name": "Glob",
+                        "arguments": {"pattern": "*.py"},
+                    }],
+                }
+
+        cfg = SimpleNamespace(
+            cwd=self.test_dir,
+            model="test-model",
+            sidecar_model="",
+            sessions_dir=os.path.join(self.test_dir, "sessions"),
+            default_subagent_max_turns=15,
+        )
+        os.makedirs(cfg.sessions_dir, exist_ok=True)
+        eve_coder._set_active_runtime_state(None)
+        client = _FakeClient(finish_after=12)
+        subagent = eve_coder.SubAgentTool(cfg, client, MagicMock())
+
+        result = subagent.execute({"prompt": "keep going until done"})
+
+        self.assertEqual(result, "done")
+        self.assertEqual(client.calls, 12)
+
+    def test_parse_subagent_default_max_turns_is_capped(self):
+        """Config parsing should clamp configured default max turns to the hard cap."""
+        cfg_path = os.path.join(self.test_dir, "config")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.write("SUBAGENT_DEFAULT_MAX_TURNS=25\n")
+
+        cfg = Config()
+        cfg._parse_config_file(cfg_path)
+
+        self.assertEqual(cfg.default_subagent_max_turns, eve_coder.HARD_MAX_SUBAGENT_TURNS)
+
 
 class TestParallelAgents(unittest.TestCase):
     """Test ParallelAgents functionality."""
@@ -125,6 +173,78 @@ class TestParallelAgents(unittest.TestCase):
     def test_parallel_agents_has_max_turns(self):
         """Test that ParallelAgents supports max_turns per agent."""
         self.assertTrue(True)  # Placeholder - actual implementation check
+
+    def test_auto_parallel_uses_configured_default_max_turns(self):
+        """Auto-parallel should pass the configured sub-agent turn budget to each task."""
+        class _StopParallel(Exception):
+            pass
+
+        class _FakeParallelTool:
+            def __init__(self):
+                self.payload = None
+
+            def execute(self, payload):
+                self.payload = payload
+                raise _StopParallel()
+
+        class _FakeRegistry:
+            def __init__(self, parallel_tool):
+                self.parallel_tool = parallel_tool
+
+            def get(self, name):
+                if name == "ParallelAgents":
+                    return self.parallel_tool
+                return None
+
+        class _FakeSession:
+            def __init__(self):
+                self.runtime_state = None
+                self.user_messages = []
+
+            def get_resume_summary(self):
+                return {}
+
+            def add_user_message(self, message):
+                self.user_messages.append(message)
+
+            def add_assistant_message(self, *args, **kwargs):
+                pass
+
+        tui = SimpleNamespace(
+            _scroll_print=lambda *args, **kwargs: None,
+            _render_markdown=lambda *args, **kwargs: None,
+        )
+        cfg = SimpleNamespace(
+            cwd=self.test_dir,
+            config_dir=self.config_dir,
+            autotest_on_start=False,
+            max_agent_steps=20,
+            max_turns=None,
+            rag=False,
+            default_subagent_max_turns=17,
+            model="test-model",
+            sidecar_model="",
+        )
+        parallel_tool = _FakeParallelTool()
+        session = _FakeSession()
+        agent = eve_coder.Agent(
+            cfg,
+            client=object(),
+            registry=_FakeRegistry(parallel_tool),
+            permissions=None,
+            session=session,
+            tui=tui,
+        )
+
+        with patch.object(eve_coder.Agent, "_detect_parallel_tasks", return_value=["task A", "task B"]):
+            with self.assertRaises(_StopParallel):
+                agent._run_impl("parallel tasks please")
+
+        self.assertIsNotNone(parallel_tool.payload)
+        self.assertEqual(
+            [task["max_turns"] for task in parallel_tool.payload["tasks"]],
+            [17, 17],
+        )
 
 
 if __name__ == "__main__":

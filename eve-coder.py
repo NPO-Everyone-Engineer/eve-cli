@@ -1225,6 +1225,7 @@ class Config:
         self.autotest_on_start = False  # --autotest flag
         self.headless = False           # --headless (CI/CD mode)
         self.max_turns = None           # --max-turns (agent turn limit in headless/one-shot)
+        self.default_subagent_max_turns = DEFAULT_SUBAGENT_MAX_TURNS
         self.carry_session = False      # --carry-session (loop mode history carryover)
         self.auto_context = True        # auto project context analysis on startup
         self.context_refresh = False    # force refresh cached context
@@ -1395,6 +1396,8 @@ class Config:
                         parsed = self._normalize_max_agent_steps(val)
                         if parsed is not None:
                             self.max_agent_steps = parsed
+                    elif key == "SUBAGENT_DEFAULT_MAX_TURNS" and val:
+                        self.default_subagent_max_turns = _normalize_subagent_max_turns(val)
                     elif key == "SHELL_ENV_POLICY" and val:
                         self.shell_env_policy = _normalize_env_policy(val)
                     elif key == "SHELL_ENV_INCLUDE" and val:
@@ -1462,6 +1465,10 @@ class Config:
             parsed = self._normalize_max_agent_steps(os.environ["EVE_CLI_MAX_AGENT_STEPS"])
             if parsed is not None:
                 self.max_agent_steps = parsed
+        if os.environ.get("EVE_CLI_SUBAGENT_DEFAULT_MAX_TURNS"):
+            self.default_subagent_max_turns = _normalize_subagent_max_turns(
+                os.environ["EVE_CLI_SUBAGENT_DEFAULT_MAX_TURNS"]
+            )
         if os.environ.get("EVE_CLI_PROFILE"):
             self.profile = os.environ["EVE_CLI_PROFILE"]
         if os.environ.get("EVE_CLI_PROMPT_COST_PER_MTOK"):
@@ -1939,6 +1946,10 @@ class Config:
                 self.max_tokens = int(prof["MAX_TOKENS"])
             except ValueError:
                 pass
+        if prof.get("SUBAGENT_DEFAULT_MAX_TURNS"):
+            self.default_subagent_max_turns = _normalize_subagent_max_turns(
+                prof["SUBAGENT_DEFAULT_MAX_TURNS"]
+            )
         if prof.get("TEMPERATURE") and not self._cli_temperature_set:
             try:
                 self.temperature = float(prof["TEMPERATURE"])
@@ -6917,6 +6928,22 @@ class ApplyPatchTool(Tool):
 # Global configuration for parallel file operations
 _MAX_PARALLEL_FILES = 5  # Default max parallelism
 _SHOW_PROGRESS = True    # Show progress indicators
+DEFAULT_SUBAGENT_MAX_TURNS = 15
+HARD_MAX_SUBAGENT_TURNS = 20
+
+
+def _normalize_subagent_max_turns(value, default=DEFAULT_SUBAGENT_MAX_TURNS):
+    try:
+        turns = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(turns, HARD_MAX_SUBAGENT_TURNS))
+
+
+def _get_default_subagent_max_turns(config):
+    return _normalize_subagent_max_turns(
+        getattr(config, "default_subagent_max_turns", DEFAULT_SUBAGENT_MAX_TURNS)
+    )
 
 class MultiEditTool(Tool):
     """Apply multiple file edits in a single tool call with parallel execution."""
@@ -8872,7 +8899,7 @@ class SubAgentTool(Tool):
     WRITE_TOOLS = frozenset({"Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"})
     NETWORK_TOOLS = frozenset({"WebFetch", "WebSearch"})
     # Hard cap on max_turns to prevent runaway loops
-    HARD_MAX_TURNS = 20
+    HARD_MAX_TURNS = HARD_MAX_SUBAGENT_TURNS
 
     def __init__(self, config, client, registry, permissions=None, tui=None):
         self._config = config
@@ -8925,7 +8952,10 @@ class SubAgentTool(Tool):
                 },
                 "max_turns": {
                     "type": "integer",
-                    "description": "Max agent loop iterations (default 10, hard cap 20)",
+                    "description": (
+                        f"Max agent loop iterations "
+                        f"(default {_get_default_subagent_max_turns(self._config)}, hard cap {self.HARD_MAX_TURNS})"
+                    ),
                 },
                 "allow_writes": {
                     "type": "boolean",
@@ -9018,12 +9048,10 @@ class SubAgentTool(Tool):
         if not prompt:
             return "Error: prompt is required"
 
-        max_turns = params.get("max_turns", 10)
-        try:
-            max_turns = int(max_turns)
-        except (ValueError, TypeError):
-            max_turns = 10
-        max_turns = max(1, min(max_turns, self.HARD_MAX_TURNS))
+        max_turns = _normalize_subagent_max_turns(
+            params.get("max_turns", _get_default_subagent_max_turns(self._config)),
+            default=_get_default_subagent_max_turns(self._config),
+        )
 
         allow_writes = params.get("allow_writes", False)
         structured_result = bool(params.get("_structured_result", False))
@@ -11491,7 +11519,13 @@ class ParallelAgentTool(Tool):
                         "type": "object",
                         "properties": {
                             "prompt": {"type": "string", "description": "Task for this agent"},
-                            "max_turns": {"type": "integer", "description": "Max turns (default 10)"},
+                            "max_turns": {
+                                "type": "integer",
+                                "description": (
+                                    f"Max turns per agent "
+                                    f"(default {_get_default_subagent_max_turns(self._coordinator._config)})"
+                                ),
+                            },
                             "allow_writes": {"type": "boolean", "description": "Allow write tools"},
                         },
                         "required": ["prompt"],
@@ -18433,7 +18467,7 @@ class TUI:
                f"{C.WHITE}{path}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}(cell {cell}, {mode}){C.RESET}")
         elif name == "SubAgent":
             prompt = params.get("prompt", "")
-            max_t = params.get("max_turns", 10)
+            max_t = params.get("max_turns", _get_default_subagent_max_turns(self.config))
             allow_w = params.get("allow_writes", False)
             prompt_display = prompt if len(prompt) <= max_display else prompt[:max_display - 3] + "..."
             mode_str = "rw" if allow_w else "ro"
@@ -19399,7 +19433,11 @@ class Agent:
                     if not skip_add:
                         self.session.add_user_message(user_input)
                         skip_add = True  # Prevent double-add in main loop
-                    tasks_payload = [{"prompt": t, "max_turns": 10} for t in parallel_tasks]
+                    default_subagent_turns = _get_default_subagent_max_turns(self.config)
+                    tasks_payload = [
+                        {"prompt": t, "max_turns": default_subagent_turns}
+                        for t in parallel_tasks
+                    ]
                     _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}⚡ Auto-detected {len(parallel_tasks)} parallel tasks{C.RESET}")
                     result = pa_tool.execute({"tasks": tasks_payload})
                     # Add parallel result to conversation and continue to main loop for follow-up tasks

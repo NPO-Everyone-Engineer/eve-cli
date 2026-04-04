@@ -660,6 +660,7 @@ eve-cli --channels discord,slack,webhook
 | `EVE_CLI_PROFILE` | 接続プロファイル | `auto` |
 | `EVE_CLI_DEBUG` | デバッグモード | `1` |
 | `EVE_CLI_MAX_AGENT_STEPS` | AI ステップ上限 | `80` |
+| `EVE_CLI_SUBAGENT_DEFAULT_MAX_TURNS` | サブエージェント既定ターン数 | `15` |
 | `EVE_CLI_PROMPT_COST_PER_MTOK` | 入力 100 万 tokens あたりの推定コスト（USD） | `0.15` |
 | `EVE_CLI_COMPLETION_COST_PER_MTOK` | 出力 100 万 tokens あたりの推定コスト（USD） | `0.60` |
 | `EVE_CLI_PLAN_MODE_REASONING_EFFORT` | Plan mode 用の reasoning 強度 | `high` |
@@ -683,6 +684,7 @@ OLLAMA_HOST=http://localhost:11434
 CONTEXT_WINDOW=65536
 MAX_TOKENS=4096
 TEMPERATURE=0.25
+SUBAGENT_DEFAULT_MAX_TURNS=15
 PROMPT_COST_PER_MTOK=0.15
 COMPLETION_COST_PER_MTOK=0.60
 PLAN_MODE_REASONING_EFFORT=high
@@ -706,6 +708,7 @@ eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
 - `eve-cli` は Ollama の native `/api/*` を使うため、OpenAI 互換の `/v1` ではなく Ollama endpoint を指定してください。
 - `PROMPT_COST_PER_MTOK` / `COMPLETION_COST_PER_MTOK` は `/usage` の推定コスト計算に使われます。未設定時は `0.0` として扱われます。
 - `PLAN_MODE_REASONING_EFFORT` は `none|low|medium|high|max` を受け付け、Plan mode 中だけ thinking budget を上書きします。
+- `SUBAGENT_DEFAULT_MAX_TURNS` はサブエージェントの既定ターン数です。現在の hard cap は `20` です。
 - `SHELL_ENV_POLICY` / `HOOK_ENV_POLICY` は `default` と `inherit` を受け付けます。
 - `NOTIFY_COMMAND` は JSON payload を stdin で受け取る想定です。
 
