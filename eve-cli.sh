@@ -182,6 +182,16 @@ if [[ "$OLLAMA_HOST" =~ ^https://(ollama\.com|www\.ollama\.com)(/api)?/?$ ]]; th
     IS_CLOUD_HOST=1
 fi
 
+ollama_tags_json() {
+    local _url="${OLLAMA_HOST}/api/tags"
+    local _api_key="${OLLAMA_API_KEY:-${EVE_CLI_OLLAMA_API_KEY:-}}"
+    if [ "$IS_CLOUD_HOST" -eq 1 ] && [ -n "$_api_key" ]; then
+        curl -s -H "Authorization: Bearer ${_api_key}" "$_url" 2>/dev/null
+    else
+        curl -s "$_url" 2>/dev/null
+    fi
+}
+
 for arg in "${EXTRA_ARGS[@]:-}"; do
     if [[ "$arg" == "--version" ]]; then
         OLLAMA_HOST="$OLLAMA_HOST" \
@@ -227,7 +237,7 @@ fi
 # Two-stage check: Python JSON first, grep -F fallback
 if [ -n "$MODEL" ]; then
     _model_found=0
-    _api_response="$(curl -s "$OLLAMA_HOST/api/tags" 2>/dev/null)"
+    _api_response="$(ollama_tags_json)"
     if [ -n "$_api_response" ]; then
         # Try Python JSON parsing for exact match
         # [SEC] Pass MODEL via env var, not interpolation (prevents injection)
@@ -250,6 +260,12 @@ except: sys.exit(1)
             _model_found=1
         fi
     fi
+    if [ "$IS_CLOUD_HOST" -eq 1 ] && [ "$_model_found" -eq 0 ]; then
+        echo "⚠️  Ollama Cloud ではローカルの download 済み判定を行いません。"
+        echo "   そのまま起動して、実際の API 呼び出し時にモデル可用性を確認します。"
+        echo ""
+        _model_found=1
+    fi
     if [ "$_model_found" -eq 0 ]; then
         echo "❌ AIモデル $MODEL がまだダウンロードされていません"
         echo ""
@@ -259,7 +275,7 @@ except: sys.exit(1)
         echo "(数分～数十分かかります。完了後に再度 eve-cli を実行してください)"
         echo ""
         echo "インストール済みモデル:"
-        curl -s "$OLLAMA_HOST/api/tags" 2>/dev/null | python3 -c "
+        ollama_tags_json | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
