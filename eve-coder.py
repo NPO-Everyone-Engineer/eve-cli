@@ -274,7 +274,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.29.0"
+__version__ = "2.30.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -4118,6 +4118,14 @@ class OllamaClient:
             headers.update(extra)
         return headers
 
+    def _safe_headers_for_log(self, headers=None):
+        """Return a copy of headers with Authorization value masked for safe logging.
+        SEC-5: Prevent API key leakage in debug/error output."""
+        h = dict(headers or self._headers())
+        if "Authorization" in h:
+            h["Authorization"] = "Bearer ***"
+        return h
+
     def check_connection(self, retries=3):
         """Check if Ollama is reachable. Returns (ok, model_list)."""
         url = self._api_url("/api/tags")
@@ -4626,17 +4634,47 @@ class OllamaClient:
         """
         buf = b""
         MAX_BUF = 1024 * 1024  # 1MB safety limit
+        CHUNK_TIMEOUT = 60  # FUN-1: max seconds to wait for next chunk
         try:
             while True:
-                try:
-                    chunk = resp.read(4096)
-                except (ConnectionError, OSError, urllib.error.URLError) as e:
+                # FUN-1: Enforce per-chunk timeout using a threading.Event to
+                # interrupt the blocking resp.read() call. signal.alarm() is not
+                # used because it requires the main thread on macOS.
+                _chunk_result = [None]
+                _chunk_exc = [None]
+                _chunk_done = threading.Event()
+
+                def _do_read():
+                    try:
+                        _chunk_result[0] = resp.read(4096)
+                    except Exception as _re:
+                        _chunk_exc[0] = _re
+                    finally:
+                        _chunk_done.set()
+
+                _reader_t = threading.Thread(target=_do_read, daemon=True)
+                _reader_t.start()
+                if not _chunk_done.wait(timeout=CHUNK_TIMEOUT):
                     if self.debug:
-                        print(f"\n{C.DIM}{t('warnings.debug_stream_error', default=f'[debug] NDJSON stream read error: {e}')}{C.RESET}",
+                        print(f"\n{C.DIM}[debug] NDJSON stream chunk timeout after {CHUNK_TIMEOUT}s{C.RESET}",
                               file=sys.stderr)
+                    break  # Chunk timeout — stop reading
+
+                if _chunk_exc[0] is not None:
+                    _exc = _chunk_exc[0]
+                    if isinstance(_exc, (ConnectionError, OSError, urllib.error.URLError)):
+                        if self.debug:
+                            print(f"\n{C.DIM}{t('warnings.debug_stream_error', default=f'[debug] NDJSON stream read error: {_exc}')}{C.RESET}",
+                                  file=sys.stderr)
+                    else:
+                        if self.debug:
+                            import traceback as _tb
+                            print(f"\n{C.DIM}[debug] NDJSON stream unexpected error: {_exc}{C.RESET}",
+                                  file=sys.stderr)
+                            _tb.print_exc(file=sys.stderr)
                     break
-                except Exception:
-                    break  # Unknown error — stop reading
+
+                chunk = _chunk_result[0]
                 if not chunk:
                     break
                 buf += chunk
@@ -4718,8 +4756,13 @@ class OllamaClient:
             tokens = data.get("tokens")
             if tokens is not None:
                 return len(tokens)
-        except Exception:
-            pass
+        except Exception as _te:
+            # FUN-2: Log tokenize errors in debug mode (non-fatal, falls back to len//4)
+            if self.debug:
+                import traceback as _tb
+                print(f"{C.DIM}[debug] tokenize error (falling back to len//4): {_te}{C.RESET}",
+                      file=sys.stderr)
+                _tb.print_exc(file=sys.stderr)
         return len(text) // 4
 
     def chat_sync(self, model, messages, tools=None, options=None):
@@ -6031,6 +6074,8 @@ class BashTool(Tool):
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico", ".tiff", ".tif"}
 IMAGE_MAX_SIZE = 10 * 1024 * 1024  # 10MB limit for image files
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".opus"}
+AUDIO_MAX_SIZE = 20 * 1024 * 1024  # 20MB limit for audio files
 
 
 _MEDIA_TYPES = {
@@ -6044,6 +6089,13 @@ _MEDIA_TYPES = {
     ".ico": "image/x-icon",
     ".tiff": "image/tiff",
     ".tif": "image/tiff",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".opus": "audio/opus",
 }
 
 
@@ -6098,6 +6150,29 @@ def _read_image_as_base64(file_path):
         return (data, media_type), None
     except Exception as e:
         err_msg = t('errors.image_read_error', default=f"Error reading image: {e}")
+        return None, err_msg
+
+
+def _read_audio_as_base64(file_path):
+    """Read audio file and return (base64_data, media_type) or (None, error_msg)."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in AUDIO_EXTENSIONS:
+        return None, f"Not an audio file: {file_path}"
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError as e:
+        return None, f"Cannot read file: {e}"
+    if file_size > AUDIO_MAX_SIZE:
+        return None, f"Audio too large ({file_size // 1_000_000}MB, max 20MB)"
+    if file_size == 0:
+        return None, "Audio file is empty"
+    media_type = _MEDIA_TYPES.get(ext, "audio/octet-stream")
+    try:
+        with open(file_path, "rb") as f:
+            data = base64.b64encode(f.read()).decode("ascii")
+        return (data, media_type), None
+    except Exception as e:
+        err_msg = t('errors.audio_read_error', default=f"Error reading audio: {e}")
         return None, err_msg
 
 
@@ -6279,10 +6354,16 @@ class ReadTool(Tool):
 
         # Check for binary files
         try:
+            # SEC-2: TOCTOU mitigation — verify inode consistency after open to detect
+            # symlink races between realpath() resolution and the actual open().
+            pre_stat = os.stat(file_path)
             with open(file_path, "rb") as f:
+                post_stat = os.fstat(f.fileno())
+                if pre_stat.st_ino != post_stat.st_ino or pre_stat.st_dev != post_stat.st_dev:
+                    return "Error: access denied - file changed during open (possible symlink race)"
                 sample = f.read(8192)
                 if b"\x00" in sample:
-                    size = os.path.getsize(file_path)
+                    size = post_stat.st_size
                     return f"(binary file, {size} bytes)"
         except Exception as e:
             return f"Error reading file: {e}"
@@ -6667,6 +6748,13 @@ class WriteTool(Tool):
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(content)
+                # SEC-4: Restrict permissions on sensitive files (new files only)
+                _is_new_file = not os.path.exists(file_path)
+                if _is_new_file:
+                    _basename_lower = os.path.basename(file_path).lower()
+                    _SENSITIVE_PATTERNS = (".env", "secret", "credential", "key", "token", "password", "passwd")
+                    if any(p in _basename_lower for p in _SENSITIVE_PATTERNS):
+                        os.chmod(tmp_path, 0o600)
                 os.replace(tmp_path, file_path)
             except Exception:
                 try:
@@ -7337,7 +7425,7 @@ class GrepTool(Tool):
         # ReDoS protection: limit pattern length and reject nested quantifiers
         if len(pat_str) > 500:
             return "Error: regex pattern too long (max 500 chars)"
-        _REDOS_RE = re.compile(r'(\([^)]*[+*][^)]*\))[+*]')
+        _REDOS_RE = re.compile(r'(\([^)]*[+*][^)]*\))[+*]|(\([^)]*\|[^)]*\))[+*]')
         if _REDOS_RE.search(pat_str):
             return "Error: regex pattern contains nested quantifiers (potential ReDoS)"
         if not os.path.isabs(search_path):
@@ -7345,7 +7433,24 @@ class GrepTool(Tool):
 
         flags = re.IGNORECASE if case_insensitive else 0
         try:
-            pattern = re.compile(pat_str, flags)
+            # SEC-3: Compile regex with threading-based timeout (1s) to prevent ReDoS.
+            # signal.alarm() is not used because it requires the main thread on macOS.
+            import threading as _threading
+            _compiled_pattern = [None]
+            _compile_error = [None]
+            def _compile_regex():
+                try:
+                    _compiled_pattern[0] = re.compile(pat_str, flags)
+                except re.error as _e:
+                    _compile_error[0] = _e
+            _t = _threading.Thread(target=_compile_regex, daemon=True)
+            _t.start()
+            _t.join(timeout=1.0)
+            if _t.is_alive():
+                return "Error: regex compilation timed out (potential ReDoS pattern)"
+            if _compile_error[0] is not None:
+                raise _compile_error[0]
+            pattern = _compiled_pattern[0]
         except re.error as e:
             return f"Error: invalid regex: {e}"
 
@@ -7481,17 +7586,39 @@ class WebFetchTool(Tool):
         """Check if a hostname resolves to a private/loopback/reserved IP. Fail-closed."""
         import socket
         import ipaddress
+        # Additional SSRF-sensitive network ranges to block explicitly
+        _BLOCKED_NETWORKS_V4 = [
+            ipaddress.ip_network("169.254.0.0/16"),   # link-local (incl. AWS/GCP/Azure metadata 169.254.169.254)
+            ipaddress.ip_network("100.64.0.0/10"),     # CGNAT (Shared Address Space)
+            ipaddress.ip_network("224.0.0.0/4"),       # IPv4 multicast
+        ]
+        _BLOCKED_NETWORKS_V6 = [
+            ipaddress.ip_network("fe80::/10"),         # IPv6 link-local
+            ipaddress.ip_network("ff00::/8"),          # IPv6 multicast
+        ]
         try:
             for info in socket.getaddrinfo(hostname, None):
                 ip_str = info[4][0]
                 addr = ipaddress.ip_address(ip_str)
                 if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
                     return True
+                # Block additional SSRF-sensitive ranges
+                if isinstance(addr, ipaddress.IPv4Address):
+                    for net in _BLOCKED_NETWORKS_V4:
+                        if addr in net:
+                            return True
+                elif isinstance(addr, ipaddress.IPv6Address):
+                    for net in _BLOCKED_NETWORKS_V6:
+                        if addr in net:
+                            return True
                 # Block IPv4-mapped IPv6 (::ffff:127.0.0.1)
                 if hasattr(addr, 'ipv4_mapped') and addr.ipv4_mapped:
                     mapped = addr.ipv4_mapped
                     if mapped.is_private or mapped.is_loopback or mapped.is_reserved:
                         return True
+                    for net in _BLOCKED_NETWORKS_V4:
+                        if mapped in net:
+                            return True
         except (socket.gaierror, ValueError, OSError):
             return True  # fail-closed: if DNS fails, block the request
         return False
@@ -7501,6 +7628,15 @@ class WebFetchTool(Tool):
         """Resolve hostname and return a public IP literal for pinned connections."""
         import socket
         import ipaddress
+        _BLOCKED_NETWORKS_V4 = [
+            ipaddress.ip_network("169.254.0.0/16"),
+            ipaddress.ip_network("100.64.0.0/10"),
+            ipaddress.ip_network("224.0.0.0/4"),
+        ]
+        _BLOCKED_NETWORKS_V6 = [
+            ipaddress.ip_network("fe80::/10"),
+            ipaddress.ip_network("ff00::/8"),
+        ]
         try:
             infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
         except (socket.gaierror, ValueError, OSError) as e:
@@ -7510,9 +7646,17 @@ class WebFetchTool(Tool):
             addr = ipaddress.ip_address(ip_str)
             if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
                 continue
+            if isinstance(addr, ipaddress.IPv4Address):
+                if any(addr in net for net in _BLOCKED_NETWORKS_V4):
+                    continue
+            elif isinstance(addr, ipaddress.IPv6Address):
+                if any(addr in net for net in _BLOCKED_NETWORKS_V6):
+                    continue
             if hasattr(addr, "ipv4_mapped") and addr.ipv4_mapped:
                 mapped = addr.ipv4_mapped
                 if mapped.is_private or mapped.is_loopback or mapped.is_reserved:
+                    continue
+                if any(mapped in net for net in _BLOCKED_NETWORKS_V4):
                     continue
             return ip_str
         raise urllib.error.URLError(f"All resolved addresses for {hostname} are private or blocked")
@@ -8006,7 +8150,14 @@ class SessionRuntimeStore:
             return value
 
     def _init_db(self):
+        # SEC-4: Restrict DB file permissions on creation
+        _db_is_new = not os.path.exists(self.path)
         with self._lock, self._connect() as conn:
+            if _db_is_new and os.path.exists(self.path):
+                try:
+                    os.chmod(self.path, 0o600)
+                except OSError:
+                    pass
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
@@ -9686,9 +9837,31 @@ class MCPTool(Tool):
             }
         }
 
+    # SEC-7: Maximum MCP tool output size (100KB) to prevent context flooding
+    _MCP_OUTPUT_MAX_BYTES = 100 * 1024
+
+    # SEC-7: XML tags that could cause prompt injection if echoed into context
+    _PROMPT_INJECT_TAGS = re.compile(
+        r'</?(?:system|instructions?|prompt|context|assistant|user)\b[^>]*>',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _sanitize_mcp_output(cls, text):
+        """Strip prompt-injection tags and enforce size limit on MCP tool output."""
+        if not isinstance(text, str):
+            return text
+        # Enforce size limit first
+        if len(text) > cls._MCP_OUTPUT_MAX_BYTES:
+            text = text[:cls._MCP_OUTPUT_MAX_BYTES] + "\n...(output truncated at 100KB)"
+        # Escape/remove dangerous XML tags that could inject into system context
+        text = cls._PROMPT_INJECT_TAGS.sub(lambda m: m.group(0).replace("<", "&lt;").replace(">", "&gt;"), text)
+        return text
+
     def execute(self, params):
         try:
-            return self._mcp.call_tool(self._mcp_tool_name, params)
+            result = self._mcp.call_tool(self._mcp_tool_name, params)
+            return self._sanitize_mcp_output(result)
         except RuntimeError as e:
             return f"MCP tool error: {e}"
 
@@ -10256,11 +10429,13 @@ class ExtensionManager:
         except (json.JSONDecodeError, OSError, KeyError) as e:
             return False, f"Installation error: {e}"
         finally:
-            # Cleanup temp directory
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            except Exception:
-                pass
+            # FUN-5: Cleanup temp directory with warning on failure
+            if os.path.exists(tmp_dir):
+                try:
+                    shutil.rmtree(tmp_dir)
+                except OSError as _rm_err:
+                    print(f"警告: 拡張機能の一時ディレクトリの削除に失敗しました: {tmp_dir}: {_rm_err}",
+                          file=sys.stderr)
 
     def uninstall(self, name):
         """Remove an installed extension.
@@ -10604,9 +10779,26 @@ def _expand_shell_injections(content, cwd="", *, allow_commands=False, source_na
         cmd = match.group(1).strip()
         if not cmd:
             continue
+        # SEC-6: Strip shell injection metacharacters from command string before execution.
+        # This prevents chained commands via ; && || | > < ` $() even when allow_commands=True.
+        import shlex as _shlex
+        _SHELL_METACHAR_RE = re.compile(r'[;&|><`]|\$\(|\$\{')
+        if _SHELL_METACHAR_RE.search(cmd):
+            output = f"(command blocked: shell metacharacters not allowed: {cmd[:80]})"
+            result = result[:match.start()] + output + result[match.end():]
+            count += 1
+            continue
         try:
+            # Use shell=False with shlex.split to prevent shell injection
+            try:
+                cmd_args = _shlex.split(cmd)
+            except ValueError as _shlex_err:
+                output = f"(command blocked: invalid shell syntax: {_shlex_err})"
+                result = result[:match.start()] + output + result[match.end():]
+                count += 1
+                continue
             proc = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True,
+                cmd_args, shell=False, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
                 cwd=cwd or None, timeout=10,
             )
@@ -10783,6 +10975,7 @@ class GitCheckpoint:
 
     def _snapshot_untracked_files(self, files):
         snapshot_dir = tempfile.mkdtemp(prefix="eve-checkpoint-")
+        os.chmod(snapshot_dir, 0o700)  # SEC-4: restrict snapshot dir permissions
         saved = []
         try:
             for rel_path in files:
@@ -13580,8 +13773,13 @@ class PermissionMgr:
                 else:
                     payload = self._global_rules if self._global_rules else self.rules
                 json.dump(payload, f, indent=2, ensure_ascii=False)
-        except OSError:
-            pass
+            # SEC-4: Restrict permissions on the permissions file (contains security rules)
+            try:
+                os.chmod(self._permissions_path, 0o600)
+            except OSError:
+                pass
+        except OSError as e:
+            print(f"警告: 許可ルールの保存に失敗しました: {e}", file=sys.stderr)
 
     def _classify_with_sidecar(self, tool_name, params):
         """Use sidecar model to classify a tool call into risk bands."""
