@@ -126,6 +126,49 @@ class TestInputPrompts(unittest.TestCase):
         self.assertEqual(prompts, ["> ", "... ", "... "])
         self.assertTrue(all("\x1b" not in prompt for prompt in prompts))
 
+    def test_ask_user_question_prompt_avoids_ansi_sequences(self):
+        prompts = []
+        tool = eve_coder.AskUserQuestionTool()
+
+        def fake_input(prompt=""):
+            prompts.append(prompt)
+            return "1"
+
+        with patch.object(eve_coder, "_active_tui", None), \
+             patch.object(eve_coder, "_active_scroll_region", None), \
+             patch("builtins.input", side_effect=fake_input):
+            result = tool.execute({
+                "question": "Choose one",
+                "options": ["alpha", "beta"],
+            })
+
+        self.assertEqual(result, "User chose: alpha")
+        self.assertEqual(prompts, ["  > "])
+        self.assertTrue(all("\x1b" not in prompt for prompt in prompts))
+
+    def test_ask_user_question_batch_prompt_avoids_ansi_sequences(self):
+        prompts = []
+        tool = eve_coder.AskUserQuestionBatchTool()
+
+        def fake_input(prompt=""):
+            prompts.append(prompt)
+            return "A, B"
+
+        with patch.object(eve_coder, "_active_tui", None), \
+             patch.object(eve_coder, "_active_scroll_region", None), \
+             patch("builtins.input", side_effect=fake_input):
+            result = tool.execute({
+                "questions": [
+                    {"question": "Q1", "options": ["alpha", "beta"]},
+                    {"question": "Q2", "options": ["gamma", "delta"]},
+                ],
+            })
+
+        self.assertIn("Q1: alpha", result)
+        self.assertIn("Q2: delta", result)
+        self.assertEqual(prompts, ["  > "])
+        self.assertTrue(all("\x1b" not in prompt for prompt in prompts))
+
     def test_stream_response_renders_native_thinking_without_polluting_text(self):
         chunks = iter([
             {"choices": [{"delta": {"thinking": "inspect files\ncompare outputs"}, "finish_reason": None}]},

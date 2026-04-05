@@ -8725,7 +8725,8 @@ class AskUserQuestionTool(Tool):
                     print(f"  {_ansi(C.DIM)}Type your answer:{_ansi(C.RESET)}")
 
             try:
-                answer = input(f"  {_ansi(C.CYAN)}>{_ansi(C.RESET)} ").strip()
+                # Avoid ANSI codes in input() prompt on macOS - causes IME/input issues.
+                answer = input("  > ").strip()
                 # Strip terminal escape sequences (same as TUI.get_input)
                 import re as _re
                 answer = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z~]', '', answer)
@@ -8891,7 +8892,8 @@ class AskUserQuestionBatchTool(Tool):
                 print(f"  {_ansi(C.DIM)}各質問の答えをカンマ区切りで入力してください:{_ansi(C.RESET)}")
 
             try:
-                answer = input(f"  {_ansi(C.CYAN)}>{_ansi(C.RESET)} ").strip()
+                # Avoid ANSI codes in input() prompt on macOS - causes IME/input issues.
+                answer = input("  > ").strip()
                 # Strip terminal escape sequences (same as TUI.get_input)
                 import re as _re
                 answer = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z~]', '', answer)
