@@ -35,11 +35,11 @@ class TestConfigDefaults(unittest.TestCase):
     def test_default_ollama_host(self):
         self.assertEqual(self.cfg.ollama_host, "http://localhost:11434")
 
-    def test_default_model_empty(self):
-        self.assertEqual(self.cfg.model, "")
+    def test_default_model(self):
+        self.assertEqual(self.cfg.model, "gemma4:31b-cloud")
 
-    def test_default_sidecar_model_empty(self):
-        self.assertEqual(self.cfg.sidecar_model, "")
+    def test_default_sidecar_model(self):
+        self.assertEqual(self.cfg.sidecar_model, "gemma4:31b-cloud")
 
     def test_default_max_tokens(self):
         self.assertEqual(self.cfg.max_tokens, 8192)

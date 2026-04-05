@@ -274,7 +274,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.28.0"
+__version__ = "2.29.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1150,8 +1150,8 @@ class Config:
     """Configuration from CLI args, config file, and environment variables."""
 
     DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-    DEFAULT_MODEL = ""  # auto-detect from RAM
-    DEFAULT_SIDECAR = ""
+    DEFAULT_MODEL = "gemma4:31b-cloud"
+    DEFAULT_SIDECAR = "gemma4:31b-cloud"
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
     DEFAULT_CONTEXT_WINDOW = 65536
@@ -1207,6 +1207,7 @@ class Config:
 
         # Markdown rendering
         self.markdown_renderer = "glow"  # "glow" or "simple"
+        self.streaming_render = "live"   # "live" (real-time) or "render" (buffer + render at end)
 
         # System prompt customization
         self.system_prompt_file = None  # --system-prompt-file
@@ -1425,6 +1426,9 @@ class Config:
                     elif key == "MARKDOWN_RENDERER" and val:
                         if val.lower() in ("glow", "simple"):
                             self.markdown_renderer = val.lower()
+                    elif key == "STREAMING_RENDER" and val:
+                        if val.lower() in ("live", "render"):
+                            self.streaming_render = val.lower()
                     elif key == "MAX_PARALLEL_FILES" and val:
                         try:
                             global _MAX_PARALLEL_FILES
@@ -1515,6 +1519,10 @@ class Config:
             renderer = os.environ["EVE_CLI_MARKDOWN_RENDERER"].lower()
             if renderer in ("glow", "simple"):
                 self.markdown_renderer = renderer
+        if os.environ.get("EVE_CLI_STREAMING_RENDER"):
+            sr = os.environ["EVE_CLI_STREAMING_RENDER"].lower()
+            if sr in ("live", "render"):
+                self.streaming_render = sr
         if os.environ.get("EVE_CLI_MAX_PARALLEL_FILES"):
             try:
                 global _MAX_PARALLEL_FILES
@@ -1578,6 +1586,8 @@ class Config:
         # Markdown rendering
         parser.add_argument("--markdown-renderer", choices=["glow", "simple"],
                             help=t('help.markdown_renderer', default="Markdown renderer: glow (beautiful tables) or simple"))
+        parser.add_argument("--streaming-render", choices=["live", "render"],
+                            help=t('help.streaming_render', default="Streaming display: live (real-time) or render (buffer and render markdown at end)"))
         # System prompt customization
         parser.add_argument("--system-prompt-file", metavar="PATH",
                             help=t('help.system_prompt_file', default="Append system prompt from file"))
@@ -1706,6 +1716,8 @@ class Config:
             self.output_format = args.output_format
         if args.markdown_renderer:
             self.markdown_renderer = args.markdown_renderer
+        if args.streaming_render:
+            self.streaming_render = args.streaming_render
         if args.system_prompt_file:
             self.system_prompt_file = args.system_prompt_file
         if args.loop:
@@ -17817,6 +17829,7 @@ class TUI:
         """
         raw_parts = []
         in_think = False
+        _render_mode = getattr(self.config, 'streaming_render', 'live') == 'render'
         think_buf = ""    # buffer to detect <think> / </think> split across chunks
         think_parts = []  # accumulate thinking content for display
         native_think_parts = []  # accumulate Ollama native thinking chunks
@@ -17840,7 +17853,10 @@ class TUI:
                 return
             _elapsed = _now - _stream_start
             _tok_display = f"{_approx_tokens / 1000:.1f}k" if _approx_tokens >= 1000 else str(_approx_tokens)
-            _status_msg = f"\U0001f4ad Thinking... ({_elapsed:.0f}s \u00b7 \u2193 {_tok_display} tokens)"
+            if _render_mode and not in_think:
+                _status_msg = f"\U0001f4ac Receiving... ({_elapsed:.0f}s \u00b7 \u2193 {_tok_display} tokens)"
+            else:
+                _status_msg = f"\U0001f4ad Thinking... ({_elapsed:.0f}s \u00b7 \u2193 {_tok_display} tokens)"
             _clear_w = max(len(_status_msg) + 6, 60)
             _lock = _sr._lock if _sr._active else _print_lock
             with _lock:
@@ -17934,7 +17950,7 @@ class TUI:
                             think_buf = think_buf[safe_end - 7:]
                         else:
                             to_print = ""
-                        if to_print:
+                        if to_print and not _render_mode:
                             if not header_printed:
                                 _clear_thinking_status()
                                 self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
@@ -17944,7 +17960,7 @@ class TUI:
                     else:
                         # Print text before <think>
                         to_print = think_buf[:idx]
-                        if to_print:
+                        if to_print and not _render_mode:
                             if not header_printed:
                                 _clear_thinking_status()
                                 self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
@@ -17973,22 +17989,24 @@ class TUI:
         _clear_thinking_status()
         _flush_native_thinking_summary()
 
-        # Flush remaining buffer
-        if think_buf and not in_think:
+        # Flush remaining buffer (live mode only)
+        if not _render_mode:
+            if think_buf and not in_think:
+                if not header_printed:
+                    self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
+                    header_printed = True
+                self._scroll_print(think_buf, end="", flush=True)
+
             if not header_printed:
                 self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
-                header_printed = True
-            self._scroll_print(think_buf, end="", flush=True)
-
-        if not header_printed:
-            self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
 
         full_text = "".join(raw_parts)
         # Detect if thinking content was produced (before stripping)
         _had_thinking = bool(native_think_parts) or bool(re.search(r'<think>[\s\S]+?</think>', full_text))
         # Strip <think>...</think> from final text for history
         full_text = re.sub(r'<think>[\s\S]*?</think>', '', full_text).strip()
-        self._scroll_print()  # newline
+        if not _render_mode:
+            self._scroll_print()  # newline
 
         # Build tool_calls list from accumulated deltas
         streamed_tool_calls = []
@@ -18011,6 +18029,14 @@ class TUI:
             if extracted:
                 streamed_tool_calls = extracted
                 full_text = cleaned
+
+        # Render mode: display full response via _render_markdown after streaming
+        if _render_mode:
+            _clear_thinking_status()
+            if full_text:
+                self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="")
+                self._render_markdown(full_text)
+            self._scroll_print()
 
         return full_text, streamed_tool_calls, _had_thinking
 
