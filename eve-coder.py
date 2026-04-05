@@ -246,6 +246,29 @@ def _classify_verifier_failure(text):
         return "timeout"
     return "unknown"
 
+
+def _looks_like_verification_command(command):
+    command = (command or "").strip().lower()
+    if not command:
+        return False
+    verification_patterns = (
+        r"\b(py_compile|compileall)\b",
+        r"\bpython(?:3)?\s+-m\s+unittest\b",
+        r"\bpytest\b",
+        r"\bnpm\s+(?:run\s+)?test\b",
+        r"\bpnpm\s+(?:run\s+)?test\b",
+        r"\byarn\s+test\b",
+        r"\bgo\s+test\b",
+        r"\bcargo\s+test\b",
+        r"\b(?:ruff|flake8|eslint|shellcheck)\b",
+        r"\bmypy\b",
+        r"\btsc\b",
+        r"\bmake\s+(?:test|check|lint)\b",
+        r"\bgradle\w*\s+(?:test|check)\b",
+        r"\bmvn\b.*\b(?:test|verify)\b",
+    )
+    return any(re.search(pattern, command) for pattern in verification_patterns)
+
 def _scroll_aware_print(*args, **kwargs):
     """Print within scroll region or normal print.
     When scroll region is active, acquires its lock to prevent text from
@@ -3511,6 +3534,17 @@ class _PromptSectionBudget:
         return self.base_prompt + "".join(self._optional_sections)
 
 
+def _optional_prompt_body(section_text):
+    """Strip a leading markdown heading so the section can be re-homed under a new title."""
+    text = (section_text or "").strip()
+    if not text:
+        return ""
+    if text.startswith("# "):
+        _, _, remainder = text.partition("\n")
+        return remainder.strip()
+    return text
+
+
 def _build_system_prompt(config):
     """Build system prompt with environment info and OS-specific hints."""
     cwd = config.cwd
@@ -3811,6 +3845,10 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
 - Processes: Get-Process (PowerShell) — like ps
 - FORBIDDEN on Windows: apt, brew, /home/, /proc/, chmod, chown
 """
+    prompt_budget = _PromptSectionBudget(
+        prompt,
+        max(_OPTIONAL_PROMPT_SECTION_MIN, int(_system_prompt_optional_budget(config) * 0.75)),
+    )
 
     # Load project-specific instructions (.eve-coder.json or CLAUDE.md)
     # Hierarchy: global (~/.config/eve-cli/CLAUDE.md) → parent dirs → cwd
@@ -3855,7 +3893,7 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
         try:
             content, truncated = _load_instructions(global_md)
             trunc_note = "\n[Note: file truncated, only first 4000 bytes loaded]" if truncated else ""
-            prompt += f"\n# Global Instructions\n{_sanitize_instructions(content)}{trunc_note}\n"
+            prompt_budget.add_optional_section("Global Instructions", _sanitize_instructions(content) + trunc_note)
         except Exception:
             pass
 
@@ -3908,7 +3946,10 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
             safe_content = _sanitize_instructions(content)
             trunc_note = "\n[Note: file truncated due to size limit]" if truncated else ""
             rel = os.path.relpath(search_dir, cwd) if search_dir != cwd else "."
-            prompt += f"\n# Project Instructions (from {rel}/{fname})\n{safe_content}{trunc_note}\n"
+            prompt_budget.add_optional_section(
+                f"Project Instructions (from {rel}/{fname})",
+                safe_content + trunc_note,
+            )
             total_loaded += len(content)
         except PermissionError:
             print(f"{C.YELLOW}{t('warnings.file_permission_denied', default=f'Warning: {fname} found but not readable (permission denied).')}{C.RESET}",
@@ -4005,16 +4046,34 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
                 continue  # paths specified but no working files to match against
             _safe_rule = _sanitize_instructions(_rf_body)
             _rule_name = _rf[:-3]  # strip .md
-            prompt += f"\n# Rule: {_rule_name}\n{_safe_rule}\n"
+            prompt_budget.add_optional_section(f"Rule: {_rule_name}", _safe_rule)
             _rules_loaded += len(_rf_body)
 
-    prompt += _build_project_context_cached(config)
+    _project_context = _optional_prompt_body(_build_project_context_cached(config))
+    if _project_context:
+        prompt_budget.add_optional_section("Project Analysis (cached)", _project_context)
 
     # Inject persistent memory
     memory = Memory(config.config_dir)
     mem_text = memory.format_for_prompt()
-    if mem_text:
-        prompt += mem_text
+    _memory_body = _optional_prompt_body(mem_text)
+    if _memory_body:
+        prompt_budget.add_optional_section("Persistent Memory", _memory_body)
+
+    # Evolution engine: inject learned behaviors into prompt
+    try:
+        _evo = EvolutionEngine(config.config_dir)
+        _evo.decay_insights()
+        _evo_text = _optional_prompt_body(_evo.format_for_prompt())
+        if _evo_text:
+            prompt_budget.add_optional_section(
+                "Learned Behaviors (auto-generated from usage patterns)",
+                _evo_text,
+            )
+    except Exception:
+        pass
+
+    prompt = prompt_budget.render()
 
     if config.system_prompt_file:
         sp_path = config.system_prompt_file
@@ -4063,16 +4122,6 @@ Adjust explanation depth and vocabulary based on level:
 Always use Japanese for explanations when the user writes in Japanese.
 """
 
-    # Evolution engine: inject learned behaviors into prompt
-    try:
-        _evo = EvolutionEngine(config.config_dir)
-        _evo.decay_insights()
-        _evo_text = _evo.format_for_prompt()
-        if _evo_text:
-            prompt += "\n" + _evo_text
-    except Exception:
-        pass
-
     # Output schema instruction (for --output-schema)
     if getattr(config, 'output_schema', None):
         schema_json = json.dumps(config.output_schema, indent=2, ensure_ascii=False)
@@ -4096,7 +4145,7 @@ def _build_runtime_system_prompt(config):
     """Build the runtime system prompt with bounded optional context sections."""
     prompt_budget = _PromptSectionBudget(
         _build_system_prompt(config),
-        _system_prompt_optional_budget(config),
+        max(_OPTIONAL_PROMPT_SECTION_MIN, _system_prompt_optional_budget(config) // 2),
     )
 
     skills = _load_skills(config)
@@ -4155,19 +4204,6 @@ def _build_runtime_system_prompt(config):
             _state = "loaded" if _added else "skipped"
             print(f"{C.DIM}[debug] Agent persona prompt section {_state}: "
                   f"{', '.join(n for n, _ in _agents_found)}{C.RESET}", file=sys.stderr)
-
-    _code_intel = CodeIntelligence(config.cwd)
-    try:
-        _n_syms = _code_intel.build_index()
-        if _n_syms > 0:
-            _repo_map = _code_intel.repo_map(max_lines=150)
-            _title = f"Repo Map (auto-generated, {_n_syms} symbols)"
-            _added = prompt_budget.add_optional_section(_title, _repo_map)
-            if config.debug:
-                _state = "loaded" if _added else "skipped"
-                print(f"{C.DIM}[debug] Repo map prompt section {_state}: {_n_syms} symbols{C.RESET}", file=sys.stderr)
-    except Exception:
-        pass
 
     return prompt_budget.render()
 
@@ -8628,6 +8664,9 @@ class SessionRuntimeStore:
             "autotest_enabled": bool(runtime.get("autotest_enabled", False)),
             "watcher_enabled": bool(runtime.get("watcher_enabled", False)),
             "resume_hint": runtime.get("resume_hint"),
+            "verification_required": bool(runtime.get("verification_required", False)),
+            "pending_verification": runtime.get("pending_verification") or [],
+            "last_verification_status": runtime.get("last_verification_status"),
             "pending_tasks": pending_tasks,
             "running_jobs": running_jobs,
             "orphaned_jobs": orphaned_jobs,
@@ -19490,6 +19529,8 @@ class Agent:
     MAX_RETRIES = 2      # retries for malformed LLM responses
     MAX_SAME_TOOL_REPEAT = 5  # prevent infinite same-tool loops (5 allows thinking models to re-verify)
     PARALLEL_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep"})  # backward-compatible fallback
+    CODE_CONTEXT_TOOLS = frozenset({"Read", "Grep", "Glob", "Edit", "Write", "ApplyPatch", "MultiEdit", "NotebookEdit", "Bash"})
+    READ_BEFORE_WRITE_TOOLS = frozenset({"Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"})
 
     # Tools allowed in plan mode (read-only exploration + task tracking)
     PLAN_MODE_TOOLS = {
@@ -19551,6 +19592,20 @@ class Agent:
         self._plan_mode = bool(runtime.get("plan_mode", False))
         self._active_plan_path = runtime.get("active_plan_path")
         self.auto_test.enabled = bool(runtime.get("autotest_enabled", False))
+        runtime_meta = session.runtime_state.load_runtime() if session.runtime_state else {}
+        restored_pending = runtime_meta.get("pending_verification") or []
+        self._known_file_paths = set()
+        self._modified_file_paths = set()
+        for _path in restored_pending:
+            try:
+                resolved, error = _resolve_repo_path(config.cwd, _path, require_exists=False, path_label="file")
+                if resolved and not error:
+                    self._modified_file_paths.add(resolved)
+            except Exception:
+                pass
+        self._pending_verification = bool(runtime_meta.get("verification_required")) or bool(self._modified_file_paths)
+        self._verification_reminders = 0
+        self._repo_map_injected = bool(runtime_meta.get("repo_map_injected", False))
 
         # Store last assistant output for loop mode completion detection
         self._last_output: str = ""
@@ -19850,14 +19905,200 @@ class Agent:
             "effort": effort or "(default)",
         }
 
+    def _update_runtime_phase(self, phase, resume_hint=None, **extra_fields):
+        if not self.session.runtime_state:
+            return
+        payload = {
+            "last_known_phase": phase,
+            "updated_at": time.time(),
+        }
+        if resume_hint is not None:
+            payload["resume_hint"] = resume_hint
+        payload.update(extra_fields)
+        self.session.runtime_state.update_runtime(**payload)
+
+    def _relativize_paths(self, paths, limit=12):
+        rel_paths = []
+        for path in sorted({p for p in paths if p}):
+            try:
+                rel_paths.append(os.path.relpath(path, self.config.cwd))
+            except ValueError:
+                rel_paths.append(path)
+        return rel_paths[:limit]
+
+    def _resolve_request_policy(self, tool_schemas, empty_retries):
+        policy = {
+            "model": self.config.model,
+            "options": {},
+            "reasoning": self._active_reasoning_profile(),
+            "tools": tool_schemas if tool_schemas else None,
+        }
+        if empty_retries >= 2:
+            policy["options"]["retry_temperature_boost"] = 0.3
+        if (
+            empty_retries >= 3
+            and self.config.sidecar_model
+            and self.config.sidecar_model != self.config.model
+        ):
+            policy["model"] = self.config.sidecar_model
+        if not policy["options"]:
+            policy["options"] = None
+        return policy
+
+    def _resolve_tool_target_paths(self, tool_name, tool_params):
+        raw_paths = []
+        if tool_name in {"Read", "Write", "Edit"}:
+            raw_paths.append(tool_params.get("file_path", ""))
+        elif tool_name == "NotebookEdit":
+            raw_paths.append(tool_params.get("notebook_path", ""))
+        elif tool_name == "MultiEdit":
+            raw_paths.extend(
+                edit.get("file_path", "")
+                for edit in tool_params.get("edits", [])
+                if isinstance(edit, dict)
+            )
+        elif tool_name == "ApplyPatch":
+            parsed_patch, _patch_error = _parse_unified_patch_text(tool_params.get("patch", ""))
+            if parsed_patch:
+                for entry in parsed_patch:
+                    target = entry["new_path"] if entry["new_path"] != "/dev/null" else entry["old_path"]
+                    if target:
+                        raw_paths.append(target)
+        resolved_paths = []
+        for raw_path in raw_paths:
+            if not raw_path or raw_path == "/dev/null":
+                continue
+            resolved, error = _resolve_repo_path(
+                self.config.cwd,
+                raw_path,
+                require_exists=False,
+                path_label="file",
+            )
+            if error and not resolved:
+                candidate = raw_path if os.path.isabs(raw_path) else os.path.join(self.config.cwd, raw_path)
+                resolved = os.path.realpath(candidate)
+            if resolved not in resolved_paths:
+                resolved_paths.append(resolved)
+        return resolved_paths
+
+    def _validate_read_before_write(self, tool_name, tool_params):
+        if tool_name not in self.READ_BEFORE_WRITE_TOOLS:
+            return None
+        missing = []
+        for path in self._resolve_tool_target_paths(tool_name, tool_params):
+            if not os.path.exists(path):
+                continue
+            if path in self._known_file_paths or path in self._modified_file_paths:
+                continue
+            missing.append(path)
+        if not missing:
+            return None
+        rel = ", ".join(self._relativize_paths(missing, limit=5))
+        return (
+            f"Read the existing file first before modifying it: {rel}. "
+            "Use Read to inspect the current contents before editing."
+        )
+
+    def _mark_verification_status(self, passed, command, summary="", source="manual"):
+        summary_text = _summarize_output_text(summary, 500)
+        if passed:
+            self._pending_verification = False
+            self._verification_reminders = 0
+            self._update_runtime_phase(
+                "verified",
+                resume_hint="continue chat",
+                verification_required=False,
+                pending_verification=[],
+                last_verification_status="passed",
+                last_verification_source=source,
+                last_verification_command=command or "",
+                last_verification_summary=summary_text,
+            )
+            return
+        self._pending_verification = bool(self._modified_file_paths)
+        self._update_runtime_phase(
+            "verifier_failed",
+            resume_hint="retry verification",
+            verification_required=bool(self._modified_file_paths),
+            pending_verification=self._relativize_paths(self._modified_file_paths),
+            last_verification_status="failed",
+            last_verification_source=source,
+            last_verification_command=command or "",
+            last_verification_summary=summary_text,
+        )
+
+    def _record_tool_runtime_effects(self, tool_name, tool_params, output, is_error):
+        tracked_paths = self._resolve_tool_target_paths(tool_name, tool_params)
+        if tool_name == "Read" and not is_error:
+            self._known_file_paths.update(tracked_paths)
+            self._update_runtime_phase(
+                "understanding",
+                resume_hint="continue with grounded context",
+                known_paths=self._relativize_paths(self._known_file_paths),
+            )
+            return
+        if tool_name in self.READ_BEFORE_WRITE_TOOLS and tracked_paths and not is_error:
+            self._known_file_paths.update(tracked_paths)
+            self._modified_file_paths.update(tracked_paths)
+            self._pending_verification = True
+            self._verification_reminders = 0
+            self._update_runtime_phase(
+                "implementing",
+                resume_hint="run verification before finishing",
+                verification_required=True,
+                pending_verification=self._relativize_paths(self._modified_file_paths),
+            )
+            return
+        if tool_name == "Bash":
+            command = str(tool_params.get("command", "") or "")
+            if _looks_like_verification_command(command):
+                passed = not is_error and "(exit code:" not in str(output or "")
+                if self.session.runtime_state:
+                    self.session.runtime_state.record_verifier_run(
+                        "manual",
+                        command,
+                        "passed" if passed else "failed",
+                        _summarize_output_text(output, 500),
+                    )
+                self._mark_verification_status(passed, command, output, source="manual")
+
+    def _maybe_inject_repo_map_context(self, route_candidates):
+        if self._repo_map_injected or not self.code_intel or not route_candidates:
+            return False
+        candidate_names = {
+            item.get("name")
+            for item in route_candidates
+            if item.get("score", 0) >= 2
+        }
+        if not candidate_names.intersection(self.CODE_CONTEXT_TOOLS):
+            return False
+        try:
+            symbol_count = self.code_intel.build_index()
+            if symbol_count <= 0:
+                return False
+            repo_map = self.code_intel.repo_map(max_lines=120)
+        except Exception:
+            return False
+        if not str(repo_map or "").strip():
+            return False
+        self.session.add_system_note(f"[Repo Map]\n{repo_map}")
+        self._repo_map_injected = True
+        self._update_runtime_phase(
+            "understanding",
+            resume_hint="continue with repo map context",
+            repo_map_injected=True,
+        )
+        return True
+
     def _run_impl(self, user_input, skip_add=False):
         """Internal agent loop implementation."""
         _p = self.tui._scroll_print  # scroll-region-safe print
         if self.session.runtime_state:
-            self.session.runtime_state.update_runtime(
-                last_known_phase="planning" if self._plan_mode else "acting",
+            self._update_runtime_phase(
+                "planning" if self._plan_mode else "acting",
                 resume_hint="continue chat",
-                updated_at=time.time(),
+                verification_required=self._pending_verification,
+                pending_verification=self._relativize_paths(self._modified_file_paths),
             )
 
         # Auto-parallel detection: if user asks multiple independent tasks, run them in parallel
@@ -19925,6 +20166,7 @@ class Agent:
                 pass
         if self.config.debug and _route_candidates:
             _p(f"  {C.DIM}[route] {_format_route_report(self._last_route_report).replace(chr(10), ' | ')}{C.RESET}")
+        self._maybe_inject_repo_map_context(_route_candidates)
         self._interrupted.clear()
         self._auto_fix_count = 0
         _recent_tool_calls = []  # track recent calls for loop detection
@@ -19970,6 +20212,7 @@ class Agent:
 
                 # 1. Call Ollama (with retry for malformed responses)
                 tools = self._get_tool_schemas()
+                request_policy = self._resolve_request_policy(tools, _empty_retries)
                 _esc_hint = " — ESC: 中断" if HAS_TERMIOS else ""
                 # P2: フッターにツール呼び出し数を渡す
                 self.tui._current_iteration = iteration
@@ -19982,32 +20225,20 @@ class Agent:
                         f"{'Planning' if self._plan_mode else 'Thinking'} (step {iteration+1}, {elapsed}s){_esc_hint}"
                     )
 
-                request_model = self.config.model
-                request_options = {}
-                if _empty_retries >= 2:
-                    request_options["retry_temperature_boost"] = 0.3
-                if (
-                    _empty_retries >= 3
-                    and self.config.sidecar_model
-                    and self.config.sidecar_model != self.config.model
-                ):
-                    request_model = self.config.sidecar_model
-
                 response = None
                 last_error = None
                 for retry in range(self.MAX_RETRIES + 1):
-                    _reasoning = self._active_reasoning_profile()
                     _prev_think_mode = self.client.think_mode
                     _prev_thinking_budget = self.client.thinking_budget
                     try:
-                        self.client.think_mode = _reasoning["think_mode"]
-                        self.client.thinking_budget = _reasoning["thinking_budget"]
+                        self.client.think_mode = request_policy["reasoning"]["think_mode"]
+                        self.client.thinking_budget = request_policy["reasoning"]["thinking_budget"]
                         response = self.client.chat(
-                            model=request_model,
+                            model=request_policy["model"],
                             messages=self.session.get_messages(),
-                            tools=tools if tools else None,
+                            tools=request_policy["tools"],
                             stream=True,  # always try streaming (text + tool calls)
-                            options=request_options or None,
+                            options=request_policy["options"],
                         )
                         break
                     except (RuntimeError, urllib.error.URLError) as e:
@@ -20066,7 +20297,7 @@ class Agent:
                            f"({pct}% ctx){C.RESET}")
                         if self._evolution:
                             self._evolution.record_usage(
-                                request_model,
+                                request_policy["model"],
                                 prompt_t,
                                 completion_t,
                                 self.config.prompt_cost_per_mtok,
@@ -20139,6 +20370,26 @@ class Agent:
 
                 # 4. If no tool calls, we're done
                 if not tool_calls:
+                    if self._pending_verification and iteration < self.max_iterations - 1:
+                        if self._verification_reminders < 2:
+                            self._verification_reminders += 1
+                            self._update_runtime_phase(
+                                "verification_required",
+                                resume_hint="run syntax check or tests before finishing",
+                                verification_required=True,
+                                pending_verification=self._relativize_paths(self._modified_file_paths),
+                            )
+                            self.session.add_system_note(
+                                "You modified files in this run but have not run a verification step yet. "
+                                "Before finishing, run a syntax check, test command, or build that validates the change."
+                            )
+                            continue
+                        self._set_stop_reason(
+                            "verification_required",
+                            "model stopped before running verification",
+                        )
+                        self._route_prefilter_names = None
+                        break
                     self._set_stop_reason("assistant_final", "model returned final text without tool calls")
                     self._route_prefilter_names = None
                     break
@@ -20253,6 +20504,17 @@ class Agent:
                             results.append(ToolResult(tc_id, "Error: could not validate file path in plan mode.", True))
                             self.tui.show_tool_result(tool_name, "Blocked: path validation error", True)
                             continue
+                    prereq_error = self._validate_read_before_write(tool_name, tool_params)
+                    if prereq_error:
+                        self._update_runtime_phase(
+                            "understanding",
+                            resume_hint="read target files before editing",
+                            verification_required=self._pending_verification,
+                            pending_verification=self._relativize_paths(self._modified_file_paths),
+                        )
+                        results.append(ToolResult(tc_id, f"Error: {prereq_error}", True))
+                        self.tui.show_tool_result(tool_name, prereq_error, True)
+                        continue
                     # Then ask permission
                     if not self.permissions.check(tool_name, tool_params, self.tui):
                         denial_reason = self.permissions.describe_last_decision()
@@ -20331,6 +20593,7 @@ class Agent:
                         self.tui.show_tool_result(tool_name, result.output, result.is_error,
                                                   duration=_pdur, params=tool_params)
                         results.append(result)
+                        self._record_tool_runtime_effects(tool_name, tool_params, result.output, result.is_error)
                         # Headless output collector (parallel path)
                         if self.output_collector:
                             self.output_collector.tool_result(tool_name, result.output, result.is_error)
@@ -20343,33 +20606,8 @@ class Agent:
                         if self._interrupted.is_set() or _esc_monitor.pressed:
                             break
                         try:
-                            tracked_paths = []
-                            tracked_path = None
-                            if tool_name == "Write":
-                                tracked_path = tool_params.get("file_path", "")
-                            elif tool_name == "Edit":
-                                tracked_path = tool_params.get("file_path", "")
-                            elif tool_name == "ApplyPatch":
-                                parsed_patch, _patch_error = _parse_unified_patch_text(tool_params.get("patch", ""))
-                                if parsed_patch:
-                                    for _entry in parsed_patch:
-                                        _target = _entry["new_path"] if _entry["new_path"] != "/dev/null" else _entry["old_path"]
-                                        if _target:
-                                            tracked_paths.append(_target)
-                            elif tool_name == "MultiEdit":
-                                tracked_paths.extend(e.get("file_path", "") for e in tool_params.get("edits", []) if e.get("file_path"))
-                            elif tool_name == "NotebookEdit":
-                                tracked_path = tool_params.get("notebook_path", "")
-                            if tracked_path and not os.path.isabs(tracked_path):
-                                tracked_path = os.path.join(os.getcwd(), tracked_path)
-                            if tracked_path:
-                                tracked_paths.append(tracked_path)
-                            tracked_paths = [p for p in tracked_paths if p]
-                            tracked_paths = [
-                                p if os.path.isabs(p) else os.path.join(os.getcwd(), p)
-                                for p in tracked_paths
-                            ]
-                            tracked_exists = bool(tracked_path and os.path.exists(tracked_path))
+                            tracked_paths = self._resolve_tool_target_paths(tool_name, tool_params)
+                            tracked_existing = {p for p in tracked_paths if os.path.exists(p)}
 
                             # Git checkpoint before write/edit operations
                             if tracked_paths and self.git_checkpoint._is_git_repo:
@@ -20387,6 +20625,7 @@ class Agent:
                             self.tui.show_tool_result(tool_name, output, is_error=_is_err,
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
+                            self._record_tool_runtime_effects(tool_name, tool_params, output, _is_err)
                             # Evolution: record tool call outcome
                             if self._evolution:
                                 self._evolution.record_tool_call(tool_name, not _is_err, _tool_dur)
@@ -20401,7 +20640,7 @@ class Agent:
                             if tracked_paths and not _is_err:
                                 for _tracked in tracked_paths:
                                     if tool_name == "Write":
-                                        action = "write" if tracked_exists else "create"
+                                        action = "write" if _tracked in tracked_existing else "create"
                                     elif tool_name == "NotebookEdit":
                                         action = "notebook"
                                     else:
@@ -20453,6 +20692,12 @@ class Agent:
                                                 "verifier_failed",
                                                 verifier_pipeline.get("summary") or f"Verifier failed: {failure_kind}",
                                             )
+                                        self._mark_verification_status(
+                                            False,
+                                            verifier_cmd,
+                                            verifier_pipeline.get("summary") or test_errors,
+                                            source="autotest",
+                                        )
                                         _p(f"\n  {_ansi(chr(27)+'[38;5;196m')}Auto-test errors detected:{C.RESET}")
                                         for line in test_errors.split('\n')[:5]:
                                             _p(f"  {C.DIM}{line}{C.RESET}")
@@ -20477,6 +20722,12 @@ class Agent:
                                         self.session.runtime_state.record_resume_event(
                                             "verifier_passed",
                                             verifier_pipeline.get("summary") if verifier_pipeline else f"Verifier passed after {tool_name}.",
+                                        )
+                                        self._mark_verification_status(
+                                            True,
+                                            verifier_cmd,
+                                            verifier_pipeline.get("summary") if verifier_pipeline else f"Verifier passed after {tool_name}.",
+                                            source="autotest",
                                         )
                         except KeyboardInterrupt:
                             self.tui.stop_spinner()

@@ -155,6 +155,17 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertIn("# Loaded Skills", rendered)
 
     @patch("sys.stdin.isatty", return_value=False)
+    def test_system_prompt_budgets_large_optional_sections(self, _mock_isatty):
+        config = self.make_config()
+        config.context_window = 2048
+        Path(self.config_dir, "CLAUDE.md").write_text("A" * 5000, encoding="utf-8")
+
+        prompt = eve_coder._build_system_prompt(config)
+
+        self.assertIn("# Global Instructions", prompt)
+        self.assertIn("[Truncated due to prompt budget]", prompt)
+
+    @patch("sys.stdin.isatty", return_value=False)
     def test_runtime_system_prompt_includes_loaded_skills(self, _mock_isatty):
         config = self.make_config()
         global_skills = Path(self.config_dir, "skills")
@@ -165,6 +176,7 @@ class TestSecurityHardening(unittest.TestCase):
 
         self.assertIn("# Loaded Skills", prompt)
         self.assertIn("## Skill: global", prompt)
+        self.assertNotIn("Repo Map (auto-generated", prompt)
 
     def test_skill_filters_allow_only_matching_entries(self):
         config = self.make_config()
