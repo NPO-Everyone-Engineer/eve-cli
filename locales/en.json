@@ -52,6 +52,8 @@
     "repo_instruction_injected": "Repo instruction files are injected into the agent prompt. Trust only repositories you control.",
     "project_skills_trust_required": "Project Skills Trust Required",
     "project_skills_injected": "Project skills are injected into the agent prompt and can influence tool usage.",
+    "project_agents_trust_required": "Project Agent Personas Trust Required",
+    "project_agents_injected": "Project agent personas override sub-agent prompts and can influence tool usage.",
     "repo_trust_unreadable": "[unreadable]",
     "test_syntax_error": "Warning: Generated test has syntax error:",
     "large_file": "Warning: Large file detected ({size}MB)",

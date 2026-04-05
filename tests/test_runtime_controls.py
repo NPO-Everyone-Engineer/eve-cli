@@ -204,7 +204,9 @@ class TestThinkingDisplay(unittest.TestCase):
         self.assertEqual(text, "Visible answer")
         self.assertEqual(tool_calls, [])
         self.assertIn("Thinking", printed)
+        self.assertIn("collapsed", printed)
         self.assertIn("inspect files", printed)
+        self.assertIn("Final answer continues below", printed)
         mock_render.assert_called_once_with("Visible answer")
 
 
@@ -456,7 +458,9 @@ class TestInputPrompts(unittest.TestCase):
         self.assertEqual(text, "Visible answer")
         self.assertEqual(tool_calls, [])
         self.assertIn("Thinking", printed)
+        self.assertIn("collapsed", printed)
         self.assertIn("inspect files", printed)
+        self.assertIn("Final answer continues below", printed)
 
 
 # ---------------------------------------------------------------------------
@@ -467,15 +471,7 @@ class TestVerificationJudgment(unittest.TestCase):
     """Tests for the improved _mark_verification_status / passed computation (FIX-1)."""
 
     def _compute_passed(self, is_error, output):
-        """Replicate the FIX-1 logic from eve-coder.py for unit testing."""
-        import re
-        _out_str = str(output or "")
-        return (
-            not is_error
-            and "(exit code:" not in _out_str
-            and not re.search(r'\bFAILED\b', _out_str)
-            and not re.search(r'\b(error|errors):\s*[1-9]', _out_str, re.IGNORECASE)
-        )
+        return eve_coder._manual_verification_passed(is_error, output)
 
     def test_passed_on_clean_output(self):
         """Clean pytest output with 'OK' should yield passed=True."""
@@ -509,6 +505,12 @@ class TestVerificationJudgment(unittest.TestCase):
         """Output containing 'Errors: 3' (mixed case) should yield passed=False."""
         self.assertFalse(self._compute_passed(False, "Errors: 3"))
 
+    def test_failed_on_pytest_summary_with_suppressed_exit_code(self):
+        self.assertFalse(self._compute_passed(False, "1 failed, 9 passed in 0.42s"))
+
+    def test_failed_on_found_errors_summary(self):
+        self.assertFalse(self._compute_passed(False, "Found 2 errors."))
+
     def test_passed_when_failed_is_substring_not_word(self):
         """'FAILEDOVER' without word boundary should NOT trigger failed=True."""
         # 'FAILED' must be a whole word; 'FAILEDOVER' should not match
@@ -517,6 +519,9 @@ class TestVerificationJudgment(unittest.TestCase):
     def test_passed_when_errors_zero(self):
         """'errors: 0' should NOT mark as failed (only 1-9 triggers failure)."""
         self.assertTrue(self._compute_passed(False, "errors: 0"))
+
+    def test_passed_when_failures_zero(self):
+        self.assertTrue(self._compute_passed(False, "0 failed, 12 passed in 0.15s"))
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +602,35 @@ class TestPendingVerificationReset(unittest.TestCase):
         )
         # The stale flag must NOT be carried forward
         self.assertFalse(agent2._pending_verification)
+
+
+# ---------------------------------------------------------------------------
+# Gemma / large-context policy tests
+# ---------------------------------------------------------------------------
+
+class TestSessionContextPolicy(unittest.TestCase):
+    def test_default_context_policy_stays_conservative(self):
+        config = eve_coder.Config()
+        config.model = "test-model"
+        config.context_window = eve_coder.Config.DEFAULT_CONTEXT_WINDOW
+
+        policy = eve_coder.Session.context_policy_for(config)
+
+        self.assertEqual(policy["compact_threshold"], 0.80)
+        self.assertEqual(policy["keep_recent_messages"], 4)
+        self.assertEqual(policy["max_messages"], eve_coder.Session.MAX_MESSAGES)
+
+    def test_gemma_context_policy_keeps_more_history(self):
+        config = eve_coder.Config()
+        config.model = "gemma4:31b"
+        config.context_window = 262144
+
+        policy = eve_coder.Session.context_policy_for(config)
+
+        self.assertEqual(policy["compact_threshold"], 0.87)
+        self.assertEqual(policy["keep_recent_messages"], 8)
+        self.assertEqual(policy["summary_chars"], 12000)
+        self.assertGreater(policy["max_messages"], eve_coder.Session.MAX_MESSAGES)
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +719,30 @@ class TestKnownFilePaths(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Audio read behavior
+# ---------------------------------------------------------------------------
+
+class TestAudioReadBehavior(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.project_dir = os.path.join(self.test_dir, "project")
+        os.makedirs(self.project_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_read_tool_explains_audio_transport_limit(self):
+        audio_path = os.path.join(self.project_dir, "sample.wav")
+        with open(audio_path, "wb") as f:
+            f.write(b"RIFFdemoWAVEfmt ")
+
+        result = eve_coder.ReadTool(self.project_dir).execute({"file_path": "sample.wav"})
+
+        self.assertIn("Audio file detected", result)
+        self.assertIn("does not accept audio attachments yet", result)
+
+
+# ---------------------------------------------------------------------------
 # FIX-6: TOCTOU テスト (エージェントファイル symlink チェック)
 # ---------------------------------------------------------------------------
 
@@ -709,6 +767,13 @@ class TestAgentFileTOCTOU(unittest.TestCase):
         config.debug = False
         return config
 
+    def trust_agents(self, config, *paths):
+        eve_coder._remember_repo_scope_trust(
+            config,
+            "agents",
+            eve_coder._compute_repo_hashes(config, [str(path) for path in paths]),
+        )
+
     @patch("sys.stdin.isatty", return_value=False)
     def test_symlink_skipped_in_agent_dir(self, _mock_isatty):
         """A symlink to a .md file in the agents dir must not appear in the prompt."""
@@ -728,6 +793,7 @@ class TestAgentFileTOCTOU(unittest.TestCase):
             self.skipTest("Symlink creation not supported on this platform")
 
         config = self.make_config()
+        self.trust_agents(config, real_agent)
         prompt = eve_coder._build_runtime_system_prompt(config)
 
         # The real agent must appear; the symlink must NOT generate a separate entry
@@ -747,6 +813,7 @@ class TestAgentFileTOCTOU(unittest.TestCase):
             f.write("---\ndescription: My special agent\n---\nDoes special things.\n")
 
         config = self.make_config()
+        self.trust_agents(config, agent_file)
         prompt = eve_coder._build_runtime_system_prompt(config)
 
         self.assertIn("my-agent", prompt)

@@ -39,11 +39,13 @@ import copy
 import hashlib
 import traceback
 import base64
+import errno
 import atexit
 import struct
 import sqlite3
 import asyncio
 import contextlib
+import stat
 from abc import ABC, abstractmethod
 from datetime import datetime
 import collections
@@ -268,6 +270,20 @@ def _looks_like_verification_command(command):
         r"\bmvn\b.*\b(?:test|verify)\b",
     )
     return any(re.search(pattern, command) for pattern in verification_patterns)
+
+
+def _manual_verification_passed(is_error, output):
+    if is_error:
+        return False
+    text = str(output or "")
+    failure_patterns = (
+        r"\(exit code:\s*[1-9]\d*\)",
+        r"(?mi)^failed\b",
+        r"\b(?:failure|failures|error|errors)\s*[:=]\s*[1-9]\d*\b",
+        r"\b[1-9]\d*\s+(?:failed|failure|failures|error|errors)\b",
+        r"\bfound\s+[1-9]\d*\s+errors?\b",
+    )
+    return not any(re.search(pattern, text, re.IGNORECASE) for pattern in failure_patterns)
 
 def _scroll_aware_print(*args, **kwargs):
     """Print within scroll region or normal print.
@@ -2557,6 +2573,10 @@ def _is_cloud_model(model_name):
     return ":cloud" in lower or "-cloud" in lower
 
 
+def _is_gemma4_model(model_name):
+    return bool(model_name) and model_name.lower().startswith("gemma4:")
+
+
 def _get_ram_gb():
     """Detect system RAM in GB."""
     try:
@@ -4179,41 +4199,31 @@ def _build_runtime_system_prompt(config):
             _state = "loaded" if _added else "skipped"
             print(f"{C.DIM}[debug] Skills prompt section {_state}: {', '.join(skills.keys())}{C.RESET}", file=sys.stderr)
 
-    _agent_dirs = [
-        os.path.join(config.cwd, ".eve-cli", "agents"),
-        os.path.join(config.config_dir, "agents"),
-    ]
+    if _is_gemma4_model(config.model):
+        _gemma_notes = "\n".join((
+            "- Use function calling only. Emit one precise tool call at a time unless parallel work is clearly required.",
+            "- Tool arguments must be strict JSON objects with double-quoted keys and no trailing commas.",
+            "- Prefer Read/Grep/Glob before write tools when gathering repo context.",
+            "- If a tool call fails validation, correct the arguments and retry instead of narrating around it.",
+        ))
+        prompt_budget.add_optional_section("Gemma 4 Tool-Calling Notes", _gemma_notes)
+
     _agents_found = []
-    for _adir in _agent_dirs:
-        if not os.path.isdir(_adir):
-            continue
+    for _af_path in _trusted_agent_persona_paths(config):
+        _aname = os.path.splitext(os.path.basename(_af_path))[0]
         try:
-            for _af in sorted(os.listdir(_adir)):
-                _af_path = os.path.join(_adir, _af)
-                if not _af.endswith(".md") or os.path.islink(_af_path):
-                    continue
-                _aname = _af[:-3]
-                try:
-                    _af_stat_before = os.lstat(_af_path)
-                    with open(_af_path, encoding="utf-8", errors="replace") as _afh:
-                        _af_stat_after = os.fstat(_afh.fileno())
-                        if (_af_stat_before.st_ino != _af_stat_after.st_ino
-                                or _af_stat_before.st_dev != _af_stat_after.st_dev):
-                            continue  # TOCTOU: file changed between lstat and open
-                        _ahead = _afh.read(500)
-                except OSError:
-                    continue
-                _adesc = ""
-                if _ahead.startswith("---"):
-                    _aparts = _ahead.split("---", 2)
-                    if len(_aparts) >= 3:
-                        for _al in _aparts[1].strip().split("\n"):
-                            if _al.strip().startswith("description:"):
-                                _adesc = _al.split(":", 1)[1].strip().strip("\"'")
-                                break
-                _agents_found.append((_aname, _adesc))
+            _ahead = _read_text_file_guarded(_af_path, 500)
         except OSError:
-            pass
+            continue
+        _adesc = ""
+        if _ahead.startswith("---"):
+            _aparts = _ahead.split("---", 2)
+            if len(_aparts) >= 3:
+                for _al in _aparts[1].strip().split("\n"):
+                    if _al.strip().startswith("description:"):
+                        _adesc = _al.split(":", 1)[1].strip().strip("\"'")
+                        break
+        _agents_found.append((_aname, _adesc))
     if _agents_found:
         _agent_lines = ["Use SubAgent(agent_name='<name>', prompt='...') to invoke these specialized agents:"]
         for _aname, _adesc in _agents_found:
@@ -4263,9 +4273,15 @@ class ResponseCache:
 
 
 class OllamaClient:
-    """Communicates with Ollama via /v1/chat/completions."""
+    """Communicates with Ollama via the native /api/chat endpoint."""
 
     def __init__(self, config):
+        self._supports_tool_streaming = None  # None=untested, True/False=detected
+        self._response_cache = ResponseCache()
+        self.refresh_from_config(config)
+
+    def refresh_from_config(self, config):
+        prev_base_url = getattr(self, "base_url", None)
         self.base_url = config.ollama_host
         self.api_key = getattr(config, "ollama_api_key", "")
         self.max_tokens = config.max_tokens
@@ -4281,8 +4297,8 @@ class OllamaClient:
         self.thinking_budget = getattr(config, 'thinking_budget', None)
         self.debug = config.debug
         self.timeout = 300
-        self._supports_tool_streaming = None  # None=untested, True/False=detected
-        self._response_cache = ResponseCache()
+        if prev_base_url is not None and prev_base_url != self.base_url:
+            self._supports_tool_streaming = None
 
     def _api_url(self, path):
         return f"{self.base_url}{path}"
@@ -4652,11 +4668,14 @@ class OllamaClient:
 
         temp = self.temperature
         if tools:
-            _tier, _ = Config.get_model_tier(model)
-            if _tier in ("S", "A") and self.think_mode is not False:
-                temp = min(temp, 0.4)
+            if _is_gemma4_model(model):
+                temp = min(temp, 0.25)
             else:
-                temp = min(temp, 0.3)
+                _tier, _ = Config.get_model_tier(model)
+                if _tier in ("S", "A") and self.think_mode is not False:
+                    temp = min(temp, 0.4)
+                else:
+                    temp = min(temp, 0.3)
 
         try:
             retry_boost = float(options.get("retry_temperature_boost", 0.0) or 0.0)
@@ -6426,7 +6445,7 @@ class ReadTool(Tool):
     name = "Read"
     lock_mode = "read"
     parallel_safe = True
-    description = "Read a file from the filesystem. Returns content with line numbers. Can also read image files (PNG, JPG, etc.) for multimodal models."
+    description = "Read a file from the filesystem. Returns content with line numbers. Can also read image files for multimodal models and identify audio inputs."
     parameters = {
         "type": "object",
         "properties": {
@@ -6543,6 +6562,22 @@ class ReadTool(Tool):
                 })
             except Exception as e:
                 return f"Error reading image file: {e}"
+
+        if ext_lower in AUDIO_EXTENSIONS:
+            try:
+                file_size = os.path.getsize(file_path)
+            except OSError as e:
+                return f"Error: cannot determine file size: {e}"
+            if file_size > AUDIO_MAX_SIZE:
+                return f"Error: audio too large ({file_size // 1_000_000}MB). Max 20MB for audio files."
+            if file_size == 0:
+                return "Error: audio file is empty (0 bytes)."
+            media_type = _MEDIA_TYPES.get(ext_lower, "audio/octet-stream")
+            return (
+                f"[Audio file detected: {os.path.basename(file_path)} ({media_type}, {file_size} bytes)]\n"
+                "Ollama's current chat API does not accept audio attachments yet, so this CLI cannot forward "
+                "the audio contents to the model directly. Ask for a transcript or use a speech-to-text step first."
+            )
 
         # Check file size (100MB limit)
         try:
@@ -9329,6 +9364,20 @@ class SubAgentTool(Tool):
                 tool_map[tool.name] = tool
         return tool_map
 
+    @classmethod
+    def _base_allowed_tools(cls, allow_writes):
+        allowed_tools = set(cls.READ_ONLY_TOOLS)
+        if allow_writes:
+            allowed_tools |= cls.WRITE_TOOLS
+        return allowed_tools
+
+    @classmethod
+    def _resolve_allowed_tools(cls, persona_tools, allow_writes):
+        allowed_tools = cls._base_allowed_tools(allow_writes)
+        if not persona_tools:
+            return allowed_tools
+        return allowed_tools.intersection({str(tool_name) for tool_name in persona_tools if tool_name})
+
     @property
     def parameters(self):
         return {
@@ -9368,17 +9417,11 @@ class SubAgentTool(Tool):
 
         Returns (system_prompt, allowed_tools, model) or (None, None, None) if not found.
         """
-        _agent_dirs = [
-            os.path.join(config.cwd, ".eve-cli", "agents"),
-            os.path.join(config.config_dir, "agents"),
-        ]
-        for _adir in _agent_dirs:
-            _apath = os.path.join(_adir, f"{agent_name}.md")
-            if not os.path.isfile(_apath) or os.path.islink(_apath):
+        for _apath in _trusted_agent_persona_paths(config):
+            if os.path.splitext(os.path.basename(_apath))[0] != agent_name:
                 continue
             try:
-                with open(_apath, encoding="utf-8", errors="replace") as f:
-                    _acontent = f.read(8000)
+                _acontent = _read_text_file_guarded(_apath, 8000)
             except OSError:
                 continue
             # Parse frontmatter
@@ -9487,7 +9530,7 @@ class SubAgentTool(Tool):
         _persona_model = None
         if _agent_name:
             _persona_prompt, _persona_tools, _persona_model = self._load_agent_persona(
-                sub_config, _agent_name)
+                self._config, _agent_name)
             if _persona_prompt is None:
                 _avail_msg = f"Error: agent persona '{_agent_name}' not found. "
                 _avail_msg += "Place agent files in .eve-cli/agents/<name>.md"
@@ -9495,13 +9538,8 @@ class SubAgentTool(Tool):
                     return self._format_result_payload(_avail_msg, ok=False, duration=0.0, error=_avail_msg)
                 return _avail_msg
 
-        # Determine allowed tool set (persona tools override defaults)
-        if _persona_tools:
-            allowed_tools = set(_persona_tools)
-        else:
-            allowed_tools = set(self.READ_ONLY_TOOLS)
-            if allow_writes:
-                allowed_tools |= self.WRITE_TOOLS
+        # Determine allowed tool set (persona tools can narrow, but never expand, parent permissions)
+        allowed_tools = self._resolve_allowed_tools(_persona_tools, allow_writes)
         sub_tools = self._build_tool_map(allowed_tools, sub_config.cwd)
 
         # Print minimal status (with optional agent label for parallel runs)
@@ -10241,6 +10279,63 @@ def _ensure_repo_scope_trusted(config, scope, title, warning, paths, preview_pat
         print(f"{C.YELLOW}{msg}{C.RESET}",
               file=sys.stderr)
     return _prompt_repo_trust(config, scope, title, warning, hashes, preview_paths=preview_paths)
+
+
+def _read_text_file_guarded(path, max_bytes, encoding="utf-8", errors="replace"):
+    fd = None
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    pre_stat = os.lstat(path)
+    if not stat.S_ISREG(pre_stat.st_mode):
+        raise OSError(errno.EINVAL, "not a regular file")
+    try:
+        fd = os.open(path, flags)
+        post_stat = os.fstat(fd)
+        if pre_stat.st_ino != post_stat.st_ino or pre_stat.st_dev != post_stat.st_dev:
+            raise OSError(errno.EAGAIN, "file changed during open")
+        with os.fdopen(fd, "r", encoding=encoding, errors=errors) as f:
+            fd = None
+            return f.read(max_bytes)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _list_markdown_files(dir_path):
+    paths = []
+    if not os.path.isdir(dir_path):
+        return paths
+    try:
+        for entry in sorted(os.listdir(dir_path)):
+            if not entry.endswith(".md"):
+                continue
+            fpath = os.path.join(dir_path, entry)
+            if os.path.islink(fpath) or not os.path.isfile(fpath):
+                continue
+            paths.append(fpath)
+    except OSError:
+        return []
+    return paths
+
+
+def _trusted_agent_persona_paths(config):
+    project_paths = _list_markdown_files(os.path.join(config.cwd, ".eve-cli", "agents"))
+    global_paths = _list_markdown_files(os.path.join(config.config_dir, "agents"))
+    load_project_agents = True
+    if project_paths:
+        load_project_agents = _ensure_repo_scope_trusted(
+            config,
+            "agents",
+            t("warnings.project_agents_trust_required", "Project Agent Personas Trust Required"),
+            t(
+                "warnings.project_agents_injected",
+                "Project agent personas override sub-agent prompts and can influence tool usage.",
+            ),
+            project_paths,
+            preview_paths=project_paths,
+        )
+    return (project_paths if load_project_agents else []) + global_paths
 
 
 def _get_trusted_repos_path(config):
@@ -13324,7 +13419,7 @@ def _current_repo_trusted_scopes(config):
     trusted = _load_trusted_repos(config)
     entry = trusted.get(_repo_key(config), {})
     scopes = []
-    for key in ("instructions", "skills", "commands", "permissions", "mcp"):
+    for key in ("instructions", "skills", "agents", "commands", "permissions", "mcp"):
         if _get_repo_scope_hashes(entry, key):
             scopes.append(key)
     try:
@@ -17182,23 +17277,57 @@ class Session:
                         or '\u3400' <= ch <= '\u4dbf'   # CJK ext-A
                         or '\u3040' <= ch <= '\u30ff'   # hiragana/katakana
                         or '\u3000' <= ch <= '\u303f'   # CJK symbols/punctuation
-                        or '\u31f0' <= ch <= '\u31ff'   # katakana ext
-                        or '\uff01' <= ch <= '\uff60'   # fullwidth forms
-                        or '\uac00' <= ch <= '\ud7af')  # korean
+                         or '\u31f0' <= ch <= '\u31ff'   # katakana ext
+                         or '\uff01' <= ch <= '\uff60'   # fullwidth forms
+                         or '\uac00' <= ch <= '\ud7af')  # korean
         non_cjk = len(text) - cjk_count
         return cjk_count + non_cjk // 4
 
+    @classmethod
+    def context_policy_for(cls, config):
+        model_name = getattr(config, "model", "") or ""
+        context_window = getattr(config, "context_window", Config.DEFAULT_CONTEXT_WINDOW) or Config.DEFAULT_CONTEXT_WINDOW
+        policy = {
+            "compact_threshold": 0.80,
+            "keep_recent_messages": 4,
+            "summary_chars": 3000,
+            "max_messages": cls.MAX_MESSAGES,
+        }
+        if _is_gemma4_model(model_name) and context_window >= 131072:
+            policy.update({
+                "compact_threshold": 0.87,
+                "keep_recent_messages": 8,
+                "summary_chars": 12000,
+                "max_messages": 900,
+            })
+        elif context_window >= 262144:
+            policy.update({
+                "compact_threshold": 0.85,
+                "keep_recent_messages": 8,
+                "summary_chars": 10000,
+                "max_messages": 800,
+            })
+        elif context_window >= 131072:
+            policy.update({
+                "compact_threshold": 0.83,
+                "keep_recent_messages": 6,
+                "summary_chars": 7000,
+                "max_messages": 700,
+            })
+        return policy
+
     def _enforce_max_messages(self):
         """Trim oldest messages if exceeding MAX_MESSAGES, preserving tool_call/result pairing."""
-        if len(self.messages) <= self.MAX_MESSAGES:
+        max_messages = self.context_policy_for(self.config)["max_messages"]
+        if len(self.messages) <= max_messages:
             return
-        cut = len(self.messages) - self.MAX_MESSAGES
+        cut = len(self.messages) - max_messages
         # Don't cut in the middle of a tool result sequence — advance past orphaned tool results
         while cut < len(self.messages) and self.messages[cut].get("role") == "tool":
             cut += 1
         if cut >= len(self.messages):
             # All remaining messages are tool results — keep at least some messages
-            cut = len(self.messages) - self.MAX_MESSAGES
+            cut = len(self.messages) - max_messages
         self.messages = self.messages[cut:]
         # Ensure the message list doesn't start with orphaned tool results (O(n) slice instead of O(n^2) pop)
         skip = 0
@@ -17231,15 +17360,17 @@ class Session:
         self._token_estimate = total
 
     def auto_compact(self, client, config):
-        """Auto-compact when token usage exceeds 80% of context window."""
+        """Auto-compact when token usage exceeds the model-aware context threshold."""
+        policy = self.context_policy_for(config)
         usage_pct = self.get_token_estimate() / config.context_window
-        if usage_pct < 0.80:
+        if usage_pct < policy["compact_threshold"]:
             return False
-        if len(self.messages) < 6:
+        keep_count = policy["keep_recent_messages"]
+        if len(self.messages) <= keep_count + 1:
             return False
         model = config.sidecar_model or config.model
-        to_summarize = self.messages[:-4]
-        keep = self.messages[-4:]
+        to_summarize = self.messages[:-keep_count]
+        keep = self.messages[-keep_count:]
         summary_text = "\n".join(
             f"[{m.get('role','?')}] {str(m.get('content',''))[:200]}"
             for m in to_summarize
@@ -17248,7 +17379,7 @@ class Session:
             return False
         summary_prompt = [
             {"role": "system", "content": "Summarize this conversation concisely in the same language. Keep key decisions, file paths, and code changes. Output only the summary."},
-            {"role": "user", "content": summary_text[:3000]},
+            {"role": "user", "content": summary_text[:policy["summary_chars"]]},
         ]
         try:
             resp = client.chat(model=model, messages=summary_prompt, tools=None, stream=False)
@@ -18250,6 +18381,26 @@ class TUI:
         _status_line_len = 60  # track length for clean clearing
         _sr = self.scroll_region  # reference (not cached bool)
 
+        def _show_thinking_summary(think_text, elapsed=None):
+            _think_text = (think_text or "").strip()
+            if not _think_text:
+                return
+            _all_lines = [line for line in _think_text.splitlines() if line.strip()]
+            _preview_lines = _all_lines[:3] if _all_lines else [_think_text]
+            _hidden = max(len(_all_lines) - len(_preview_lines), 0)
+            _think_tok = len(_think_text) // 4 or 1
+            _tok_s = f"{_think_tok / 1000:.1f}k" if _think_tok >= 1000 else str(_think_tok)
+            _meta = f"{elapsed:.1f}s · {_tok_s} tokens" if elapsed is not None else f"{_tok_s} tokens"
+            self._scroll_print(f"\n  {C.DIM}╭─ 💭 Thinking (collapsed · {_meta}){C.RESET}")
+            for _line in _preview_lines:
+                _disp = (_line[:100] + "\u2026") if len(_line) > 100 else _line
+                self._scroll_print(f"  {C.DIM}│  {_disp}{C.RESET}")
+            if _hidden:
+                self._scroll_print(
+                    f"  {C.DIM}│  … {_hidden} more line{'s' if _hidden != 1 else ''} hidden{C.RESET}"
+                )
+            self._scroll_print(f"  {C.DIM}╰─ Final answer continues below{C.RESET}")
+
         def _update_thinking_status():
             nonlocal _status_line_shown, _status_line_len, _last_status_update
             _now = time.time()
@@ -18276,19 +18427,6 @@ class TUI:
                 with _lock:
                     print(f"\r{' ' * _status_line_len}\r", end="", flush=True)
                 _status_line_shown = False
-
-        def _show_thinking_summary(think_text, elapsed=None):
-            _think_text = (think_text or "").strip()
-            if not _think_text:
-                return
-            _think_tok = len(_think_text) // 4 or 1
-            _tok_s = f"{_think_tok / 1000:.1f}k" if _think_tok >= 1000 else str(_think_tok)
-            _meta = f"{elapsed:.1f}s · {_tok_s} tokens" if elapsed is not None else f"{_tok_s} tokens"
-            self._scroll_print(f"\n  \U0001f4ad Thinking ({_meta})")
-            _lines = [l for l in _think_text.splitlines() if l.strip()][:3]
-            for _l in _lines:
-                _disp = (_l[:100] + "\u2026") if len(_l) > 100 else _l
-                self._scroll_print(f"  {C.DIM}   \u2502 {_disp}{C.RESET}")
 
         def _flush_native_thinking_summary():
             nonlocal native_thinking_shown
@@ -18456,13 +18594,20 @@ class TUI:
             _think_text = (think_text or "").strip()
             if not _think_text:
                 return
+            _all_lines = [line for line in _think_text.splitlines() if line.strip()]
+            _preview_lines = _all_lines[:3] if _all_lines else [_think_text]
+            _hidden = max(len(_all_lines) - len(_preview_lines), 0)
             _think_tok = len(_think_text) // 4 or 1
             _tok_s = f"{_think_tok / 1000:.1f}k" if _think_tok >= 1000 else str(_think_tok)
-            self._scroll_print(f"\n  \U0001f4ad Thinking ({_tok_s} tokens)")
-            _lines = [l for l in _think_text.splitlines() if l.strip()][:3]
-            for _l in _lines:
-                _disp = (_l[:100] + "\u2026") if len(_l) > 100 else _l
-                self._scroll_print(f"  {C.DIM}   \u2502 {_disp}{C.RESET}")
+            self._scroll_print(f"\n  {C.DIM}╭─ 💭 Thinking (collapsed · {_tok_s} tokens){C.RESET}")
+            for _line in _preview_lines:
+                _disp = (_line[:100] + "\u2026") if len(_line) > 100 else _line
+                self._scroll_print(f"  {C.DIM}│  {_disp}{C.RESET}")
+            if _hidden:
+                self._scroll_print(
+                    f"  {C.DIM}│  … {_hidden} more line{'s' if _hidden != 1 else ''} hidden{C.RESET}"
+                )
+            self._scroll_print(f"  {C.DIM}╰─ Final answer continues below{C.RESET}")
 
         # Extract and display <think>...</think> blocks before stripping
         _think_matches = re.findall(r'<think>([\s\S]*?)</think>', content)
@@ -20073,13 +20218,7 @@ class Agent:
         if tool_name == "Bash":
             command = str(tool_params.get("command", "") or "")
             if _looks_like_verification_command(command):
-                _out_str = str(output or "")
-                passed = (
-                    not is_error
-                    and "(exit code:" not in _out_str
-                    and not re.search(r'\bFAILED\b', _out_str)
-                    and not re.search(r'\b(error|errors):\s*[1-9]', _out_str, re.IGNORECASE)
-                )
+                passed = _manual_verification_passed(is_error, output)
                 if self.session.runtime_state:
                     self.session.runtime_state.record_verifier_run(
                         "manual",
@@ -20225,7 +20364,8 @@ class Agent:
             # Auto-compact if context is getting full
             if iteration > 0 and iteration % 5 == 0:
                 if self.session.auto_compact(self.client, self.config):
-                    _p(f"\n  {C.DIM}[auto-compacted: context was >80% full]{C.RESET}")
+                    _threshold_pct = int(self.session.context_policy_for(self.config)["compact_threshold"] * 100)
+                    _p(f"\n  {C.DIM}[auto-compacted: context was >{_threshold_pct}% full]{C.RESET}")
 
             text = ""
             try:
@@ -23616,8 +23756,14 @@ def main():
                                 _ok, fresh_models = client.check_connection()
                                 if client.check_model(new_model, available_models=fresh_models if _ok else None):
                                     config.model = new_model
+                                    if not config._cli_context_window_set:
+                                        config.context_window = Config.DEFAULT_CONTEXT_WINDOW
                                     config._apply_context_window(new_model)
+                                    if not config._cli_max_tokens_set:
+                                        config.max_tokens = Config.DEFAULT_MAX_TOKENS
                                     config._apply_max_tokens(new_model)
+                                    client.refresh_from_config(config)
+                                    session.system_prompt = _build_runtime_system_prompt(config)
                                     # Update footer mode display
                                     if agent.tui.scroll_region._active:
                                         agent.tui.scroll_region.update_mode_display(f"Model: {new_model}")

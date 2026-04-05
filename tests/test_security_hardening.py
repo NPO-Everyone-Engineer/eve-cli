@@ -121,6 +121,70 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertNotIn("repo", loaded)
 
     @patch("sys.stdin.isatty", return_value=False)
+    def test_untrusted_repo_agents_are_skipped_but_global_agents_load(self, _mock_isatty):
+        config = self.make_config()
+        global_agents = Path(self.config_dir, "agents")
+        repo_agents = Path(self.project_dir, ".eve-cli", "agents")
+        global_agents.mkdir(parents=True, exist_ok=True)
+        repo_agents.mkdir(parents=True, exist_ok=True)
+        (global_agents / "global-agent.md").write_text(
+            "---\ndescription: Global agent\n---\nGlobal persona",
+            encoding="utf-8",
+        )
+        (repo_agents / "repo-agent.md").write_text(
+            "---\ndescription: Repo agent\n---\nRepo persona",
+            encoding="utf-8",
+        )
+
+        prompt = eve_coder._build_runtime_system_prompt(config)
+        persona_prompt, persona_tools, persona_model = eve_coder.SubAgentTool._load_agent_persona(
+            config,
+            "repo-agent",
+        )
+
+        self.assertIn("global-agent", prompt)
+        self.assertNotIn("repo-agent", prompt)
+        self.assertIsNone(persona_prompt)
+        self.assertIsNone(persona_tools)
+        self.assertIsNone(persona_model)
+
+    def test_trusted_repo_agents_are_loaded(self):
+        config = self.make_config()
+        repo_agents = Path(self.project_dir, ".eve-cli", "agents")
+        repo_agents.mkdir(parents=True, exist_ok=True)
+        repo_agent = repo_agents / "repo-agent.md"
+        repo_agent.write_text(
+            "---\ndescription: Repo agent\nmodel: gemma4:31b\ntools: [Read, Bash]\n---\nRepo persona",
+            encoding="utf-8",
+        )
+        eve_coder._remember_repo_scope_trust(
+            config,
+            "agents",
+            eve_coder._compute_repo_hashes(config, [str(repo_agent)]),
+        )
+
+        prompt = eve_coder._build_runtime_system_prompt(config)
+        persona_prompt, persona_tools, persona_model = eve_coder.SubAgentTool._load_agent_persona(
+            config,
+            "repo-agent",
+        )
+
+        self.assertIn("repo-agent", prompt)
+        self.assertEqual(persona_prompt, "Repo persona")
+        self.assertEqual(persona_tools, ["Read", "Bash"])
+        self.assertEqual(persona_model, "gemma4:31b")
+
+    def test_subagent_persona_tools_are_clamped_to_parent_allowlist(self):
+        self.assertEqual(
+            eve_coder.SubAgentTool._resolve_allowed_tools(["Bash", "Read"], allow_writes=False),
+            {"Read"},
+        )
+        self.assertEqual(
+            eve_coder.SubAgentTool._resolve_allowed_tools(["Bash", "Read"], allow_writes=True),
+            {"Bash", "Read"},
+        )
+
+    @patch("sys.stdin.isatty", return_value=False)
     def test_global_instructions_strip_json_tool_calls(self, _mock_isatty):
         config = self.make_config()
         Path(self.config_dir, "CLAUDE.md").write_text(
@@ -177,6 +241,15 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertIn("# Loaded Skills", prompt)
         self.assertIn("## Skill: global", prompt)
         self.assertNotIn("Repo Map (auto-generated", prompt)
+
+    def test_runtime_system_prompt_adds_gemma_tool_notes(self):
+        config = self.make_config()
+        config.model = "gemma4:31b"
+
+        prompt = eve_coder._build_runtime_system_prompt(config)
+
+        self.assertIn("# Gemma 4 Tool-Calling Notes", prompt)
+        self.assertIn("strict JSON objects", prompt)
 
     def test_skill_filters_allow_only_matching_entries(self):
         config = self.make_config()

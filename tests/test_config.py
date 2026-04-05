@@ -946,6 +946,14 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
 
         self.assertEqual(temp, 0.2)
 
+    def test_gemma_uses_stricter_tool_temperature(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        temp = client._resolve_request_temperature("gemma4:31b", tools=True)
+
+        self.assertEqual(temp, 0.25)
+
     def test_request_temperature_applies_retry_boost_without_mutating_client(self):
         cfg = Config()
         client = eve_coder.OllamaClient(cfg)
@@ -972,6 +980,23 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
         self.assertEqual(opts["temperature"], 0.6)
         self.assertEqual(opts["num_predict"], 512)
         self.assertNotIn("retry_temperature_boost", opts)
+
+    def test_refresh_from_config_updates_runtime_settings(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+        cfg.ollama_host = "https://ollama.com"
+        cfg.max_tokens = 1234
+        cfg.temperature = 0.2
+        cfg.context_window = 262144
+        cfg.debug = True
+
+        client.refresh_from_config(cfg)
+
+        self.assertEqual(client.base_url, "https://ollama.com")
+        self.assertEqual(client.max_tokens, 1234)
+        self.assertEqual(client.temperature, 0.2)
+        self.assertEqual(client.context_window, 262144)
+        self.assertTrue(client.debug)
 
 
 class TestOllamaThinkingAdapters(unittest.TestCase):

@@ -74,6 +74,8 @@
     "repo_instruction_injected": "リポジトリの指示ファイルはエージェントのプロンプトに注入されます。信頼できるリポジトリだけを許可してください。",
     "project_skills_trust_required": "プロジェクトスキルの信頼確認が必要です",
     "project_skills_injected": "プロジェクトスキルはエージェントのプロンプトに注入され、ツール利用に影響します。",
+    "project_agents_trust_required": "プロジェクトエージェントの信頼確認が必要です",
+    "project_agents_injected": "プロジェクトエージェントはサブエージェントのプロンプトを上書きし、ツール利用に影響します。",
     "repo_trust_unreadable": "[読み取れません]",
     "trusted_mcp_changed": "警告：信頼された MCP 設定または参照アセットが変更されました。",
     "mcp_json_load_failed": "警告：mcp.json を読み込めませんでした：{error}",
