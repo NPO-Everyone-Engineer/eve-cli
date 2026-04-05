@@ -1016,9 +1016,9 @@ class InputMonitor:
     Unix-only: uses termios + tty.setcbreak for real-time key detection.
     On Windows (or when termios is unavailable), all methods are no-ops.
 
-    Optional type-ahead capture is exposed through on_typeahead for simple
-    queued input while the assistant is streaming. The callback receives raw
-    bytes that were not interpreted as ESC/Ctrl+C.
+    Type-ahead capture is intentionally disabled. The cbreak + background-read
+    approach interferes with IME composition and multi-line paste in terminals.
+    The on_typeahead parameter is accepted only for backward compatibility.
     """
 
     def __init__(self, on_typeahead=None):
@@ -1026,7 +1026,7 @@ class InputMonitor:
         self._stop_event = threading.Event()
         self._thread = None
         self._old_settings = None
-        self._on_typeahead = on_typeahead
+        self._on_typeahead = None
 
     @property
     def pressed(self):
@@ -1086,11 +1086,7 @@ class InputMonitor:
                 elif ch == b'\x03':  # Ctrl+C
                     self._pressed.set()
                     break
-                elif self._on_typeahead is not None:
-                    try:
-                        self._on_typeahead(ch)
-                    except Exception:
-                        pass
+                # Ignore all other bytes. Reading ahead here breaks IME and paste.
 
     def stop(self):
         """Stop monitoring and restore terminal settings."""
@@ -6035,6 +6031,7 @@ class BashTool(Tool):
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico", ".tiff", ".tif"}
 IMAGE_MAX_SIZE = 10 * 1024 * 1024  # 10MB limit for image files
+
 
 _MEDIA_TYPES = {
     ".png": "image/png",
@@ -17719,7 +17716,6 @@ class TUI:
         
         TUI 機能強化：
         - ESC キー検出：AI 応答中に ESC で中断可能
-        - Type-ahead: 応答中の入力をバッファリング
         """
         try:
             # Simple prompt without ANSI codes for IME compatibility
@@ -17779,7 +17775,7 @@ class TUI:
                 print(f"{C.DIM}  (multi-line input, end with \"\"\" on its own line){C.RESET}")
                 while True:
                     try:
-                        line = input(f"{C.DIM}...{C.RESET} ")
+                        line = input("... ")
                         if line.strip() == '"""':
                             break
                         lines.append(line)
@@ -17803,7 +17799,7 @@ class TUI:
                 lines = [first_line]
                 while True:
                     try:
-                        cont = input(f"{C.DIM}...{C.RESET} ")
+                        cont = input("... ")
                         cont = _strip_shift_enter_garbage(cont)
                         if cont.strip() == "":
                             # Empty line = send
@@ -19584,7 +19580,7 @@ class Agent:
             self.tui.scroll_region.update_mode_display(f"Model: {self.config.model}")
 
         # ESC key monitor for real-time interrupt
-        _esc_monitor = InputMonitor(on_typeahead=self.tui.queue_typeahead_bytes)
+        _esc_monitor = InputMonitor()
         _esc_monitor.start()
 
         for iteration in range(self.max_iterations):
@@ -21528,15 +21524,9 @@ def main():
                 if not _ch_ready:
                     continue  # no user input yet; loop back to poll channels
 
-            queued_input = tui.dequeue_typeahead_input()
-            if queued_input is not None:
-                user_input = queued_input
-                print(f"{C.DIM}[queued] {queued_input}{C.RESET}")
-            else:
-                prefill = tui.consume_typeahead_prefill()
-                user_input = tui.get_multiline_input(
-                    session=session, plan_mode=agent._plan_mode, prefill=prefill,
-                )
+            user_input = tui.get_multiline_input(
+                session=session, plan_mode=agent._plan_mode,
+            )
 
             if user_input is None:
                 continue

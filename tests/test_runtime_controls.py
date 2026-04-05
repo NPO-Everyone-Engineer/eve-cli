@@ -105,6 +105,27 @@ class TestThinkingDisplay(unittest.TestCase):
         self.assertIn("inspect files", printed)
         mock_render.assert_called_once_with("Visible answer")
 
+
+class TestInputPrompts(unittest.TestCase):
+    def setUp(self):
+        self.tui = eve_coder.TUI(eve_coder.Config())
+
+    def test_multiline_continuation_prompts_avoid_ansi_sequences(self):
+        prompts = []
+        responses = iter(["first line", "second line", ""])
+
+        def fake_input(prompt=""):
+            prompts.append(prompt)
+            return next(responses)
+
+        with patch.object(self.tui, "show_input_separator"), \
+             patch("builtins.input", side_effect=fake_input):
+            result = self.tui.get_multiline_input()
+
+        self.assertEqual(result, "first line\nsecond line")
+        self.assertEqual(prompts, ["> ", "... ", "... "])
+        self.assertTrue(all("\x1b" not in prompt for prompt in prompts))
+
     def test_stream_response_renders_native_thinking_without_polluting_text(self):
         chunks = iter([
             {"choices": [{"delta": {"thinking": "inspect files\ncompare outputs"}, "finish_reason": None}]},
