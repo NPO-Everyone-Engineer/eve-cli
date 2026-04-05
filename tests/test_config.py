@@ -901,6 +901,39 @@ class TestOllamaClientHeaders(unittest.TestCase):
         self.assertEqual(req.get_header("Authorization"), "Bearer secret-token")
 
 
+class TestGemma4CloudAndSampling(unittest.TestCase):
+    def test_gemma31b_alias_is_treated_as_cloud(self):
+        self.assertTrue(eve_coder._is_cloud_model("gemma4:31b"))
+        self.assertTrue(eve_coder._is_cloud_model("gemma4:31b-cloud"))
+
+    def test_gemma_defaults_to_google_temperature(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client._merge_chat_options("gemma4:31b", 0.7)
+
+        self.assertEqual(opts["temperature"], 1.0)
+        self.assertEqual(opts["top_p"], 0.95)
+        self.assertEqual(opts["top_k"], 64)
+
+    def test_gemma_preserves_lower_tool_temperature(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client._merge_chat_options("gemma4:31b", 0.3)
+
+        self.assertEqual(opts["temperature"], 0.3)
+
+    def test_gemma_preserves_explicit_temperature_override(self):
+        cfg = Config()
+        cfg.temperature = 0.9
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client._merge_chat_options("gemma4:31b", 0.9)
+
+        self.assertEqual(opts["temperature"], 0.9)
+
+
 class TestFullWidthSpaceHandling(unittest.TestCase):
     """Test that full-width spaces (\u3000) in CLI args are handled correctly."""
 

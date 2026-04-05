@@ -274,7 +274,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.27.0"
+__version__ = "2.28.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1822,6 +1822,8 @@ class Config:
         "llama3.1:405b": 131072,
         "qwen3:235b": 32768,
         "qwen3.5:397b-cloud": 262144,  # Cloud model, 256K ctx
+        "gemma4:31b-cloud":  262144,   # Cloud model, 256K ctx
+        "gemma4:31b":        262144,   # 256K ctx
         "qwen3.5:35b-a3b": 262144,     # MoE 35B (3B active), 256K ctx
         "deepseek-coder-v2:236b": 131072,
         # Tier B — Advanced (48GB+ RAM)
@@ -1869,6 +1871,8 @@ class Config:
         ("deepseek-v3:671b",        768, "S"),
         # Tier A — Expert: excellent coding + reasoning
         ("qwen3.5:397b-cloud",      256, "A"),  # Cloud model
+        ("gemma4:31b-cloud",         32, "A"),  # Cloud model, 31B
+        ("gemma4:31b",               32, "A"),  # 31B
         ("qwen3.5:35b-a3b",         256, "A"),  # MoE 35B (3B active)
         ("qwen3:235b",              256, "A"),
         ("deepseek-coder-v2:236b",  256, "A"),
@@ -2517,6 +2521,8 @@ def _is_cloud_model(model_name):
     if not model_name:
         return False
     lower = model_name.lower()
+    if lower == "gemma4:31b":
+        return True
     return ":cloud" in lower or "-cloud" in lower
 
 
@@ -4078,6 +4084,12 @@ class OllamaClient:
         self.max_tokens = config.max_tokens
         self.temperature = config.temperature
         self.context_window = config.context_window
+        # Preserve explicit user temperature overrides while still allowing
+        # model-specific defaults to improve first-run behavior.
+        self._temperature_overridden = bool(
+            getattr(config, "_cli_temperature_set", False)
+            or getattr(config, "temperature", Config.DEFAULT_TEMPERATURE) != Config.DEFAULT_TEMPERATURE
+        )
         self.think_mode = getattr(config, 'think_mode', None)
         self.thinking_budget = getattr(config, 'thinking_budget', None)
         self.debug = config.debug
@@ -4172,6 +4184,8 @@ class OllamaClient:
             if any(f in families for f in ["clip", "mllama"]):
                 return True
             if "vision" in model.lower() or "llava" in model.lower():
+                return True
+            if model.lower().startswith("gemma4:"):
                 return True
             # Check parameters/template for image token
             template = data.get("template", "")
@@ -4445,8 +4459,16 @@ class OllamaClient:
             "temperature": temperature,
         }
 
+        # Gemma 4 optimized sampling (Google recommended values).
+        # Keep explicit user temperatures and caller-chosen lower temperatures
+        # for tool-calling reliability intact.
+        if model.startswith("gemma4:"):
+            if not self._temperature_overridden and temperature == self.temperature:
+                merged["temperature"] = 1.0
+            merged["top_p"] = 0.95
+            merged["top_k"] = 64
         # Qwen3.5 / tier S-A optimized sampling
-        if _tier in ("S", "A"):
+        elif _tier in ("S", "A"):
             merged["top_p"] = 0.8
             merged["top_k"] = 30
             merged["repeat_penalty"] = 1.1
@@ -23827,7 +23849,7 @@ Review this code for:
                     _has_vision = client.check_vision_support(_model_name)
                     if not _has_vision:
                         print(f"  {C.YELLOW}⚠️  モデル '{_model_name}' はビジョン(画像認識)非対応の可能性があります。{C.RESET}")
-                        print(f"  {C.DIM}ビジョン対応モデル例: llava, llama3.2-vision, gemma3 等{C.RESET}")
+                        print(f"  {C.DIM}ビジョン対応モデル例: llava, llama3.2-vision, gemma3, gemma4 等{C.RESET}")
                         session._vision_warned = True
                 # Temporarily override add_user_message to send multimodal content
                 content = _build_multimodal_content(text, _images_for_msg)
