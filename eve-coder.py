@@ -297,7 +297,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.30.1"
+__version__ = "2.30.2"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -21701,6 +21701,9 @@ def main():
     except RuntimeError as e:
         print(f"{C.RED}{e}{C.RESET}", file=sys.stderr)
         sys.exit(1)
+
+    # Code Intelligence (lightweight symbol indexing) — used by Agent and /reindex command
+    _code_intel = CodeIntelligence(config.cwd)
 
     # Initialize hooks system
     hook_mgr = HookManager(config)
