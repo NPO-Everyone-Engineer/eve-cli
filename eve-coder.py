@@ -4334,6 +4334,8 @@ class OllamaClient:
             "role": message.get("role", "assistant"),
             "content": message.get("content", "") or "",
         }
+        if message.get("thinking"):
+            openai_msg["thinking"] = message.get("thinking", "") or ""
         if openai_tcs:
             openai_msg["tool_calls"] = openai_tcs
         return {
@@ -4648,6 +4650,9 @@ class OllamaClient:
 
                     # Build OpenAI-compatible delta
                     delta = {}
+                    thinking = message.get("thinking", "")
+                    if thinking:
+                        delta["thinking"] = thinking
                     content = message.get("content", "")
                     if content:
                         delta["content"] = content
@@ -17814,6 +17819,8 @@ class TUI:
         in_think = False
         think_buf = ""    # buffer to detect <think> / </think> split across chunks
         think_parts = []  # accumulate thinking content for display
+        native_think_parts = []  # accumulate Ollama native thinking chunks
+        native_thinking_shown = False
         header_printed = False
         # Accumulate tool_call deltas: {index: {"id": ..., "name": ..., "arguments": ...}}
         _tc_accum = {}
@@ -17850,6 +17857,27 @@ class TUI:
                     print(f"\r{' ' * _status_line_len}\r", end="", flush=True)
                 _status_line_shown = False
 
+        def _show_thinking_summary(think_text, elapsed=None):
+            _think_text = (think_text or "").strip()
+            if not _think_text:
+                return
+            _think_tok = len(_think_text) // 4 or 1
+            _tok_s = f"{_think_tok / 1000:.1f}k" if _think_tok >= 1000 else str(_think_tok)
+            _meta = f"{elapsed:.1f}s · {_tok_s} tokens" if elapsed is not None else f"{_tok_s} tokens"
+            self._scroll_print(f"\n  \U0001f4ad Thinking ({_meta})")
+            _lines = [l for l in _think_text.splitlines() if l.strip()][:3]
+            for _l in _lines:
+                _disp = (_l[:100] + "\u2026") if len(_l) > 100 else _l
+                self._scroll_print(f"  {C.DIM}   \u2502 {_disp}{C.RESET}")
+
+        def _flush_native_thinking_summary():
+            nonlocal native_thinking_shown
+            if native_thinking_shown or not native_think_parts:
+                return
+            _clear_thinking_status()
+            _show_thinking_summary("".join(native_think_parts), time.time() - _stream_start)
+            native_thinking_shown = True
+
         for chunk in response_iter:
             choice = chunk.get("choices", [{}])[0]
             delta = choice.get("delta", {})
@@ -17875,10 +17903,17 @@ class TUI:
                     _fa = func_delta["arguments"]
                     acc["function"]["arguments"] += _fa if isinstance(_fa, str) else str(_fa)
 
+            native_thinking = delta.get("thinking", "")
+            if native_thinking:
+                _approx_tokens += len(native_thinking) // 4 or 1
+                native_think_parts.append(native_thinking)
+
             content = delta.get("content", "")
             if not content:
                 _update_thinking_status()
                 continue
+            if native_think_parts:
+                _flush_native_thinking_summary()
             # Approximate token count: ~4 chars per token
             _approx_tokens += len(content) // 4 or 1
             raw_parts.append(content)
@@ -17931,19 +17966,12 @@ class TUI:
                         in_think = False
                         # Display thinking summary with preview
                         _clear_thinking_status()
-                        _think_text = "".join(think_parts).strip()
-                        _think_elapsed = time.time() - _stream_start
-                        _think_tok = len(_think_text) // 4 or 1
-                        _tok_s = f"{_think_tok / 1000:.1f}k" if _think_tok >= 1000 else str(_think_tok)
-                        self._scroll_print(f"\n  \U0001f4ad Thinking ({_think_elapsed:.1f}s \u00b7 {_tok_s} tokens)")
-                        _lines = [l for l in _think_text.splitlines() if l.strip()][:3]
-                        for _l in _lines:
-                            _disp = (_l[:100] + "\u2026") if len(_l) > 100 else _l
-                            self._scroll_print(f"  {C.DIM}   \u2502 {_disp}{C.RESET}")
+                        _show_thinking_summary("".join(think_parts), time.time() - _stream_start)
                         think_parts = []
 
         # Clear status line before final output
         _clear_thinking_status()
+        _flush_native_thinking_summary()
 
         # Flush remaining buffer
         if think_buf and not in_think:
@@ -17957,7 +17985,7 @@ class TUI:
 
         full_text = "".join(raw_parts)
         # Detect if thinking content was produced (before stripping)
-        _had_thinking = bool(re.search(r'<think>[\s\S]+?</think>', full_text))
+        _had_thinking = bool(native_think_parts) or bool(re.search(r'<think>[\s\S]+?</think>', full_text))
         # Strip <think>...</think> from final text for history
         full_text = re.sub(r'<think>[\s\S]*?</think>', '', full_text).strip()
         self._scroll_print()  # newline
@@ -17992,20 +18020,27 @@ class TUI:
         message = choice.get("message", {})
         content = message.get("content", "") or ""
         tool_calls = message.get("tool_calls", [])
+        native_thinking = message.get("thinking", "") or ""
+
+        def _show_thinking_summary(think_text):
+            _think_text = (think_text or "").strip()
+            if not _think_text:
+                return
+            _think_tok = len(_think_text) // 4 or 1
+            _tok_s = f"{_think_tok / 1000:.1f}k" if _think_tok >= 1000 else str(_think_tok)
+            self._scroll_print(f"\n  \U0001f4ad Thinking ({_tok_s} tokens)")
+            _lines = [l for l in _think_text.splitlines() if l.strip()][:3]
+            for _l in _lines:
+                _disp = (_l[:100] + "\u2026") if len(_l) > 100 else _l
+                self._scroll_print(f"  {C.DIM}   \u2502 {_disp}{C.RESET}")
 
         # Extract and display <think>...</think> blocks before stripping
         _think_matches = re.findall(r'<think>([\s\S]*?)</think>', content)
-        _had_thinking = bool(_think_matches)
+        _had_thinking = bool(native_thinking.strip()) or bool(_think_matches)
+        if native_thinking:
+            _show_thinking_summary(native_thinking)
         for _tm in _think_matches:
-            _think_text = _tm.strip()
-            if _think_text:
-                _think_tok = len(_think_text) // 4 or 1
-                _tok_s = f"{_think_tok / 1000:.1f}k" if _think_tok >= 1000 else str(_think_tok)
-                self._scroll_print(f"\n  \U0001f4ad Thinking ({_tok_s} tokens)")
-                _lines = [l for l in _think_text.splitlines() if l.strip()][:3]
-                for _l in _lines:
-                    _disp = (_l[:100] + "\u2026") if len(_l) > 100 else _l
-                    self._scroll_print(f"  {C.DIM}   \u2502 {_disp}{C.RESET}")
+            _show_thinking_summary(_tm)
         # Strip <think>...</think> blocks (Qwen reasoning traces)
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
 

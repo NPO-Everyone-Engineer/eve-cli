@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SCRIPT_DIR)
@@ -76,6 +77,50 @@ class TestReadWriteLock(unittest.TestCase):
         rt.join()
         wt.join()
         self.assertEqual(events, ["reader-start", "reader-end", "writer"])
+
+
+class TestThinkingDisplay(unittest.TestCase):
+    def setUp(self):
+        self.tui = eve_coder.TUI(eve_coder.Config())
+
+    def test_show_sync_response_renders_native_thinking_without_polluting_text(self):
+        data = {
+            "choices": [{
+                "message": {
+                    "thinking": "inspect files\ncompare outputs",
+                    "content": "Visible answer",
+                }
+            }]
+        }
+
+        with patch.object(self.tui, "_scroll_print") as mock_print, \
+             patch.object(self.tui, "_render_markdown") as mock_render:
+            text, tool_calls, had_thinking = self.tui.show_sync_response(data)
+
+        printed = "\n".join(call.args[0] for call in mock_print.call_args_list if call.args)
+        self.assertTrue(had_thinking)
+        self.assertEqual(text, "Visible answer")
+        self.assertEqual(tool_calls, [])
+        self.assertIn("Thinking", printed)
+        self.assertIn("inspect files", printed)
+        mock_render.assert_called_once_with("Visible answer")
+
+    def test_stream_response_renders_native_thinking_without_polluting_text(self):
+        chunks = iter([
+            {"choices": [{"delta": {"thinking": "inspect files\ncompare outputs"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "Visible answer"}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ])
+
+        with patch.object(self.tui, "_scroll_print") as mock_print:
+            text, tool_calls, had_thinking = self.tui.stream_response(chunks)
+
+        printed = "\n".join(call.args[0] for call in mock_print.call_args_list if call.args)
+        self.assertTrue(had_thinking)
+        self.assertEqual(text, "Visible answer")
+        self.assertEqual(tool_calls, [])
+        self.assertIn("Thinking", printed)
+        self.assertIn("inspect files", printed)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ profile sections, and backward compatibility paths.
 import unittest
 import sys
 import os
+import io
 import tempfile
 import textwrap
 from unittest.mock import patch, MagicMock
@@ -932,6 +933,38 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
         opts = client._merge_chat_options("gemma4:31b", 0.9)
 
         self.assertEqual(opts["temperature"], 0.9)
+
+
+class TestOllamaThinkingAdapters(unittest.TestCase):
+    def test_native_response_preserves_thinking_field(self):
+        adapted = eve_coder.OllamaClient._native_to_openai_response({
+            "message": {
+                "role": "assistant",
+                "thinking": "step 1\nstep 2",
+                "content": "final answer",
+            },
+            "prompt_eval_count": 11,
+            "eval_count": 5,
+        })
+
+        message = adapted["choices"][0]["message"]
+        self.assertEqual(message["thinking"], "step 1\nstep 2")
+        self.assertEqual(message["content"], "final answer")
+
+    def test_iter_ndjson_preserves_thinking_delta(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+        payload = (
+            b'{"message":{"thinking":"pondering"},"done":false}\n'
+            b'{"message":{"content":"answer"},"done":true,"prompt_eval_count":7,"eval_count":3}\n'
+        )
+
+        chunks = list(client._iter_ndjson(io.BytesIO(payload)))
+
+        self.assertEqual(chunks[0]["choices"][0]["delta"]["thinking"], "pondering")
+        self.assertEqual(chunks[1]["choices"][0]["delta"]["content"], "answer")
+        self.assertEqual(chunks[1]["usage"]["prompt_tokens"], 7)
+        self.assertEqual(chunks[1]["usage"]["completion_tokens"], 3)
 
 
 class TestFullWidthSpaceHandling(unittest.TestCase):
