@@ -934,6 +934,45 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
 
         self.assertEqual(opts["temperature"], 0.9)
 
+    def test_request_temperature_prefers_explicit_option(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        temp = client._resolve_request_temperature(
+            "gemma4:31b",
+            tools=True,
+            options={"temperature": 0.2, "retry_temperature_boost": 0.3},
+        )
+
+        self.assertEqual(temp, 0.2)
+
+    def test_request_temperature_applies_retry_boost_without_mutating_client(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        temp = client._resolve_request_temperature(
+            "test-model",
+            tools=True,
+            options={"retry_temperature_boost": 0.3},
+        )
+
+        self.assertEqual(temp, 0.6)
+        self.assertEqual(client.temperature, cfg.temperature)
+
+    def test_merge_chat_options_drops_retry_temperature_meta(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client._merge_chat_options(
+            "test-model",
+            0.6,
+            {"retry_temperature_boost": 0.3, "max_tokens": 512},
+        )
+
+        self.assertEqual(opts["temperature"], 0.6)
+        self.assertEqual(opts["num_predict"], 512)
+        self.assertNotIn("retry_temperature_boost", opts)
+
 
 class TestOllamaThinkingAdapters(unittest.TestCase):
     def test_native_response_preserves_thinking_field(self):

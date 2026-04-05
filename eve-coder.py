@@ -3464,6 +3464,52 @@ def _issue_to_pr(config, agent, session, tui, issue_number):
 
     print(f"\n  {C.GREEN}Done! Issue #{issue_number} → PR: {pr_url}{C.RESET}")
 
+_OPTIONAL_PROMPT_BUDGET_MIN = 4000
+_OPTIONAL_PROMPT_BUDGET_MAX = 16000
+_OPTIONAL_PROMPT_SECTION_MIN = 256
+
+
+def _system_prompt_optional_budget(config):
+    """Return the char budget for optional prompt sections."""
+    ctx = getattr(config, "context_window", Config.DEFAULT_CONTEXT_WINDOW) or Config.DEFAULT_CONTEXT_WINDOW
+    try:
+        ctx = int(ctx)
+    except (TypeError, ValueError):
+        ctx = Config.DEFAULT_CONTEXT_WINDOW
+    return max(_OPTIONAL_PROMPT_BUDGET_MIN, min(_OPTIONAL_PROMPT_BUDGET_MAX, ctx // 6))
+
+
+class _PromptSectionBudget:
+    """Accumulate optional prompt sections within a bounded char budget."""
+
+    def __init__(self, base_prompt, optional_budget):
+        self.base_prompt = base_prompt.rstrip() + "\n"
+        self.optional_budget = max(int(optional_budget or 0), 0)
+        self._optional_sections = []
+        self._used_optional = 0
+
+    def add_optional_section(self, title, body):
+        body = (body or "").strip()
+        if not body:
+            return False
+        remaining = self.optional_budget - self._used_optional
+        if remaining < _OPTIONAL_PROMPT_SECTION_MIN:
+            return False
+        header = f"\n# {title}\n"
+        section = f"{header}{body}\n"
+        if len(section) > remaining:
+            budget_for_body = remaining - len(header) - len("\n[Truncated due to prompt budget]\n")
+            if budget_for_body < _OPTIONAL_PROMPT_SECTION_MIN:
+                return False
+            body = body[:budget_for_body].rstrip()
+            section = f"{header}{body}\n[Truncated due to prompt budget]\n"
+        self._optional_sections.append(section)
+        self._used_optional += len(section)
+        return True
+
+    def render(self):
+        return self.base_prompt + "".join(self._optional_sections)
+
 
 def _build_system_prompt(config):
     """Build system prompt with environment info and OS-specific hints."""
@@ -3479,21 +3525,20 @@ If asked what model you are, answer truthfully: "{model_name}" running locally/v
 You EXECUTE tasks using tools and explain results clearly.
 IMPORTANT: Never output <think> or </think> tags in your responses. Use the function calling API exclusively — do not emit <tool_call> XML blocks.
 
-CRITICAL — DESIGN QUALITY:
+CRITICAL — EXECUTION FRAMEWORK:
 - ALWAYS read existing code BEFORE writing new code. Understand the project's patterns first.
-- Write functions that are small (≤30 lines), single-purpose, and clearly named.
-- Do NOT write more than 50 lines at once. Build incrementally: skeleton → flesh out → edge cases.
-- Before implementing, list 3+ edge cases that could break. Handle them explicitly.
-- Match existing code style exactly — naming, indentation, error handling patterns.
+- Before any tool call, do a brief private preflight: goal, current state, and why this tool is the best next action.
+- When a task spans multiple steps, keep any user-facing progress label short (examples: [understanding], [implementing], [verifying]).
+- Match existing code style exactly — naming, indentation, error handling, and test patterns.
+- Prefer direct evidence over speculation. Read code, inspect outputs, then act.
 
 CORE RULES:
-1. TOOL FIRST. Call a tool immediately — no explanation before the tool call.
-2. After tool result: give a clear, concise summary (2-3 sentences). No bullet points or numbered lists.
-3. If you need clarification from the user, use the AskUserQuestion tool. Don't end with a rhetorical question.
-4. NEVER say "I cannot" — always try with a tool first.
-4b. Use tools ONLY when you need external information or to take action. Answer factual/conceptual questions directly from your knowledge — do NOT search or run commands unless the answer requires current data or system state.
+1. PREPARE → TOOL. Do the short preflight, then call the tool immediately when external state or action is required. Do not stall with long narration.
+2. Use tools ONLY when you need current state, external information, or side effects. Answer factual/conceptual questions directly when tools are unnecessary.
+3. After tool results, give a clear, concise summary (2-3 sentences). No bullet points or numbered lists unless the user explicitly wants them.
+4. If you need clarification from the user, use the AskUserQuestion tool. Don't end with a rhetorical question.
 5. NEVER tell the user to run a command. YOU run it with Bash.
-6. If a tool fails, read the error carefully, diagnose the cause, and immediately try a fix. Do not report errors to the user — fix them silently. Only report if you have tried 3 different approaches and all failed.
+6. If a tool fails, read the error carefully, diagnose the cause, and immediately try a fix. Report failure only after 3 genuinely different approaches fail.
 7. Install dependencies BEFORE running: Bash(pip3 install X) first, THEN Bash(python3 script.py).
 8. Scripts using input()/stdin WILL get EOFError in Bash (stdin is closed). Fix order:
    a. First: add CLI arguments (sys.argv, argparse) to avoid input() entirely.
@@ -3507,31 +3552,34 @@ CORE RULES:
 14. For multi-step tasks (install → configure → run → verify), complete ALL steps in sequence without pausing. Only pause if you hit an unrecoverable error that requires a user decision.
 15. If the user says a simple greeting (hello, hi, こんにちは, etc.), respond with a brief friendly greeting and ask what they'd like to build. Do NOT call a tool for greetings.
 
-# Quality Protocol — READ → PLAN → IMPLEMENT → VERIFY
+# Quality Protocol — UNDERSTAND → PLAN → IMPLEMENT → VERIFY
 For ANY code modification task, follow this strict sequence:
 
-## Step 1: UNDERSTAND (Read before modifying)
-- ALWAYS Read the target file BEFORE calling Edit/Write. Never edit code you haven't read.
-- Read related files (imports, callers, tests) to understand context.
-- Check for existing patterns, naming conventions, and code style in the project.
+## Step 1: UNDERSTAND
+- Read the target file BEFORE Edit/Write. Never edit code you haven't read.
+- Read related files (imports, callers, tests) and identify the exact surfaces affected.
+- Check existing patterns, naming conventions, and code style in the project.
 
-## Step 2: PLAN (Think before acting)
-- For tasks touching 2+ files or requiring 3+ steps: briefly state your plan BEFORE making changes.
-- Identify edge cases, error conditions, and potential regressions.
-- Consider: "What could go wrong with this change?"
+## Step 2: PLAN
+- For tasks touching 2+ files or requiring 3+ steps: briefly state the plan BEFORE making changes.
+- Name the concrete files, functions, or interfaces you expect to touch.
+- Consider at least 3 edge cases across these categories:
+  - Data boundary: empty/None, min/max, wrong type, unicode
+  - Environment/external: permissions, missing dependency, timeout/network
+  - Logic/consistency: concurrent updates, circular references, unexpected formats
 
-## Step 3: IMPLEMENT (Write clean, defensive code)
-- Match the existing code style (indentation, naming, patterns).
+## Step 3: IMPLEMENT
+- Match existing code style and keep changes surgical.
 - Handle errors at system boundaries (user input, file I/O, network, external APIs).
-- Use descriptive variable names. Avoid single-letter names except loop counters.
-- Keep functions focused — one function, one responsibility.
-- Add type hints for function signatures in typed languages.
+- Use descriptive variable names and focused functions.
+- For complex tasks, show only brief phase labels — never expose chain-of-thought.
 
-## Step 4: VERIFY (Check your own work)
-- After editing: run syntax check or lint if available (Bash: python3 -c "import py_compile; py_compile.compile('file.py', doraise=True)")
+## Step 4: VERIFY
+- After editing: run syntax check or lint if available (Bash: python3 -c "import py_compile; py_compile.compile('file.py', doraise=True)").
 - After implementing a feature: run related tests if they exist.
-- After a complex change: Read the modified file to confirm the edit looks correct.
-- If the user asked for a bug fix: write a test that reproduces the bug FIRST, then fix it, then confirm the test passes.
+- After a complex change: read the modified file to confirm the edit looks correct.
+- If the user asked for a bug fix: reproduce first, then write a minimal failing test, then fix it, then re-run the test.
+- Report verification succinctly; do not dump raw logs unless the user asks.
 
 # Error Diagnosis Framework
 When a tool call fails or code doesn't work:
@@ -3559,26 +3607,22 @@ After completing a task that modifies 2+ files or adds significant logic:
 5. Run tests if available. If no tests, run at least a syntax check.
 Only mark the task as complete AFTER this self-review.
 
-# Few-Shot Examples — Good Tool Usage Patterns
+# Few-Shot Examples — Bad → Analysis → Good
 
-Example 1: Bug fix (test-first)
-  User: "login関数でパスワードが空の時にクラッシュする"
-  Good: Read(login.py) → Bash(python3 -m pytest tests/test_login.py -x) to reproduce →
-        Edit(login.py, add validation) → Bash(python3 -m pytest tests/test_login.py -x) to verify
-  Bad:  Edit(login.py, add try/except around everything) → "修正しました"
+Example 1: Bug fix
+  Bad: Edit(login.py, add broad try/except) → "fixed"
+  Analysis: Hides the root cause and skips reproduction.
+  Good: Read(login.py) → Bash(run failing test) → Edit minimum validation logic → Bash(re-run test)
 
-Example 2: New feature (plan → implement → verify)
-  User: "CSVエクスポート機能を追加して"
-  Good: Read(app.py) to understand structure → Read(models.py) to understand data →
-        Plan: "app.pyにエンドポイント追加、utils/csv_export.pyを新規作成" →
-        Write(utils/csv_export.py) → Edit(app.py) → Bash(python3 -m pytest) → Read(app.py) to confirm
-  Bad:  Write(csv_export.py) without reading existing code → "作成しました"
+Example 2: New feature
+  Bad: Write(csv_export.py) without reading existing code.
+  Analysis: Risks breaking project conventions and missing integration points.
+  Good: Read(app.py) → Read(models.py) → brief plan naming touched files → implement → verify with tests
 
 Example 3: Investigation
-  User: "なんでこのAPIが遅いの？"
-  Good: Grep("api.*route\|def.*endpoint") → Read(relevant files) →
-        Bash(time curl localhost:8000/api/slow) → analyze → explain with evidence
-  Bad:  "N+1クエリが原因だと思います" (without reading any code)
+  Bad: "It's probably an N+1 query" without reading code or measuring.
+  Analysis: Speculation without evidence produces unreliable fixes.
+  Good: Grep relevant symbols → Read the exact handlers → Bash(measure/reproduce) → explain with evidence
 
 # Mandatory Code Quality Rules
 
@@ -4048,6 +4092,86 @@ IMPORTANT rules for structured output:
     return prompt
 
 
+def _build_runtime_system_prompt(config):
+    """Build the runtime system prompt with bounded optional context sections."""
+    prompt_budget = _PromptSectionBudget(
+        _build_system_prompt(config),
+        _system_prompt_optional_budget(config),
+    )
+
+    skills = _load_skills(config)
+    if skills:
+        skill_blocks = []
+        for skill_name, skill_info in skills.items():
+            _raw = skill_info["content"]
+            _expanded = _expand_skill_variables(
+                _raw,
+                arguments="",
+                skill_dir=skill_info["skill_dir"],
+                cwd=config.cwd,
+            )
+            truncated = _expanded[:1200] + "..." if len(_expanded) > 1200 else _expanded
+            skill_blocks.append(f"## Skill: {skill_name}\n{truncated}")
+        _added = prompt_budget.add_optional_section("Loaded Skills", "\n\n".join(skill_blocks))
+        if config.debug:
+            _state = "loaded" if _added else "skipped"
+            print(f"{C.DIM}[debug] Skills prompt section {_state}: {', '.join(skills.keys())}{C.RESET}", file=sys.stderr)
+
+    _agent_dirs = [
+        os.path.join(config.cwd, ".eve-cli", "agents"),
+        os.path.join(config.config_dir, "agents"),
+    ]
+    _agents_found = []
+    for _adir in _agent_dirs:
+        if not os.path.isdir(_adir):
+            continue
+        try:
+            for _af in sorted(os.listdir(_adir)):
+                if not _af.endswith(".md") or os.path.islink(os.path.join(_adir, _af)):
+                    continue
+                _aname = _af[:-3]
+                try:
+                    with open(os.path.join(_adir, _af), encoding="utf-8", errors="replace") as _afh:
+                        _ahead = _afh.read(500)
+                except OSError:
+                    continue
+                _adesc = ""
+                if _ahead.startswith("---"):
+                    _aparts = _ahead.split("---", 2)
+                    if len(_aparts) >= 3:
+                        for _al in _aparts[1].strip().split("\n"):
+                            if _al.strip().startswith("description:"):
+                                _adesc = _al.split(":", 1)[1].strip().strip("\"'")
+                                break
+                _agents_found.append((_aname, _adesc))
+        except OSError:
+            pass
+    if _agents_found:
+        _agent_lines = ["Use SubAgent(agent_name='<name>', prompt='...') to invoke these specialized agents:"]
+        for _aname, _adesc in _agents_found:
+            _agent_lines.append(f"- **{_aname}**: {_adesc}" if _adesc else f"- **{_aname}**")
+        _added = prompt_budget.add_optional_section("Available Agent Personas", "\n".join(_agent_lines))
+        if config.debug:
+            _state = "loaded" if _added else "skipped"
+            print(f"{C.DIM}[debug] Agent persona prompt section {_state}: "
+                  f"{', '.join(n for n, _ in _agents_found)}{C.RESET}", file=sys.stderr)
+
+    _code_intel = CodeIntelligence(config.cwd)
+    try:
+        _n_syms = _code_intel.build_index()
+        if _n_syms > 0:
+            _repo_map = _code_intel.repo_map(max_lines=150)
+            _title = f"Repo Map (auto-generated, {_n_syms} symbols)"
+            _added = prompt_budget.add_optional_section(_title, _repo_map)
+            if config.debug:
+                _state = "loaded" if _added else "skipped"
+                print(f"{C.DIM}[debug] Repo map prompt section {_state}: {_n_syms} symbols{C.RESET}", file=sys.stderr)
+    except Exception:
+        pass
+
+    return prompt_budget.render()
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # OllamaClient — Direct communication with Ollama OpenAI-compatible API
 # ════════════════════════════════════════════════════════════════════════════════
@@ -4462,6 +4586,31 @@ class OllamaClient:
         
         return repaired
 
+    def _resolve_request_temperature(self, model, tools=None, options=None):
+        """Resolve request temperature from explicit overrides, task kind, and retry hints."""
+        options = options or {}
+        if "temperature" in options:
+            try:
+                return float(options["temperature"])
+            except (TypeError, ValueError):
+                pass
+
+        temp = self.temperature
+        if tools:
+            _tier, _ = Config.get_model_tier(model)
+            if _tier in ("S", "A") and self.think_mode is not False:
+                temp = min(temp, 0.4)
+            else:
+                temp = min(temp, 0.3)
+
+        try:
+            retry_boost = float(options.get("retry_temperature_boost", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            retry_boost = 0.0
+        if retry_boost:
+            temp = min(temp + retry_boost, 1.5)
+        return temp
+
     def _merge_chat_options(self, model, temperature, options=None):
         """Build Ollama options with model-optimized sampling parameters."""
         _tier, _ = Config.get_model_tier(model)
@@ -4501,6 +4650,8 @@ class OllamaClient:
                 merged["num_predict"] = value
             elif key == "context_window":
                 merged["num_ctx"] = value
+            elif key == "retry_temperature_boost":
+                continue
             else:
                 merged[key] = value
         return merged
@@ -4520,15 +4671,9 @@ class OllamaClient:
             if cached is not None:
                 return cached
 
-        temp = self.temperature
+        request_options = dict(options or {})
+        temp = self._resolve_request_temperature(model, tools=bool(tools), options=request_options)
         if tools:
-            # For tier S/A thinking models use 0.6 (Qwen team recommendation);
-            # for other models lower to 0.3 to improve JSON reliability.
-            _tier, _ = Config.get_model_tier(model)
-            if _tier in ("S", "A") and self.think_mode is not False:
-                temp = min(self.temperature, 0.4)
-            else:
-                temp = min(self.temperature, 0.3)
             # Auto-detect streaming with tools (Ollama 0.5+ supports this)
             if not self.detect_tool_streaming():
                 if stream:
@@ -4555,7 +4700,7 @@ class OllamaClient:
             "messages": api_messages,
             "stream": stream,
             "keep_alive": 300 if _is_cloud_model(model) else -1,  # Cloud: 5min, Local: keep loaded
-            "options": self._merge_chat_options(model, temp, options),
+            "options": self._merge_chat_options(model, temp, request_options),
         }
         if tools:
             payload["tools"] = tools
@@ -14963,8 +15108,13 @@ def _get_kairos_state_dir(config=None):
 def _get_kairos_project_dir(config=None):
     cwd = _config_value(config, "cwd", os.getcwd()) if config is not None else os.getcwd()
     path = os.path.join(cwd, ".eve-cli", "kairos")
-    os.makedirs(path, exist_ok=True)
-    return path
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except OSError:
+        # Project directory is not writable (e.g. read-only filesystem, running from /).
+        # Fall back to the user state directory so KAIROS can still start.
+        return _get_kairos_state_dir(config)
 
 
 class KairosStateStore:
@@ -19484,6 +19634,16 @@ class Agent:
             # Start dream worker
             dream_worker.start()
             
+        except OSError as e:
+            import errno as _errno
+            if e.errno == _errno.EROFS:
+                cwd = _config_value(self.config, "cwd", os.getcwd())
+                print(f"KAIROS initialization error: {e}")
+                print(f"  Current directory is on a read-only filesystem: {cwd!r}")
+                print(f"  Run eve-cli from a writable project directory.")
+            else:
+                print(f"KAIROS initialization error: {e}")
+            self.kairos = None
         except Exception as e:
             print(f"KAIROS initialization error: {e}")
             self.kairos = None
@@ -19822,6 +19982,17 @@ class Agent:
                         f"{'Planning' if self._plan_mode else 'Thinking'} (step {iteration+1}, {elapsed}s){_esc_hint}"
                     )
 
+                request_model = self.config.model
+                request_options = {}
+                if _empty_retries >= 2:
+                    request_options["retry_temperature_boost"] = 0.3
+                if (
+                    _empty_retries >= 3
+                    and self.config.sidecar_model
+                    and self.config.sidecar_model != self.config.model
+                ):
+                    request_model = self.config.sidecar_model
+
                 response = None
                 last_error = None
                 for retry in range(self.MAX_RETRIES + 1):
@@ -19832,10 +20003,11 @@ class Agent:
                         self.client.think_mode = _reasoning["think_mode"]
                         self.client.thinking_budget = _reasoning["thinking_budget"]
                         response = self.client.chat(
-                            model=self.config.model,
+                            model=request_model,
                             messages=self.session.get_messages(),
                             tools=tools if tools else None,
                             stream=True,  # always try streaming (text + tool calls)
+                            options=request_options or None,
                         )
                         break
                     except (RuntimeError, urllib.error.URLError) as e:
@@ -19894,7 +20066,7 @@ class Agent:
                            f"({pct}% ctx){C.RESET}")
                         if self._evolution:
                             self._evolution.record_usage(
-                                self.config.model,
+                                request_model,
                                 prompt_t,
                                 completion_t,
                                 self.config.prompt_cost_per_mtok,
@@ -19923,29 +20095,21 @@ class Agent:
                             continue
                     # Step 2: Retry with slightly higher temperature
                     if _empty_retries == 2:
-                        if not hasattr(self, '_orig_temperature'):
-                            self._orig_temperature = self.client.temperature
-                        self.client.temperature = min(self._orig_temperature + 0.3, 1.5)
-                        _p(f"  {C.DIM}[retry with temperature {self.client.temperature:.1f}]{C.RESET}")
+                        _retry_temp = self.client._resolve_request_temperature(
+                            self.config.model,
+                            tools=bool(tools),
+                            options={"retry_temperature_boost": 0.3},
+                        )
+                        _p(f"  {C.DIM}[retry with temperature {_retry_temp:.1f}]{C.RESET}")
                         time.sleep(0.5)
                         continue
                     # Step 3: Sidecar model fallback
                     if _empty_retries == 3 and self.config.sidecar_model and self.config.sidecar_model != self.config.model:
-                        if not hasattr(self, '_orig_model'):
-                            self._orig_model = self.config.model
-                        self.config.model = self.config.sidecar_model
                         _p(f"  {C.DIM}[fallback to sidecar: {self.config.sidecar_model}]{C.RESET}")
                         time.sleep(0.5)
                         continue
                     # Step 4: Give up with actionable suggestions
                     if _empty_retries > 3:
-                        # Restore original settings
-                        if hasattr(self, '_orig_temperature'):
-                            self.client.temperature = self._orig_temperature
-                            del self._orig_temperature
-                        if hasattr(self, '_orig_model'):
-                            self.config.model = self._orig_model
-                            del self._orig_model
                         _p(f"\n{C.YELLOW}AI から空のレスポンスが返されました（4回リトライ後も失敗）{C.RESET}")
                         _p(f"{C.DIM}対処法:{C.RESET}")
                         _p(f"{C.DIM}  1. /compact — コンテキストを圧縮{C.RESET}")
@@ -19954,13 +20118,6 @@ class Agent:
                         break
                     time.sleep(_empty_retries * 0.5)
                     continue
-                # Restore temperature/model if they were modified during retries
-                if hasattr(self, '_orig_temperature'):
-                    self.client.temperature = self._orig_temperature
-                    del self._orig_temperature
-                if hasattr(self, '_orig_model'):
-                    self.config.model = self._orig_model
-                    del self._orig_model
 
                 # 3. Add to history
                 self.session.add_assistant_message(text, tool_calls if tool_calls else None)
@@ -21222,61 +21379,7 @@ def main():
             sys.exit(1)
 
     # Setup components
-    system_prompt = _build_system_prompt(config)
-
-    # Load skills and inject into system prompt
-    skills = _load_skills(config)
-    if skills:
-        system_prompt += "\n# Loaded Skills\n"
-        for skill_name, skill_info in skills.items():
-            _raw = skill_info["content"]
-            _expanded = _expand_skill_variables(_raw, arguments="",
-                                                skill_dir=skill_info["skill_dir"],
-                                                cwd=config.cwd)
-            # Truncate each skill to 2000 chars to avoid bloating context
-            truncated = _expanded[:2000] + "..." if len(_expanded) > 2000 else _expanded
-            system_prompt += f"\n## Skill: {skill_name}\n{truncated}\n"
-        if config.debug:
-            print(f"{C.DIM}[debug] Loaded {len(skills)} skills: {', '.join(skills.keys())}{C.RESET}", file=sys.stderr)
-
-    # Load agent personas and inject summaries into system prompt
-    _agent_dirs = [
-        os.path.join(config.cwd, ".eve-cli", "agents"),
-        os.path.join(config.config_dir, "agents"),
-    ]
-    _agents_found = []
-    for _adir in _agent_dirs:
-        if not os.path.isdir(_adir):
-            continue
-        try:
-            for _af in sorted(os.listdir(_adir)):
-                if not _af.endswith(".md") or os.path.islink(os.path.join(_adir, _af)):
-                    continue
-                _aname = _af[:-3]
-                try:
-                    with open(os.path.join(_adir, _af), encoding="utf-8", errors="replace") as _afh:
-                        _ahead = _afh.read(500)
-                except OSError:
-                    continue
-                _adesc = ""
-                if _ahead.startswith("---"):
-                    _aparts = _ahead.split("---", 2)
-                    if len(_aparts) >= 3:
-                        for _al in _aparts[1].strip().split("\n"):
-                            if _al.strip().startswith("description:"):
-                                _adesc = _al.split(":", 1)[1].strip().strip("\"'")
-                                break
-                _agents_found.append((_aname, _adesc))
-        except OSError:
-            pass
-    if _agents_found:
-        system_prompt += "\n# Available Agent Personas\n"
-        system_prompt += "Use SubAgent(agent_name='<name>', prompt='...') to invoke these specialized agents:\n"
-        for _aname, _adesc in _agents_found:
-            system_prompt += f"- **{_aname}**: {_adesc}\n" if _adesc else f"- **{_aname}**\n"
-        if config.debug:
-            print(f"{C.DIM}[debug] Loaded {len(_agents_found)} agent personas: "
-                  f"{', '.join(n for n, _ in _agents_found)}{C.RESET}", file=sys.stderr)
+    system_prompt = _build_runtime_system_prompt(config)
 
     # RAG: inject local context into system prompt (query mode)
     _rag_engine = None
@@ -21295,16 +21398,6 @@ def main():
         except Exception as e:
             print(f"{C.YELLOW}RAG initialization warning: {e}{C.RESET}")
             _rag_engine = None
-
-    # Code Intelligence (lightweight symbol indexing) + auto Repo Map injection
-    _code_intel = CodeIntelligence(config.cwd)
-    try:
-        _n_syms = _code_intel.build_index()
-        if _n_syms > 0:
-            _repo_map = _code_intel.repo_map(max_lines=150)
-            system_prompt += f"\n# Repo Map (auto-generated, {_n_syms} symbols)\n{_repo_map}\n"
-    except Exception:
-        pass
 
     session = Session(config, system_prompt)
     session.set_client(client)  # enable sidecar model for context compaction
@@ -21479,7 +21572,7 @@ def main():
     # One-shot mode
     if config.prompt:
         # Build system prompt once (shared across all loop iterations)
-        system_prompt = _build_system_prompt(config)
+        system_prompt = _build_runtime_system_prompt(config)
         exit_code = 0  # Track exit code for CI/CD
 
         # Create headless output collector for structured CI/CD output

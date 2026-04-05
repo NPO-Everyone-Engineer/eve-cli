@@ -133,6 +133,39 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertNotIn('"name":"Bash"', prompt)
         self.assertIn("[BLOCKED]", prompt)
 
+    def test_system_prompt_uses_preflight_framework(self):
+        config = self.make_config()
+
+        prompt = eve_coder._build_system_prompt(config)
+
+        self.assertIn("PREPARE → TOOL", prompt)
+        self.assertIn("goal, current state, and why this tool", prompt)
+        self.assertIn("[understanding]", prompt)
+        self.assertIn("Data boundary", prompt)
+        self.assertIn("Bad → Analysis → Good", prompt)
+
+    def test_prompt_section_budget_truncates_optional_sections(self):
+        budget = eve_coder._PromptSectionBudget("base prompt", optional_budget=320)
+
+        added = budget.add_optional_section("Loaded Skills", "x" * 600)
+
+        self.assertTrue(added)
+        rendered = budget.render()
+        self.assertIn("[Truncated due to prompt budget]", rendered)
+        self.assertIn("# Loaded Skills", rendered)
+
+    @patch("sys.stdin.isatty", return_value=False)
+    def test_runtime_system_prompt_includes_loaded_skills(self, _mock_isatty):
+        config = self.make_config()
+        global_skills = Path(self.config_dir, "skills")
+        global_skills.mkdir(parents=True, exist_ok=True)
+        (global_skills / "global.md").write_text("global skill content", encoding="utf-8")
+
+        prompt = eve_coder._build_runtime_system_prompt(config)
+
+        self.assertIn("# Loaded Skills", prompt)
+        self.assertIn("## Skill: global", prompt)
+
     def test_skill_filters_allow_only_matching_entries(self):
         config = self.make_config()
         config.skill_enable_patterns = ["design*"]
