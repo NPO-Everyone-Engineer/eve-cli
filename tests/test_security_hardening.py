@@ -151,7 +151,7 @@ class TestSecurityHardening(unittest.TestCase):
 
         self.assertTrue(added)
         rendered = budget.render()
-        self.assertIn("[Truncated due to prompt budget]", rendered)
+        self.assertIn("...(truncated)", rendered)
         self.assertIn("# Loaded Skills", rendered)
 
     @patch("sys.stdin.isatty", return_value=False)
@@ -163,7 +163,7 @@ class TestSecurityHardening(unittest.TestCase):
         prompt = eve_coder._build_system_prompt(config)
 
         self.assertIn("# Global Instructions", prompt)
-        self.assertIn("[Truncated due to prompt budget]", prompt)
+        self.assertIn("...(truncated)", prompt)
 
     @patch("sys.stdin.isatty", return_value=False)
     def test_runtime_system_prompt_includes_loaded_skills(self, _mock_isatty):

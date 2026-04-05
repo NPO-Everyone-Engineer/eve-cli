@@ -459,5 +459,298 @@ class TestInputPrompts(unittest.TestCase):
         self.assertIn("inspect files", printed)
 
 
+# ---------------------------------------------------------------------------
+# FIX-1: verification 判定ロジックのテスト
+# ---------------------------------------------------------------------------
+
+class TestVerificationJudgment(unittest.TestCase):
+    """Tests for the improved _mark_verification_status / passed computation (FIX-1)."""
+
+    def _compute_passed(self, is_error, output):
+        """Replicate the FIX-1 logic from eve-coder.py for unit testing."""
+        import re
+        _out_str = str(output or "")
+        return (
+            not is_error
+            and "(exit code:" not in _out_str
+            and not re.search(r'\bFAILED\b', _out_str)
+            and not re.search(r'\b(error|errors):\s*[1-9]', _out_str, re.IGNORECASE)
+        )
+
+    def test_passed_on_clean_output(self):
+        """Clean pytest output with 'OK' should yield passed=True."""
+        self.assertTrue(self._compute_passed(False, "Ran 5 tests in 0.1s\nOK"))
+
+    def test_passed_on_empty_output_no_error(self):
+        """Empty output with no error flag should yield passed=True."""
+        self.assertTrue(self._compute_passed(False, ""))
+
+    def test_passed_on_none_output(self):
+        """None output with no error flag should yield passed=True."""
+        self.assertTrue(self._compute_passed(False, None))
+
+    def test_failed_on_is_error(self):
+        """is_error=True should always yield passed=False."""
+        self.assertFalse(self._compute_passed(True, "Ran 5 tests in 0.1s\nOK"))
+
+    def test_failed_on_exit_code_in_output(self):
+        """Output containing '(exit code: 1)' should yield passed=False."""
+        self.assertFalse(self._compute_passed(False, "Something went wrong\n(exit code: 1)"))
+
+    def test_failed_on_FAILED_in_output(self):
+        """Output containing 'FAILED' (uppercase) should yield passed=False."""
+        self.assertFalse(self._compute_passed(False, "FAILED (failures=1)"))
+
+    def test_failed_on_errors_count(self):
+        """Output containing 'errors: 2' should yield passed=False."""
+        self.assertFalse(self._compute_passed(False, "errors: 2"))
+
+    def test_failed_on_errors_count_uppercase(self):
+        """Output containing 'Errors: 3' (mixed case) should yield passed=False."""
+        self.assertFalse(self._compute_passed(False, "Errors: 3"))
+
+    def test_passed_when_failed_is_substring_not_word(self):
+        """'FAILEDOVER' without word boundary should NOT trigger failed=True."""
+        # 'FAILED' must be a whole word; 'FAILEDOVER' should not match
+        self.assertTrue(self._compute_passed(False, "FAILEDOVER some other text"))
+
+    def test_passed_when_errors_zero(self):
+        """'errors: 0' should NOT mark as failed (only 1-9 triggers failure)."""
+        self.assertTrue(self._compute_passed(False, "errors: 0"))
+
+
+# ---------------------------------------------------------------------------
+# FIX-2: resume 時の _pending_verification リセットのテスト
+# ---------------------------------------------------------------------------
+
+class TestPendingVerificationReset(unittest.TestCase):
+    """Tests that resume does not carry forward stale verification_required (FIX-2)."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.project_dir = os.path.join(self.test_dir, "project")
+        self.config_dir = os.path.join(self.test_dir, "config")
+        self.sessions_dir = os.path.join(self.test_dir, "sessions")
+        os.makedirs(self.project_dir, exist_ok=True)
+        os.makedirs(self.config_dir, exist_ok=True)
+        os.makedirs(self.sessions_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def make_config(self, session_id="verify-reset-test"):
+        config = eve_coder.Config()
+        config.cwd = self.project_dir
+        config.config_dir = self.config_dir
+        config.sessions_dir = self.sessions_dir
+        config.permissions_file = os.path.join(self.config_dir, "permissions.json")
+        config.model = "test-model"
+        config.sidecar_model = "fallback-model"
+        config.autotest_on_start = False
+        config.max_agent_steps = 4
+        config.max_turns = None
+        config.rag = False
+        config.learn_mode = False
+        config.learn_auto_explain = False
+        config.prompt_cost_per_mtok = 0
+        config.completion_cost_per_mtok = 0
+        config.session_id = session_id
+        return config
+
+    def make_agent(self, config):
+        session = eve_coder.Session(config, "test system prompt")
+        agent = eve_coder.Agent(
+            config,
+            client=_SequenceClient([]),
+            registry=_FakeRegistry([]),
+            permissions=_FakePermissions(),
+            session=session,
+            tui=_FakeTUI(),
+        )
+        return agent, session
+
+    def test_pending_verification_false_on_fresh_init(self):
+        """A fresh agent (no prior runtime state) must start with _pending_verification=False."""
+        config = self.make_config("fresh-init-test")
+        agent, _session = self.make_agent(config)
+        self.assertFalse(agent._pending_verification)
+
+    def test_pending_verification_false_on_resume_with_stale_flag(self):
+        """After resume where runtime has verification_required=True but no pending files,
+        _pending_verification must be False (stale flag is discarded)."""
+        config = self.make_config("resume-stale-test")
+        # First, create a session and manually persist a stale verification_required flag
+        session = eve_coder.Session(config, "test system prompt")
+        if session.runtime_state:
+            session.runtime_state.update_runtime(
+                verification_required=True,
+                pending_verification=[],  # no files pending
+            )
+        # Now create a new agent that resumes this session
+        agent2 = eve_coder.Agent(
+            config,
+            client=_SequenceClient([]),
+            registry=_FakeRegistry([]),
+            permissions=_FakePermissions(),
+            session=session,
+            tui=_FakeTUI(),
+        )
+        # The stale flag must NOT be carried forward
+        self.assertFalse(agent2._pending_verification)
+
+
+# ---------------------------------------------------------------------------
+# FIX-4: _known_file_paths ターン間引き継ぎのテスト
+# ---------------------------------------------------------------------------
+
+class TestKnownFilePaths(unittest.TestCase):
+    """Tests that _known_file_paths persists across turns within a session (FIX-4)."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.project_dir = os.path.join(self.test_dir, "project")
+        self.config_dir = os.path.join(self.test_dir, "config")
+        self.sessions_dir = os.path.join(self.test_dir, "sessions")
+        os.makedirs(self.project_dir, exist_ok=True)
+        os.makedirs(self.config_dir, exist_ok=True)
+        os.makedirs(self.sessions_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def make_config(self):
+        config = eve_coder.Config()
+        config.cwd = self.project_dir
+        config.config_dir = self.config_dir
+        config.sessions_dir = self.sessions_dir
+        config.permissions_file = os.path.join(self.config_dir, "permissions.json")
+        config.model = "test-model"
+        config.sidecar_model = "fallback-model"
+        config.autotest_on_start = False
+        config.max_agent_steps = 4
+        config.max_turns = None
+        config.rag = False
+        config.learn_mode = False
+        config.learn_auto_explain = False
+        config.prompt_cost_per_mtok = 0
+        config.completion_cost_per_mtok = 0
+        config.session_id = "known-paths-test"
+        return config
+
+    @patch.object(eve_coder, "InputMonitor", _FakeInputMonitor)
+    def test_known_paths_persist_across_turns(self):
+        """Files read in turn 1 remain in _known_file_paths for turn 2."""
+        target = os.path.join(self.project_dir, "sample.py")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+
+        config = self.make_config()
+        # Turn 1: read the file
+        client = _SequenceClient([
+            {"choices": [{"message": {"content": "read it", "tool_calls": [{
+                "id": "call_read",
+                "function": {
+                    "name": "Read",
+                    "arguments": json.dumps({"file_path": "sample.py"}),
+                },
+            }]}}]},
+            {"choices": [{"message": {"content": "done", "tool_calls": []}}]},
+        ])
+        session = eve_coder.Session(config, "test system prompt")
+        agent = eve_coder.Agent(
+            config,
+            client=client,
+            registry=_FakeRegistry([eve_coder.ReadTool(self.project_dir)]),
+            permissions=_FakePermissions(),
+            session=session,
+            tui=_FakeTUI(),
+        )
+        agent._run_impl("Read sample.py")
+        paths_after_turn1 = set(agent._known_file_paths)
+
+        # _known_file_paths must not be empty after reading
+        self.assertTrue(len(paths_after_turn1) > 0,
+                        "_known_file_paths should contain the read file after turn 1")
+
+        # Turn 2: run another prompt — _known_file_paths must still contain turn-1 paths
+        client2 = _SequenceClient([
+            {"choices": [{"message": {"content": "ok", "tool_calls": []}}]},
+        ])
+        agent.client = client2
+        agent._run_impl("What did we read?")
+
+        # Paths from turn 1 must be preserved
+        self.assertTrue(paths_after_turn1.issubset(agent._known_file_paths),
+                        "_known_file_paths from turn 1 must persist into turn 2")
+
+
+# ---------------------------------------------------------------------------
+# FIX-6: TOCTOU テスト (エージェントファイル symlink チェック)
+# ---------------------------------------------------------------------------
+
+class TestAgentFileTOCTOU(unittest.TestCase):
+    """Tests that symlinks in agent dirs are skipped (FIX-6 TOCTOU guard)."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.project_dir = os.path.join(self.test_dir, "project")
+        self.config_dir = os.path.join(self.test_dir, "config")
+        os.makedirs(self.project_dir, exist_ok=True)
+        os.makedirs(self.config_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def make_config(self):
+        config = eve_coder.Config()
+        config.cwd = self.project_dir
+        config.config_dir = self.config_dir
+        config.model = "test-model"
+        config.debug = False
+        return config
+
+    @patch("sys.stdin.isatty", return_value=False)
+    def test_symlink_skipped_in_agent_dir(self, _mock_isatty):
+        """A symlink to a .md file in the agents dir must not appear in the prompt."""
+        agents_dir = os.path.join(self.project_dir, ".eve-cli", "agents")
+        os.makedirs(agents_dir, exist_ok=True)
+
+        # Create a real agent file
+        real_agent = os.path.join(agents_dir, "real-agent.md")
+        with open(real_agent, "w", encoding="utf-8") as f:
+            f.write("---\ndescription: Real agent\n---\nDo things.\n")
+
+        # Create a symlink pointing to the real agent file
+        link_agent = os.path.join(agents_dir, "symlink-agent.md")
+        try:
+            os.symlink(real_agent, link_agent)
+        except OSError:
+            self.skipTest("Symlink creation not supported on this platform")
+
+        config = self.make_config()
+        prompt = eve_coder._build_runtime_system_prompt(config)
+
+        # The real agent must appear; the symlink must NOT generate a separate entry
+        # (symlink-agent should not appear as its own agent persona)
+        self.assertNotIn("symlink-agent", prompt)
+        # The real agent should still appear
+        self.assertIn("real-agent", prompt)
+
+    @patch("sys.stdin.isatty", return_value=False)
+    def test_normal_agent_file_included(self, _mock_isatty):
+        """A normal (non-symlink) .md file in agents dir must appear in the prompt."""
+        agents_dir = os.path.join(self.project_dir, ".eve-cli", "agents")
+        os.makedirs(agents_dir, exist_ok=True)
+
+        agent_file = os.path.join(agents_dir, "my-agent.md")
+        with open(agent_file, "w", encoding="utf-8") as f:
+            f.write("---\ndescription: My special agent\n---\nDoes special things.\n")
+
+        config = self.make_config()
+        prompt = eve_coder._build_runtime_system_prompt(config)
+
+        self.assertIn("my-agent", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

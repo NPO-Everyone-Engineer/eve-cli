@@ -297,7 +297,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.30.0"
+__version__ = "2.30.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -3521,11 +3521,11 @@ class _PromptSectionBudget:
         header = f"\n# {title}\n"
         section = f"{header}{body}\n"
         if len(section) > remaining:
-            budget_for_body = remaining - len(header) - len("\n[Truncated due to prompt budget]\n")
+            budget_for_body = remaining - len(header) - len("\n...(truncated)\n")
             if budget_for_body < _OPTIONAL_PROMPT_SECTION_MIN:
                 return False
             body = body[:budget_for_body].rstrip()
-            section = f"{header}{body}\n[Truncated due to prompt budget]\n"
+            section = f"{header}{body}\n...(truncated)\n"
         self._optional_sections.append(section)
         self._used_optional += len(section)
         return True
@@ -3546,7 +3546,13 @@ def _optional_prompt_body(section_text):
 
 
 def _build_system_prompt(config):
-    """Build system prompt with environment info and OS-specific hints."""
+    """Build system prompt with environment info and OS-specific hints.
+
+    Budget managed here: Instructions, Rules, ProjectContext, Memory, Evolution.
+    This budget covers the static sections injected at prompt-build time.
+    _build_runtime_system_prompt wraps this output and manages its own budget
+    for dynamic runtime sections (Skills, Agents, etc.).
+    """
     cwd = config.cwd
     plat = platform.system().lower()
     shell = os.environ.get("SHELL", "unknown")
@@ -4142,10 +4148,17 @@ IMPORTANT rules for structured output:
 
 
 def _build_runtime_system_prompt(config):
-    """Build the runtime system prompt with bounded optional context sections."""
+    """Build the runtime system prompt with bounded optional context sections.
+
+    Budget managed here: Skills, Agents, and other dynamic runtime sections.
+    The base prompt produced by _build_system_prompt already consumed its own
+    budget for static sections (Instructions, Rules, ProjectContext, etc.).
+    We use the full optional budget here (not halved) to avoid double-compressing
+    the combined prompt.
+    """
     prompt_budget = _PromptSectionBudget(
         _build_system_prompt(config),
-        max(_OPTIONAL_PROMPT_SECTION_MIN, _system_prompt_optional_budget(config) // 2),
+        max(_OPTIONAL_PROMPT_SECTION_MIN, _system_prompt_optional_budget(config)),
     )
 
     skills = _load_skills(config)
@@ -4176,11 +4189,17 @@ def _build_runtime_system_prompt(config):
             continue
         try:
             for _af in sorted(os.listdir(_adir)):
-                if not _af.endswith(".md") or os.path.islink(os.path.join(_adir, _af)):
+                _af_path = os.path.join(_adir, _af)
+                if not _af.endswith(".md") or os.path.islink(_af_path):
                     continue
                 _aname = _af[:-3]
                 try:
-                    with open(os.path.join(_adir, _af), encoding="utf-8", errors="replace") as _afh:
+                    _af_stat_before = os.lstat(_af_path)
+                    with open(_af_path, encoding="utf-8", errors="replace") as _afh:
+                        _af_stat_after = os.fstat(_afh.fileno())
+                        if (_af_stat_before.st_ino != _af_stat_after.st_ino
+                                or _af_stat_before.st_dev != _af_stat_after.st_dev):
+                            continue  # TOCTOU: file changed between lstat and open
                         _ahead = _afh.read(500)
                 except OSError:
                     continue
@@ -19603,7 +19622,9 @@ class Agent:
                     self._modified_file_paths.add(resolved)
             except Exception:
                 pass
-        self._pending_verification = bool(runtime_meta.get("verification_required")) or bool(self._modified_file_paths)
+        # Do not carry forward stale verification_required from a previous session;
+        # only re-arm if there are actually modified files pending review.
+        self._pending_verification = bool(self._modified_file_paths)
         self._verification_reminders = 0
         self._repo_map_injected = bool(runtime_meta.get("repo_map_injected", False))
 
@@ -20052,7 +20073,13 @@ class Agent:
         if tool_name == "Bash":
             command = str(tool_params.get("command", "") or "")
             if _looks_like_verification_command(command):
-                passed = not is_error and "(exit code:" not in str(output or "")
+                _out_str = str(output or "")
+                passed = (
+                    not is_error
+                    and "(exit code:" not in _out_str
+                    and not re.search(r'\bFAILED\b', _out_str)
+                    and not re.search(r'\b(error|errors):\s*[1-9]', _out_str, re.IGNORECASE)
+                )
                 if self.session.runtime_state:
                     self.session.runtime_state.record_verifier_run(
                         "manual",
@@ -20381,7 +20408,10 @@ class Agent:
                             )
                             self.session.add_system_note(
                                 "You modified files in this run but have not run a verification step yet. "
-                                "Before finishing, run a syntax check, test command, or build that validates the change."
+                                "Before finishing, run ONE of: syntax check "
+                                "(python3 -c 'import py_compile; py_compile.compile(...)'), "
+                                "test suite (pytest / unittest), linter (ruff / flake8), or build command. "
+                                "If no test framework is installed, a syntax check is sufficient."
                             )
                             continue
                         self._set_stop_reason(
