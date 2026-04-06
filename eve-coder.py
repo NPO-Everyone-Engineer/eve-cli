@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.30.2"
+__version__ = "2.30.3"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -2575,6 +2575,20 @@ def _is_cloud_model(model_name):
 
 def _is_gemma4_model(model_name):
     return bool(model_name) and model_name.lower().startswith("gemma4:")
+
+
+def _strip_thinking_tags(content):
+    """Strip thinking traces from model output.
+
+    Handles both:
+    - Qwen/generic format: <think>...</think>
+    - Gemma 4 format:      <|channel>thought\\n...<channel|>
+    """
+    # Qwen / generic
+    content = re.sub(r'<think>[\s\S]*?</think>', '', content)
+    # Gemma 4: <|channel>thought\n...<channel|>
+    content = re.sub(r'<\|channel>thought[\s\S]*?<channel\|>', '', content)
+    return content.strip()
 
 
 def _get_ram_gb():
@@ -4997,8 +5011,8 @@ class OllamaClient:
         content = message.get("content", "") or ""
         raw_tool_calls = message.get("tool_calls", [])
 
-        # Strip <think>...</think> blocks (Qwen reasoning traces)
-        content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+        # Strip thinking traces (Qwen <think> and Gemma 4 <|channel>thought)
+        content = _strip_thinking_tags(content)
 
         # Normalize tool_calls into a consistent format
         tool_calls = []
@@ -9913,8 +9927,8 @@ class _MCPChatTool:
                 content = choices[0].get("message", {}).get("content", "")
             else:
                 content = resp.get("message", {}).get("content", "")
-            # Strip thinking blocks
-            content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+            # Strip thinking traces (Qwen <think> and Gemma 4 <|channel>thought)
+            content = _strip_thinking_tags(content)
             return content or "(empty response)"
         except Exception as e:
             return f"Chat error: {e}"
@@ -14100,11 +14114,16 @@ class PermissionMgr:
             {"role": "user", "content": f"Tool: {tool_name}\nArguments: {param_str}"},
         ]
         try:
+            # Build model-aware options (low temp for deterministic classification)
+            _sc_opts = self._sidecar_client._merge_chat_options(
+                self._sidecar_model, 0.3
+            ) if hasattr(self._sidecar_client, '_merge_chat_options') else {"temperature": 0.3}
             resp = self._sidecar_client.chat(
                 model=self._sidecar_model,
                 messages=classify_prompt,
                 tools=None,
                 stream=False,
+                options=_sc_opts,
             )
             # Extract content from response
             content = ""
@@ -14115,8 +14134,8 @@ class PermissionMgr:
                 content = resp.get("message", {}).get("content", "")
             if not content:
                 return None
-            # Strip <think> blocks (Qwen reasoning traces)
-            content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+            # Strip thinking traces (Qwen <think> and Gemma 4 <|channel>thought)
+            content = _strip_thinking_tags(content)
             lines = content.strip().split("\n", 1)
             decision_word = lines[0].strip().upper()
             reason = lines[1].strip() if len(lines) > 1 else ""
@@ -15062,7 +15081,7 @@ class EvolutionEngine:
                 content = choices[0].get("message", {}).get("content", "")
             if not content:
                 content = resp.get("message", {}).get("content", "")
-            content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+            content = _strip_thinking_tags(content)
             new_insights = []
             for line in content.strip().split("\n"):
                 line = line.strip()
@@ -17377,9 +17396,18 @@ class Session:
         )
         if not summary_text.strip():
             return False
+        # Derive summary_chars from the compaction model's context window when it
+        # differs from the main model (e.g. Gemma 4 sidecar with 256K ctx).
+        summary_chars = policy["summary_chars"]
+        if config.sidecar_model and config.sidecar_model != config.model:
+            sc_ctx = Config.MODEL_CONTEXT_SIZES.get(config.sidecar_model, 0)
+            if sc_ctx >= 262144:
+                summary_chars = max(summary_chars, 12000)
+            elif sc_ctx >= 131072:
+                summary_chars = max(summary_chars, 8000)
         summary_prompt = [
             {"role": "system", "content": "Summarize this conversation concisely in the same language. Keep key decisions, file paths, and code changes. Output only the summary."},
-            {"role": "user", "content": summary_text[:policy["summary_chars"]]},
+            {"role": "user", "content": summary_text[:summary_chars]},
         ]
         try:
             resp = client.chat(model=model, messages=summary_prompt, tools=None, stream=False)
@@ -18544,9 +18572,12 @@ class TUI:
 
         full_text = "".join(raw_parts)
         # Detect if thinking content was produced (before stripping)
-        _had_thinking = bool(native_think_parts) or bool(re.search(r'<think>[\s\S]+?</think>', full_text))
-        # Strip <think>...</think> from final text for history
-        full_text = re.sub(r'<think>[\s\S]*?</think>', '', full_text).strip()
+        _had_thinking = bool(native_think_parts) or bool(
+            re.search(r'<think>[\s\S]+?</think>', full_text) or
+            re.search(r'<\|channel>thought[\s\S]+?<channel\|>', full_text)
+        )
+        # Strip thinking traces (Qwen <think> and Gemma 4 <|channel>thought) from final text for history
+        full_text = _strip_thinking_tags(full_text)
         if not _render_mode:
             self._scroll_print()  # newline
 
@@ -18616,8 +18647,8 @@ class TUI:
             _show_thinking_summary(native_thinking)
         for _tm in _think_matches:
             _show_thinking_summary(_tm)
-        # Strip <think>...</think> blocks (Qwen reasoning traces)
-        content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+        # Strip thinking traces (Qwen <think> and Gemma 4 <|channel>thought)
+        content = _strip_thinking_tags(content)
 
         # Check for XML tool calls in text
         if not tool_calls and content and known_tools:
@@ -21274,6 +21305,13 @@ def _call_sidecar_for_suggestions(agent, config, client, system_prompt, user_pro
         {"role": "user", "content": user_prompt},
     ]
 
+    # Build model-aware options (use _merge_chat_options if available)
+    if hasattr(client, '_merge_chat_options'):
+        _opts = client._merge_chat_options(sidecar_model, 0.7)
+        _opts["num_predict"] = 512
+    else:
+        _opts = {"temperature": 0.7, "max_tokens": 512}
+
     # Call Ollama API via client
     try:
         resp = client.chat(
@@ -21281,7 +21319,7 @@ def _call_sidecar_for_suggestions(agent, config, client, system_prompt, user_pro
             messages=messages,
             tools=None,
             stream=False,
-            options={"temperature": 0.7, "max_tokens": 512}
+            options=_opts,
         )
     except Exception as e:
         raise RuntimeError(t('errors.sidecar_call_failed', default=f"サイドカーモデル呼び出し失敗：{e}"))
@@ -22806,8 +22844,8 @@ def main():
                             choices = resp.get("choices", [])
                             if choices:
                                 commit_msg = choices[0].get("message", {}).get("content", "").strip()
-                        # Strip <think> tags from Qwen/reasoning models
-                        commit_msg = re.sub(r'<think>.*?</think>\s*', '', commit_msg, flags=re.DOTALL).strip()
+                        # Strip thinking traces (Qwen <think> and Gemma 4 <|channel>thought)
+                        commit_msg = _strip_thinking_tags(commit_msg)
                         if not commit_msg:
                             # Fallback: auto-generate from file names
                             fb_files = subprocess.run(
