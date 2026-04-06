@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -45,6 +46,30 @@ class _CaptureSuggestHelpClient:
 class _EmptySuggestHelpClient:
     def chat(self, **kwargs):
         return {"choices": [{"message": {"content": ""}}]}
+
+
+class _UtilitySuggestHelpClient:
+    def __init__(self):
+        self.last_kwargs = None
+        self.reasoning_states = []
+
+    def build_utility_options(self, model, profile, temperature):
+        return {
+            "temperature": temperature,
+            "num_ctx": 8192,
+            "num_predict": 512,
+            "profile": profile,
+            "model": model,
+        }
+
+    @contextlib.contextmanager
+    def temporary_reasoning(self, think_mode, thinking_budget=None):
+        self.reasoning_states.append((think_mode, thinking_budget))
+        yield
+
+    def chat(self, **kwargs):
+        self.last_kwargs = kwargs
+        return {"choices": [{"message": {"content": '["foo", "bar"]'}}]}
 
 
 class TestSuggestHelp(unittest.TestCase):
@@ -96,6 +121,24 @@ class TestSuggestHelp(unittest.TestCase):
         self.assertEqual(suggestions, ["foo", "bar"])
         self.assertEqual(client.last_kwargs["options"]["temperature"], 0.7)
         self.assertEqual(client.last_kwargs["options"]["max_tokens"], 512)
+
+    def test_call_sidecar_for_suggestions_prefers_utility_options_when_available(self):
+        client = _UtilitySuggestHelpClient()
+        config = SimpleNamespace(sidecar_model="gemma4:31b")
+
+        suggestions = eve_coder._call_sidecar_for_suggestions(
+            agent=None,
+            config=config,
+            client=client,
+            system_prompt="system",
+            user_prompt="user",
+        )
+
+        self.assertEqual(suggestions, ["foo", "bar"])
+        self.assertEqual(client.reasoning_states, [(False, None)])
+        self.assertEqual(client.last_kwargs["options"]["profile"], "suggestions")
+        self.assertEqual(client.last_kwargs["options"]["num_ctx"], 8192)
+        self.assertEqual(client.last_kwargs["options"]["num_predict"], 512)
 
     def test_parse_suggest_help_response_reports_empty_output_clearly(self):
         with self.assertRaises(RuntimeError) as cm:

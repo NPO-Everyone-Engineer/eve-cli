@@ -907,6 +907,10 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
         self.assertTrue(eve_coder._is_cloud_model("gemma4:31b"))
         self.assertTrue(eve_coder._is_cloud_model("gemma4:31b-cloud"))
 
+    def test_qwen397_alias_is_treated_as_cloud(self):
+        self.assertTrue(eve_coder._is_cloud_model("qwen3.5:397b"))
+        self.assertTrue(eve_coder._is_cloud_model("qwen3.5:397b-cloud"))
+
     def test_gemma_defaults_to_google_temperature(self):
         cfg = Config()
         client = eve_coder.OllamaClient(cfg)
@@ -980,6 +984,31 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
         self.assertEqual(opts["temperature"], 0.6)
         self.assertEqual(opts["num_predict"], 512)
         self.assertNotIn("retry_temperature_boost", opts)
+
+    def test_build_utility_options_caps_context_and_tokens(self):
+        cfg = Config()
+        cfg.context_window = 262144
+        cfg.max_tokens = 32768
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client.build_utility_options("gemma4:31b", "classifier", 0.2)
+
+        self.assertEqual(opts["num_ctx"], 4096)
+        self.assertEqual(opts["num_predict"], 64)
+        self.assertEqual(opts["temperature"], 0.2)
+
+    def test_temporary_reasoning_restores_client_settings(self):
+        cfg = Config()
+        cfg.think_mode = True
+        cfg.thinking_budget = 8000
+        client = eve_coder.OllamaClient(cfg)
+
+        with client.temporary_reasoning(False, None):
+            self.assertFalse(client.think_mode)
+            self.assertIsNone(client.thinking_budget)
+
+        self.assertTrue(client.think_mode)
+        self.assertEqual(client.thinking_budget, 8000)
 
     def test_refresh_from_config_updates_runtime_settings(self):
         cfg = Config()

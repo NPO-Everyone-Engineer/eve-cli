@@ -1868,6 +1868,7 @@ class Config:
         # Tier A — Expert (128GB+ RAM)
         "llama3.1:405b": 131072,
         "qwen3:235b": 32768,
+        "qwen3.5:397b": 262144,        # Cloud alias, 256K ctx
         "qwen3.5:397b-cloud": 262144,  # Cloud model, 256K ctx
         "gemma4:31b-cloud":  262144,   # Cloud model, 256K ctx
         "gemma4:31b":        262144,   # 256K ctx
@@ -1917,6 +1918,7 @@ class Config:
         ("deepseek-r1:671b",        768, "S"),
         ("deepseek-v3:671b",        768, "S"),
         # Tier A — Expert: excellent coding + reasoning
+        ("qwen3.5:397b",            256, "A"),  # Cloud alias
         ("qwen3.5:397b-cloud",      256, "A"),  # Cloud model
         ("gemma4:31b-cloud",         32, "A"),  # Cloud model, 31B
         ("gemma4:31b",               32, "A"),  # 31B
@@ -2568,7 +2570,7 @@ def _is_cloud_model(model_name):
     if not model_name:
         return False
     lower = model_name.lower()
-    if lower == "gemma4:31b":
+    if lower in {"gemma4:31b", "qwen3.5:397b"}:
         return True
     return ":cloud" in lower or "-cloud" in lower
 
@@ -4289,6 +4291,14 @@ class ResponseCache:
 class OllamaClient:
     """Communicates with Ollama via the native /api/chat endpoint."""
 
+    _UTILITY_OPTION_PROFILES = {
+        "classifier": {"context_window": 4096, "max_tokens": 64},
+        "decision": {"context_window": 8192, "max_tokens": 256},
+        "suggestions": {"context_window": 8192, "max_tokens": 512},
+        "summary": {"context_window": 16384, "max_tokens": 1024},
+        "insights": {"context_window": 16384, "max_tokens": 768},
+    }
+
     def __init__(self, config):
         self._supports_tool_streaming = None  # None=untested, True/False=detected
         self._response_cache = ResponseCache()
@@ -4334,6 +4344,29 @@ class OllamaClient:
         if "Authorization" in h:
             h["Authorization"] = "Bearer ***"
         return h
+
+    @contextlib.contextmanager
+    def temporary_reasoning(self, think_mode, thinking_budget=None):
+        """Temporarily override reasoning settings for helper calls."""
+        prev_think_mode = self.think_mode
+        prev_thinking_budget = self.thinking_budget
+        try:
+            self.think_mode = think_mode
+            self.thinking_budget = thinking_budget
+            yield
+        finally:
+            self.think_mode = prev_think_mode
+            self.thinking_budget = prev_thinking_budget
+
+    def build_utility_options(self, model, profile, temperature):
+        """Build smaller per-call budgets for non-primary helper invocations."""
+        spec = dict(self._UTILITY_OPTION_PROFILES.get(profile, {}))
+        overrides = {}
+        if "context_window" in spec:
+            overrides["context_window"] = spec["context_window"]
+        if "max_tokens" in spec:
+            overrides["max_tokens"] = spec["max_tokens"]
+        return self._merge_chat_options(model, temperature, overrides or None)
 
     def check_connection(self, retries=3):
         """Check if Ollama is reachable. Returns (ok, model_list)."""
@@ -14115,16 +14148,24 @@ class PermissionMgr:
         ]
         try:
             # Build model-aware options (low temp for deterministic classification)
-            _sc_opts = self._sidecar_client._merge_chat_options(
-                self._sidecar_model, 0.3
-            ) if hasattr(self._sidecar_client, '_merge_chat_options') else {"temperature": 0.3}
-            resp = self._sidecar_client.chat(
-                model=self._sidecar_model,
-                messages=classify_prompt,
-                tools=None,
-                stream=False,
-                options=_sc_opts,
+            _sc_opts = (
+                self._sidecar_client.build_utility_options(self._sidecar_model, "classifier", 0.2)
+                if hasattr(self._sidecar_client, "build_utility_options")
+                else {"temperature": 0.2, "max_tokens": 64}
             )
+            _sc_ctx = (
+                self._sidecar_client.temporary_reasoning(False, None)
+                if hasattr(self._sidecar_client, "temporary_reasoning")
+                else contextlib.nullcontext()
+            )
+            with _sc_ctx:
+                resp = self._sidecar_client.chat(
+                    model=self._sidecar_model,
+                    messages=classify_prompt,
+                    tools=None,
+                    stream=False,
+                    options=_sc_opts,
+                )
             # Extract content from response
             content = ""
             choices = resp.get("choices", [])
@@ -15074,7 +15115,24 @@ class EvolutionEngine:
             {"role": "user", "content": summary},
         ]
         try:
-            resp = client.chat(model=model, messages=prompt, tools=None, stream=False)
+            _insight_opts = (
+                client.build_utility_options(model, "insights", 0.2)
+                if hasattr(client, "build_utility_options")
+                else {"temperature": 0.2, "max_tokens": 768}
+            )
+            _insight_ctx = (
+                client.temporary_reasoning(False, None)
+                if hasattr(client, "temporary_reasoning")
+                else contextlib.nullcontext()
+            )
+            with _insight_ctx:
+                resp = client.chat(
+                    model=model,
+                    messages=prompt,
+                    tools=None,
+                    stream=False,
+                    options=_insight_opts,
+                )
             content = ""
             choices = resp.get("choices", [])
             if choices:
@@ -16058,20 +16116,32 @@ class DecisionEngine:
                      or _config_value(self.config, "model", ""))
             if not model:
                 raise ValueError("No model configured for decision engine")
-            response = self.client.chat(
-                model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are EvE CLI's proactive supervisor (KAIROS). "
-                                   "Decide whether to take action or stay quiet based on observations. "
-                                   "Respond ONLY with valid JSON in the specified format.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                tools=None,
-                stream=False,
+            _decision_opts = (
+                self.client.build_utility_options(model, "decision", 0.2)
+                if hasattr(self.client, "build_utility_options")
+                else {"temperature": 0.2, "max_tokens": 256}
             )
+            _decision_ctx = (
+                self.client.temporary_reasoning(False, None)
+                if hasattr(self.client, "temporary_reasoning")
+                else contextlib.nullcontext()
+            )
+            with _decision_ctx:
+                response = self.client.chat(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are EvE CLI's proactive supervisor (KAIROS). "
+                                       "Decide whether to take action or stay quiet based on observations. "
+                                       "Respond ONLY with valid JSON in the specified format.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    tools=None,
+                    stream=False,
+                    options=_decision_opts,
+                )
             if isinstance(response, dict):
                 choices = response.get("choices") or []
                 if choices:
@@ -17410,7 +17480,24 @@ class Session:
             {"role": "user", "content": summary_text[:summary_chars]},
         ]
         try:
-            resp = client.chat(model=model, messages=summary_prompt, tools=None, stream=False)
+            _summary_opts = (
+                client.build_utility_options(model, "summary", 0.2)
+                if hasattr(client, "build_utility_options")
+                else {"temperature": 0.2, "max_tokens": 1024}
+            )
+            _summary_ctx = (
+                client.temporary_reasoning(False, None)
+                if hasattr(client, "temporary_reasoning")
+                else contextlib.nullcontext()
+            )
+            with _summary_ctx:
+                resp = client.chat(
+                    model=model,
+                    messages=summary_prompt,
+                    tools=None,
+                    stream=False,
+                    options=_summary_opts,
+                )
             summary = ""
             if isinstance(resp, dict):
                 choices = resp.get("choices", [])
@@ -17613,12 +17700,24 @@ class Session:
             )},
         ]
         try:
-            resp = self._client.chat(
-                model=self.config.sidecar_model,
-                messages=summary_prompt,
-                tools=None,
-                stream=False,
+            _summary_opts = (
+                self._client.build_utility_options(self.config.sidecar_model, "summary", 0.2)
+                if hasattr(self._client, "build_utility_options")
+                else {"temperature": 0.2, "max_tokens": 1024}
             )
+            _summary_ctx = (
+                self._client.temporary_reasoning(False, None)
+                if hasattr(self._client, "temporary_reasoning")
+                else contextlib.nullcontext()
+            )
+            with _summary_ctx:
+                resp = self._client.chat(
+                    model=self.config.sidecar_model,
+                    messages=summary_prompt,
+                    tools=None,
+                    stream=False,
+                    options=_summary_opts,
+                )
             choices = resp.get("choices", [])
             if choices:
                 summary = choices[0].get("message", {}).get("content", "")
@@ -21306,21 +21405,26 @@ def _call_sidecar_for_suggestions(agent, config, client, system_prompt, user_pro
     ]
 
     # Build model-aware options (use _merge_chat_options if available)
-    if hasattr(client, '_merge_chat_options'):
-        _opts = client._merge_chat_options(sidecar_model, 0.7)
-        _opts["num_predict"] = 512
+    if hasattr(client, 'build_utility_options'):
+        _opts = client.build_utility_options(sidecar_model, "suggestions", 0.7)
     else:
         _opts = {"temperature": 0.7, "max_tokens": 512}
 
     # Call Ollama API via client
     try:
-        resp = client.chat(
-            model=sidecar_model,
-            messages=messages,
-            tools=None,
-            stream=False,
-            options=_opts,
+        _suggest_ctx = (
+            client.temporary_reasoning(False, None)
+            if hasattr(client, "temporary_reasoning")
+            else contextlib.nullcontext()
         )
+        with _suggest_ctx:
+            resp = client.chat(
+                model=sidecar_model,
+                messages=messages,
+                tools=None,
+                stream=False,
+                options=_opts,
+            )
     except Exception as e:
         raise RuntimeError(t('errors.sidecar_call_failed', default=f"サイドカーモデル呼び出し失敗：{e}"))
 
