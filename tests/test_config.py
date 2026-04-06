@@ -229,6 +229,20 @@ class TestParseConfigFile(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_role_specific_models(self):
+        path = self._write_config("""
+            UTILITY_MODEL = qwen3:8b
+            COMPACTION_MODEL = gemma4:31b
+            SUBAGENT_MODEL = qwen3.5:32b
+        """)
+        try:
+            self.cfg._parse_config_file(path)
+            self.assertEqual(self.cfg.utility_model, "qwen3:8b")
+            self.assertEqual(self.cfg.compaction_model, "gemma4:31b")
+            self.assertEqual(self.cfg.subagent_model, "qwen3.5:32b")
+        finally:
+            os.unlink(path)
+
     def test_ollama_host(self):
         path = self._write_config("OLLAMA_HOST = http://192.168.1.100:11434\n")
         try:
@@ -620,6 +634,18 @@ class TestLoadEnv(unittest.TestCase):
         with patch.dict(os.environ, env):
             self.cfg._load_env()
         self.assertEqual(self.cfg.sidecar_model, "old-sidecar")
+
+    def test_role_specific_models_from_env(self):
+        env = self._make_env(
+            EVE_CLI_UTILITY_MODEL="util-v1",
+            EVE_CLI_COMPACTION_MODEL="compact-v1",
+            EVE_CLI_SUBAGENT_MODEL="sub-v1",
+        )
+        with patch.dict(os.environ, env):
+            self.cfg._load_env()
+        self.assertEqual(self.cfg.utility_model, "util-v1")
+        self.assertEqual(self.cfg.compaction_model, "compact-v1")
+        self.assertEqual(self.cfg.subagent_model, "sub-v1")
 
     def test_max_agent_steps_from_env(self):
         env = self._make_env(EVE_CLI_MAX_AGENT_STEPS="150")
@@ -1229,6 +1255,52 @@ class TestLoadConfigFile(unittest.TestCase):
         cfg._apply_profile()
 
         self.assertEqual(cfg.sidecar_model, "cli-sidecar")
+
+    def test_apply_profile_respects_role_specific_overrides(self):
+        cfg = Config()
+        cfg.profile = "online"
+        cfg.network_status = "online"
+        cfg.utility_model = "cli-utility"
+        cfg.compaction_model = "cli-compaction"
+        cfg.subagent_model = "cli-subagent"
+        cfg._cli_utility_model_set = True
+        cfg._cli_compaction_model_set = True
+        cfg._cli_subagent_model_set = True
+        cfg._profiles = {
+            "online": {
+                "UTILITY_MODEL": "profile-utility",
+                "COMPACTION_MODEL": "profile-compaction",
+                "SUBAGENT_MODEL": "profile-subagent",
+            }
+        }
+
+        cfg._apply_profile()
+
+        self.assertEqual(cfg.utility_model, "cli-utility")
+        self.assertEqual(cfg.compaction_model, "cli-compaction")
+        self.assertEqual(cfg.subagent_model, "cli-subagent")
+
+
+class TestModelRoleResolution(unittest.TestCase):
+    def test_utility_model_falls_back_to_sidecar(self):
+        cfg = Config()
+        cfg.sidecar_model = "gemma4:31b"
+        self.assertEqual(eve_coder._resolve_utility_model(cfg), "gemma4:31b")
+
+    def test_compaction_model_prefers_explicit_override(self):
+        cfg = Config()
+        cfg.sidecar_model = "gemma4:31b"
+        cfg.compaction_model = "gemma4:31b-cloud"
+        self.assertEqual(eve_coder._resolve_compaction_model(cfg), "gemma4:31b-cloud")
+
+    def test_subagent_model_prefers_specific_then_utility(self):
+        cfg = Config()
+        cfg.model = "qwen3.5:397b"
+        cfg.sidecar_model = "gemma4:31b"
+        cfg.utility_model = "qwen3:8b"
+        self.assertEqual(eve_coder._resolve_subagent_model(cfg), "qwen3:8b")
+        cfg.subagent_model = "qwen3.5:32b"
+        self.assertEqual(eve_coder._resolve_subagent_model(cfg), "qwen3.5:32b")
 
 
 if __name__ == "__main__":

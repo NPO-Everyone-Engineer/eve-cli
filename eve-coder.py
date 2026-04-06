@@ -1187,6 +1187,9 @@ class Config:
     DEFAULT_OLLAMA_HOST = "http://localhost:11434"
     DEFAULT_MODEL = "gemma4:31b-cloud"
     DEFAULT_SIDECAR = "gemma4:31b-cloud"
+    DEFAULT_UTILITY_MODEL = ""
+    DEFAULT_COMPACTION_MODEL = ""
+    DEFAULT_SUBAGENT_MODEL = ""
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
     DEFAULT_CONTEXT_WINDOW = 65536
@@ -1203,6 +1206,9 @@ class Config:
         self.ollama_api_key = ""
         self.model = self.DEFAULT_MODEL
         self.sidecar_model = self.DEFAULT_SIDECAR
+        self.utility_model = self.DEFAULT_UTILITY_MODEL
+        self.compaction_model = self.DEFAULT_COMPACTION_MODEL
+        self.subagent_model = self.DEFAULT_SUBAGENT_MODEL
         self.max_tokens = self.DEFAULT_MAX_TOKENS
         self.temperature = self.DEFAULT_TEMPERATURE
         self.context_window = self.DEFAULT_CONTEXT_WINDOW
@@ -1224,6 +1230,9 @@ class Config:
         self._profiles = {}         # profile_name -> {key: value} from config file
         self._cli_model_set = False  # True if --model was passed on CLI
         self._cli_sidecar_set = False  # True if --sidecar or SIDECAR_MODEL was set
+        self._cli_utility_model_set = False
+        self._cli_compaction_model_set = False
+        self._cli_subagent_model_set = False
         self._cli_ollama_host_set = False
         self._cli_max_tokens_set = False
         self._cli_temperature_set = False
@@ -1395,6 +1404,15 @@ class Config:
                     elif key == "SIDECAR_MODEL" and val:
                         self.sidecar_model = val
                         self._cli_sidecar_set = True
+                    elif key == "UTILITY_MODEL" and val:
+                        self.utility_model = val
+                        self._cli_utility_model_set = True
+                    elif key == "COMPACTION_MODEL" and val:
+                        self.compaction_model = val
+                        self._cli_compaction_model_set = True
+                    elif key == "SUBAGENT_MODEL" and val:
+                        self.subagent_model = val
+                        self._cli_subagent_model_set = True
                     elif key == "OLLAMA_HOST" and val:
                         self.ollama_host = val
                     elif key == "OLLAMA_API_KEY" and val:
@@ -1496,6 +1514,15 @@ class Config:
         if os.environ.get("EVE_CLI_SIDECAR_MODEL"):
             self._cli_sidecar_set = True
             self.sidecar_model = os.environ["EVE_CLI_SIDECAR_MODEL"]
+        if os.environ.get("EVE_CLI_UTILITY_MODEL"):
+            self._cli_utility_model_set = True
+            self.utility_model = os.environ["EVE_CLI_UTILITY_MODEL"]
+        if os.environ.get("EVE_CLI_COMPACTION_MODEL"):
+            self._cli_compaction_model_set = True
+            self.compaction_model = os.environ["EVE_CLI_COMPACTION_MODEL"]
+        if os.environ.get("EVE_CLI_SUBAGENT_MODEL"):
+            self._cli_subagent_model_set = True
+            self.subagent_model = os.environ["EVE_CLI_SUBAGENT_MODEL"]
         if os.environ.get("EVE_CODER_MAX_AGENT_STEPS"):
             parsed = self._normalize_max_agent_steps(os.environ["EVE_CODER_MAX_AGENT_STEPS"])
             if parsed is not None:
@@ -1990,6 +2017,15 @@ class Config:
         if prof.get("SIDECAR_MODEL") and not self._cli_sidecar_set:
             self.sidecar_model = prof["SIDECAR_MODEL"]
             self._cli_sidecar_set = True
+        if prof.get("UTILITY_MODEL") and not self._cli_utility_model_set:
+            self.utility_model = prof["UTILITY_MODEL"]
+            self._cli_utility_model_set = True
+        if prof.get("COMPACTION_MODEL") and not self._cli_compaction_model_set:
+            self.compaction_model = prof["COMPACTION_MODEL"]
+            self._cli_compaction_model_set = True
+        if prof.get("SUBAGENT_MODEL") and not self._cli_subagent_model_set:
+            self.subagent_model = prof["SUBAGENT_MODEL"]
+            self._cli_subagent_model_set = True
         if prof.get("OLLAMA_HOST") and not self._cli_ollama_host_set:
             self.ollama_host = prof["OLLAMA_HOST"]
         if prof.get("OLLAMA_API_KEY"):
@@ -2223,12 +2259,12 @@ class Config:
         self.notify_on = _normalize_notify_events(self.notify_on)
         # Validate model names — reject shell metacharacters / path traversal
         _SAFE_MODEL_RE = re.compile(r'^[a-zA-Z0-9_.:\-/]+$')
-        for attr in ("model", "sidecar_model"):
+        for attr in ("model", "sidecar_model", "utility_model", "compaction_model", "subagent_model"):
             val = getattr(self, attr, "")
             if val and not _SAFE_MODEL_RE.match(val):
                 msg = t('warnings.invalid_model_name', default=f"Warning: invalid {attr} name {val!r} — resetting to default.")
                 print(f"{C.YELLOW}{msg}{C.RESET}", file=sys.stderr)
-                setattr(self, attr, "" if attr == "sidecar_model" else self.DEFAULT_MODEL)
+                setattr(self, attr, "" if attr != "model" else self.DEFAULT_MODEL)
 
     def _ensure_dirs(self):
         for d in [self.config_dir, self.state_dir, self.sessions_dir, self.commands_dir]:
@@ -9618,7 +9654,7 @@ class SubAgentTool(Tool):
 
         for turn in range(max_turns):
             try:
-                _sub_model = _persona_model or self._config.sidecar_model or self._config.model
+                _sub_model = _resolve_subagent_model(self._config, _persona_model)
                 resp = self._client.chat_sync(
                     model=_sub_model,
                     messages=messages,
@@ -13627,6 +13663,7 @@ def _build_doctor_lines(config, client, registry, permissions, session, agent, h
         custom_commands = sorted(_custom_commands.keys())
     evo = getattr(agent, "_evolution", None)
     usage = evo.usage_summary() if evo else {"prompt_tokens": 0, "completion_tokens": 0, "estimated_cost_usd": 0.0}
+    role_models = _role_model_snapshot(config)
     lines = [
         "Doctor",
         f"  version:            {__version__}",
@@ -13634,6 +13671,9 @@ def _build_doctor_lines(config, client, registry, permissions, session, agent, h
         f"  session:            {session.session_id}",
         f"  model:              {config.model}",
         f"  sidecar:            {config.sidecar_model or '(none)'}",
+        f"  utility_model:      {role_models['utility'] or '(none)'}",
+        f"  compaction_model:   {role_models['compaction'] or '(none)'}",
+        f"  subagent_model:     {role_models['subagent'] or '(none)'}",
         f"  host:               {config.ollama_host}",
         f"  connection:         {'ok' if conn_ok else 'failed'}",
         f"  model_available:    {'yes' if client.check_model(config.model, available_models=models if conn_ok else None) else 'no'}",
@@ -15305,6 +15345,40 @@ def _config_value(config, key, default=None):
     return getattr(config, key, default)
 
 
+def _resolve_utility_model(config):
+    return (
+        _config_value(config, "utility_model", "")
+        or _config_value(config, "sidecar_model", "")
+        or _config_value(config, "model", "")
+    )
+
+
+def _resolve_compaction_model(config):
+    return (
+        _config_value(config, "compaction_model", "")
+        or _config_value(config, "sidecar_model", "")
+        or _config_value(config, "model", "")
+    )
+
+
+def _resolve_subagent_model(config, persona_model=""):
+    return (
+        persona_model
+        or _config_value(config, "subagent_model", "")
+        or _config_value(config, "utility_model", "")
+        or _config_value(config, "sidecar_model", "")
+        or _config_value(config, "model", "")
+    )
+
+
+def _role_model_snapshot(config):
+    return {
+        "utility": _resolve_utility_model(config),
+        "compaction": _resolve_compaction_model(config),
+        "subagent": _resolve_subagent_model(config),
+    }
+
+
 def _kairos_settings(config):
     """Return merged KAIROS settings from defaults, JSON config, and env."""
     settings = _deep_copy_dict(KAIROS_DEFAULTS)
@@ -16117,8 +16191,7 @@ class DecisionEngine:
         try:
             if not self.client or not hasattr(self.client, "chat"):
                 raise ValueError("Ollama client is unavailable")
-            model = (_config_value(self.config, "sidecar_model", "")
-                     or _config_value(self.config, "model", ""))
+            model = _resolve_utility_model(self.config)
             if not model:
                 raise ValueError("No model configured for decision engine")
             _decision_opts = (
@@ -17462,7 +17535,7 @@ class Session:
         keep_count = policy["keep_recent_messages"]
         if len(self.messages) <= keep_count + 1:
             return False
-        model = config.sidecar_model or config.model
+        model = _resolve_compaction_model(config)
         to_summarize = self.messages[:-keep_count]
         keep = self.messages[-keep_count:]
         summary_text = "\n".join(
@@ -17474,8 +17547,8 @@ class Session:
         # Derive summary_chars from the compaction model's context window when it
         # differs from the main model (e.g. Gemma 4 sidecar with 256K ctx).
         summary_chars = policy["summary_chars"]
-        if config.sidecar_model and config.sidecar_model != config.model:
-            sc_ctx = Config.MODEL_CONTEXT_SIZES.get(config.sidecar_model, 0)
+        if model and model != config.model:
+            sc_ctx = Config.MODEL_CONTEXT_SIZES.get(model, 0)
             if sc_ctx >= 262144:
                 summary_chars = max(summary_chars, 12000)
             elif sc_ctx >= 131072:
@@ -17668,7 +17741,8 @@ class Session:
     def _summarize_old_messages(self, old_messages):
         """Use sidecar model to generate a summary of old conversation messages.
         Returns summary text or None if sidecar is unavailable/fails."""
-        if not self._client or not self.config.sidecar_model:
+        compaction_model = _resolve_compaction_model(self.config)
+        if not self._client or not compaction_model:
             return None
         # Build a condensed transcript for summarization
         transcript_parts = []
@@ -17706,7 +17780,7 @@ class Session:
         ]
         try:
             _summary_opts = (
-                self._client.build_utility_options(self.config.sidecar_model, "summary", 0.2)
+                self._client.build_utility_options(compaction_model, "summary", 0.2)
                 if hasattr(self._client, "build_utility_options")
                 else {"temperature": 0.2, "max_tokens": 1024}
             )
@@ -17717,7 +17791,7 @@ class Session:
             )
             with _summary_ctx:
                 resp = self._client.chat(
-                    model=self.config.sidecar_model,
+                    model=compaction_model,
                     messages=summary_prompt,
                     tools=None,
                     stream=False,
@@ -18224,6 +18298,7 @@ class TUI:
 
         _tier, _ = Config.get_model_tier(config.model)
         _tier_colors = {"S": "196", "A": "208", "B": "226", "C": "46", "D": "51", "E": "250"}
+        role_models = _role_model_snapshot(config)
         _tier_str = ""
         if _tier:
             _tc = _tier_colors.get(_tier, "250")
@@ -18236,6 +18311,12 @@ class TUI:
                 _sc_tc = _tier_colors.get(_sc_tier, "250")
                 _sc_tier_str = " %s[Tier %s]%s" % (_ansi(chr(27) + "[38;5;%sm" % _sc_tc), _sc_tier, C.RESET)
             print(f"  🔄 {info_dim}Sidecar{C.RESET} {info_bright}{config.sidecar_model}{C.RESET}{_sc_tier_str}")
+        if role_models["utility"] and role_models["utility"] != (config.sidecar_model or ""):
+            print(f"  ⚙️  {info_dim}Utility{C.RESET} {info_bright}{role_models['utility']}{C.RESET}")
+        if role_models["compaction"] and role_models["compaction"] != role_models["utility"]:
+            print(f"  🗜️  {info_dim}Compact{C.RESET} {info_bright}{role_models['compaction']}{C.RESET}")
+        if role_models["subagent"] and role_models["subagent"] not in {role_models['utility'], role_models['compaction']}:
+            print(f"  🧩 {info_dim}Subagent{C.RESET} {info_bright}{role_models['subagent']}{C.RESET}")
         print(f"  🔒 {info_dim}Mode{C.RESET}   {mode_str}")
         # Network status
         if config.network_status == "online":
@@ -20238,10 +20319,10 @@ class Agent:
             policy["options"]["retry_temperature_boost"] = 0.3
         if (
             empty_retries >= 3
-            and self.config.sidecar_model
-            and self.config.sidecar_model != self.config.model
+            and _resolve_utility_model(self.config)
+            and _resolve_utility_model(self.config) != self.config.model
         ):
-            policy["model"] = self.config.sidecar_model
+            policy["model"] = _resolve_utility_model(self.config)
         if not policy["options"]:
             policy["options"] = None
         return policy
@@ -20637,8 +20718,9 @@ class Agent:
                         time.sleep(0.5)
                         continue
                     # Step 3: Sidecar model fallback
-                    if _empty_retries == 3 and self.config.sidecar_model and self.config.sidecar_model != self.config.model:
-                        _p(f"  {C.DIM}[fallback to sidecar: {self.config.sidecar_model}]{C.RESET}")
+                    _fallback_model = _resolve_utility_model(self.config)
+                    if _empty_retries == 3 and _fallback_model and _fallback_model != self.config.model:
+                        _p(f"  {C.DIM}[fallback to sidecar: {_fallback_model}]{C.RESET}")
                         time.sleep(0.5)
                         continue
                     # Step 4: Give up with actionable suggestions
@@ -20684,7 +20766,7 @@ class Agent:
                             self.session.add_system_note(
                                 "You modified files in this run but have not run a verification step yet. "
                                 "Before finishing, run ONE of: syntax check "
-                                "(python3 -c 'import py_compile; py_compile.compile(...)'), "
+                                "(python3 -c 'import py_compile; py_compile.compile(..., cfile=..., doraise=True)'), "
                                 "test suite (pytest / unittest), linter (ruff / flake8), or build command. "
                                 "If no test framework is installed, a syntax check is sufficient."
                             )
@@ -21401,7 +21483,7 @@ def _call_sidecar_for_suggestions(agent, config, client, system_prompt, user_pro
     """
     import json
 
-    sidecar_model = config.sidecar_model or os.environ.get('EVE_CLI_SIDECAR_MODEL', 'qwen3:8b')
+    sidecar_model = _resolve_utility_model(config) or os.environ.get('EVE_CLI_SIDECAR_MODEL', 'qwen3:8b')
 
     # Build messages
     messages = [
@@ -21977,7 +22059,7 @@ def main():
     # Wire auto-mode sidecar references
     if config.auto_mode and client:
         permissions._sidecar_client = client
-        permissions._sidecar_model = config.sidecar_model or config.model
+        permissions._sidecar_model = _resolve_utility_model(config)
     registry.register(SubAgentTool(config, client, registry, permissions, tui))
     coordinator = MultiAgentCoordinator(config, client, registry, permissions, tui)
     registry.register(ParallelAgentTool(coordinator))
@@ -22783,11 +22865,15 @@ def main():
                         _ok, fresh_models = client.check_connection()
                         avail = fresh_models if _ok else []
                         _tier, _ = Config.get_model_tier(config.model)
+                        _role_models = _role_model_snapshot(config)
                         _tier_str = f" (Tier {_tier})" if _tier else ""
                         print(f"\n  {C.BOLD}Current model:{C.RESET} {_ansi(chr(27)+'[38;5;51m')}{config.model}{_tier_str}{C.RESET}")
                         print(f"  {C.DIM}Context window: {config.context_window} tokens{C.RESET}")
                         if config.sidecar_model:
-                            print(f"  {C.DIM}Sidecar (compaction): {config.sidecar_model}{C.RESET}")
+                            print(f"  {C.DIM}Sidecar fallback: {config.sidecar_model}{C.RESET}")
+                        print(f"  {C.DIM}Utility model: {_role_models['utility'] or '(none)'}{C.RESET}")
+                        print(f"  {C.DIM}Compaction model: {_role_models['compaction'] or '(none)'}{C.RESET}")
+                        print(f"  {C.DIM}Subagent model: {_role_models['subagent'] or '(none)'}{C.RESET}")
                         if avail:
                             print(f"\n  {C.BOLD}Installed models:{C.RESET}")
                             _show_model_list(avail)
@@ -23926,8 +24012,12 @@ def main():
                             continue
                     
                     print(f"\n  {_c51x}━━ Configuration ━━━━━━━━━━━━━━━━━━{C.RESET}")
+                    _role_models = _role_model_snapshot(config)
                     print(f"  {_c87x}Model{C.RESET}         {config.model}")
                     print(f"  {_c87x}Sidecar{C.RESET}       {config.sidecar_model or '(none)'}")
+                    print(f"  {_c87x}Utility{C.RESET}       {_role_models['utility'] or '(none)'}")
+                    print(f"  {_c87x}Compaction{C.RESET}    {_role_models['compaction'] or '(none)'}")
+                    print(f"  {_c87x}Subagent{C.RESET}      {_role_models['subagent'] or '(none)'}")
                     print(f"  {_c87x}Host{C.RESET}          {config.ollama_host}")
                     print(f"  {_c87x}Temperature{C.RESET}   {config.temperature}")
                     print(f"  {_c87x}Max tokens{C.RESET}    {config.max_tokens}")
@@ -24837,7 +24927,7 @@ Review this code for:
             _evo = agent._evolution
         _evo.record_session_end()
         if _evo.should_generate_insights() and client:
-            _sidecar = config.sidecar_model or config.model
+            _sidecar = _resolve_utility_model(config)
             if _sidecar:
                 _evo.generate_insights(client, _sidecar)
     except Exception:

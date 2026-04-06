@@ -322,7 +322,7 @@ class TestAgentRuntimeControls(unittest.TestCase):
                             "function": {
                                 "name": "Bash",
                                 "arguments": json.dumps({
-                                    "command": "python3 -c \"import py_compile; py_compile.compile('generated.py', doraise=True)\"",
+                                    "command": "python3 -c \"import py_compile; py_compile.compile('generated.py', cfile='generated.pyc', doraise=True)\"",
                                 }),
                             },
                         }],
@@ -377,6 +377,16 @@ class TestAgentRuntimeControls(unittest.TestCase):
         policy = agent._resolve_request_policy([], empty_retries=3)
 
         self.assertEqual(policy["model"], "fallback-model")
+        self.assertEqual(policy["options"], {"retry_temperature_boost": 0.3})
+
+    def test_resolve_request_policy_prefers_utility_model_after_retries(self):
+        client = _SequenceClient([])
+        agent, _session = self.make_agent(client, [eve_coder.ReadTool(self.project_dir)])
+        agent.config.utility_model = "utility-fallback"
+
+        policy = agent._resolve_request_policy([], empty_retries=3)
+
+        self.assertEqual(policy["model"], "utility-fallback")
         self.assertEqual(policy["options"], {"retry_temperature_boost": 0.3})
 
 
