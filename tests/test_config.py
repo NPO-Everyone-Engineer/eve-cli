@@ -997,6 +997,18 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
         self.assertEqual(opts["num_predict"], 64)
         self.assertEqual(opts["temperature"], 0.2)
 
+    def test_tool_mode_caps_large_model_num_predict(self):
+        cfg = Config()
+        cfg.context_window = 262144
+        cfg.max_tokens = 32768
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client._merge_chat_options("qwen3.5:397b", 0.4, {"tool_mode": True})
+
+        self.assertEqual(opts["num_predict"], 4096)
+        self.assertEqual(opts["num_ctx"], 262144)
+        self.assertNotIn("tool_mode", opts)
+
     def test_temporary_reasoning_restores_client_settings(self):
         cfg = Config()
         cfg.think_mode = True

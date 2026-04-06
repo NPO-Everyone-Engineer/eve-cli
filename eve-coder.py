@@ -4735,11 +4735,14 @@ class OllamaClient:
     def _merge_chat_options(self, model, temperature, options=None):
         """Build Ollama options with model-optimized sampling parameters."""
         _tier, _ = Config.get_model_tier(model)
+        _tool_mode = bool((options or {}).get("tool_mode"))
 
         # Base num_predict; increase for thinking models
         _num_predict = self.max_tokens
         if self.think_mode is not False and _tier in ("S", "A"):
             _num_predict = max(_num_predict, 49152)  # 48K for thinking chain + output
+        if _tool_mode and _tier in ("S", "A"):
+            _num_predict = min(_num_predict, 4096)  # tool turns rarely need long completions
 
         merged = {
             "num_ctx": self.context_window,
@@ -4771,7 +4774,7 @@ class OllamaClient:
                 merged["num_predict"] = value
             elif key == "context_window":
                 merged["num_ctx"] = value
-            elif key == "retry_temperature_boost":
+            elif key in {"retry_temperature_boost", "tool_mode"}:
                 continue
             else:
                 merged[key] = value
@@ -4793,6 +4796,8 @@ class OllamaClient:
                 return cached
 
         request_options = dict(options or {})
+        if tools:
+            request_options["tool_mode"] = True
         temp = self._resolve_request_temperature(model, tools=bool(tools), options=request_options)
         if tools:
             # Auto-detect streaming with tools (Ollama 0.5+ supports this)
