@@ -90,7 +90,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 - **Thinking モード** — Qwen3.5 の拡張推論で複雑な問題を深く思考
 - **Headless モード** — CI/CD パイプラインから非対話で実行（stdin パイプ、`--max-turns`、`--carry-session` 対応）
 - **プロジェクトコンテキスト自動学習** — 言語・FW・リンター・テストFW を自動検出してキャッシュ、初回から文脈を理解
-- **コードレビュー** — `/review` コマンドでセキュリティ・パフォーマンス・保守性の構造化レビュー
+- **コードレビュー** — `/review` コマンドと Rubber Duck でセキュリティ・パフォーマンス・保守性の構造化レビュー
 - **Docker サンドボックス** — `--sandbox docker` で Bash コマンドをコンテナ内で安全に実行
 - **Extensions** — `eve-cli install <github-url>` でコミュニティ製スキル・MCP 設定を追加
 - GitHub 連携
@@ -108,7 +108,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | カテゴリ | 内容 |
 |---------|------|
 | **AI エージェント** | 複数の内蔵ツール、Plan/Act モード、Agent Teams、サブエージェント、Thinking モード |
-| **開発支援** | コミット自動生成、テスト生成、自動 Lint/Test、Repo Map、コードレビュー（`/review`）、GitHub 連携 |
+| **開発支援** | コミット自動生成、テスト生成、自動 Lint/Test、Repo Map、コードレビュー（`/review` / Rubber Duck）、GitHub 連携 |
 | **CI/CD** | Headless モード（stdin パイプ対応）、JSON 出力、`--max-turns`、`--carry-session`、ループモード |
 | **コンテキスト** | プロジェクト自動解析（言語・FW・リンター・テストFW 検出）、キャッシュ、コードインテリジェンス |
 | **Proactive** | KAIROS supervisor。heartbeat ごとに状況を観測し、`observe` / `suggest` / `active` モードで通知・承認待ち・低リスク自動実行を制御 |
@@ -131,6 +131,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | 1回だけ実行する | `eve-cli -p "テストを書いて実行して"` |
 | 自動テスト付きで使う | `eve-cli --autotest` |
 | Thinking モードで使う | `eve-cli --think` |
+| Rubber Duck を有効にする | `eve-cli --review-model gemma4:31b-cloud --rubber-duck` |
 | 学習モードで使う | `eve-cli --learn --level 4` |
 | CI/CD で実行する | `eve-cli --headless -p "lint修正して" -y --output-format json` |
 | stdin パイプで実行する | `echo "テスト実行" \| eve-cli --headless --output-format json` |
@@ -250,7 +251,7 @@ README は「最初の入口」に絞ってあります。
 | `tests/` | ループ実行、セキュリティ、メモリ互換、並列編集などの回帰テストです。 |
 | `dev/` | 開発用スタンドアロンスクリプトです。セキュリティ診断、パフォーマンス検証、アドホックな動作確認に使います。 |
 | `scripts/` | リリースや保守に使う補助スクリプトです。現在は `install-manifest.json` 更新用スクリプトを含みます。 |
-| `00_Docs/` | 実装メモ、機能提案、作業記録などの内部ドキュメント置き場です。安定版の利用ガイドは `docs/` を参照してください。 |
+| `tests/fixtures/` | 回帰テスト用の fixture・placeholder ファイル置き場です。catchup 系の存在確認テストもここを参照します。 |
 
 補足: `.eve-cli/` 配下の `rules/`（パスSスコープルール）、`skills/`、`agents/`、`hooks.json`、`mcp.json` はチーム共有のため git 追跡されます。`channels/`（Bot トークン）や `context/`（キャッシュ）は gitignore されます。詳細は [高度な機能](docs/advanced.md) をご覧ください。
 

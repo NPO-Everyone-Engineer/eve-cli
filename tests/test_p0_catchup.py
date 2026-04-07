@@ -153,7 +153,7 @@ class TestCatchupDocumentation(unittest.TestCase):
     def test_instruction_file_exists(self):
         """Test that catchup instruction file exists."""
         instruction_path = os.path.join(
-            SCRIPT_DIR, "00_Docs", "20260308_cli_catchup_instruction.md"
+            SCRIPT_DIR, "tests", "fixtures", "20260308_cli_catchup_instruction.md"
         )
         self.assertTrue(os.path.exists(instruction_path))
 
