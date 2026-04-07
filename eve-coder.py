@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.30.3"
+__version__ = "2.31.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -3351,6 +3351,7 @@ Rules:
   - ...
   ## Follow-up Checks
   - ...
+- Prefix every finding with `[blocking]` or `[non-blocking]`.
 - If there are no meaningful findings, write '- No major findings.' under Findings.
 - If there are no follow-up checks, write '- None.' under Follow-up Checks.
 """
@@ -3405,6 +3406,64 @@ def _parse_rubber_duck_sections(review_text):
     return findings, follow_up_checks, fallback
 
 
+def _split_rubber_duck_findings(findings):
+    blocking = []
+    non_blocking = []
+    for item in findings or ():
+        text = str(item or "").strip()
+        lowered = text.lower()
+        if lowered.startswith("[blocking]"):
+            blocking.append(text[len("[blocking]"):].strip())
+        elif lowered.startswith("[non-blocking]"):
+            non_blocking.append(text[len("[non-blocking]"):].strip())
+        elif re.search(r"\b(blocking|must[- ]fix|critical|security|correctness)\b", lowered):
+            blocking.append(text)
+        else:
+            non_blocking.append(text)
+    return blocking, non_blocking
+
+
+def _latest_rubber_duck_note(session):
+    for msg in reversed(getattr(session, "messages", []) or []):
+        content = str(msg.get("content", ""))
+        if "[Rubber Duck Review]" in content:
+            return content
+    return ""
+
+
+def _accept_rubber_duck_review(session, mode="all"):
+    review_note = _latest_rubber_duck_note(session)
+    if not review_note:
+        return False, "No Rubber Duck review available."
+    findings, follow_up_checks, _fallback = _parse_rubber_duck_sections(review_note)
+    blocking, non_blocking = _split_rubber_duck_findings(findings)
+    mode = (mode or "all").strip().lower()
+    if mode not in ("all", "blocking", "follow-up", "followup", "checks"):
+        mode = "all"
+
+    accepted_findings = []
+    accepted_checks = []
+    if mode == "blocking":
+        accepted_findings = blocking
+    elif mode in ("follow-up", "followup", "checks"):
+        accepted_checks = follow_up_checks
+    else:
+        accepted_findings = blocking + non_blocking
+        accepted_checks = follow_up_checks
+
+    lines = ["[Rubber Duck Accepted]"]
+    if accepted_findings:
+        lines.append("Address these accepted findings before finishing:")
+        lines.extend(f"- {item}" for item in accepted_findings)
+    if accepted_checks:
+        lines.append("Run or consider these follow-up checks:")
+        lines.extend(f"- {item}" for item in accepted_checks)
+    if not accepted_findings and not accepted_checks:
+        lines.append("- No actionable review items were selected.")
+    session.add_system_note("\n".join(lines))
+    return True, f"Accepted {len(accepted_findings)} finding(s) and {len(accepted_checks)} follow-up check(s)."
+
+
 def _publish_rubber_duck_review(config, session, tui, trigger, source_desc, model, review_text):
     if not review_text:
         return
@@ -3437,10 +3496,15 @@ def _publish_rubber_duck_review(config, session, tui, trigger, source_desc, mode
             pass
     if tui is not None:
         findings, follow_up_checks, fallback = _parse_rubber_duck_sections(review_text)
+        blocking, non_blocking = _split_rubber_duck_findings(findings)
         tui._scroll_print(f"\n{C.CYAN}Rubber Duck Review{C.RESET} {C.DIM}({source_desc}, {model}){C.RESET}")
         if findings or follow_up_checks:
-            tui._scroll_print(f"{C.BBLUE}Findings{C.RESET}")
-            tui._render_markdown("\n".join(f"- {item}" for item in (findings or ["No major findings."])))
+            if blocking:
+                tui._scroll_print(f"{C.RED}Blocking Findings{C.RESET}")
+                tui._render_markdown("\n".join(f"- {item}" for item in blocking))
+                tui._scroll_print("")
+            tui._scroll_print(f"{C.YELLOW}Non-blocking Findings{C.RESET}")
+            tui._render_markdown("\n".join(f"- {item}" for item in (non_blocking or (["No major findings."] if not blocking else ["None."]))))
             tui._scroll_print("")
             tui._scroll_print(f"{C.BBLUE}Follow-up Checks{C.RESET}")
             tui._render_markdown("\n".join(f"- {item}" for item in (follow_up_checks or ["None."])))
@@ -18483,7 +18547,7 @@ class TUI:
                     "/help", "/exit", "/quit", "/q", "/clear", "/model", "/models",
                     "/status", "/doctor", "/tool-pool", "/command-graph", "/bootstrap-graph",
                     "/save", "/compact", "/yes", "/no", "/tokens", "/usage",
-                    "/think", "/no-think", "/map", "/review", "/rubber-duck",
+                    "/think", "/no-think", "/map", "/review", "/rubber-duck", "/accept-review",
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/gentest", "/watch", "/skills",
@@ -20053,6 +20117,7 @@ class TUI:
   {_c198}/no-think{C.RESET}          Disable thinking mode
   {_c198}/review{C.RESET} [target]   Run a second-opinion review on current changes
   {_c198}/rubber-duck{C.RESET} [on|off|plan|post-edit|all] Toggle automatic second-opinion checkpoints
+  {_c198}/accept-review{C.RESET} [all|blocking|follow-up] Add the latest Rubber Duck advice back into context
   {_c198}/map{C.RESET}               Generate repo map and inject into AI context
   {_c198}/skills{C.RESET}            List loaded skills
   {_c198}/hooks{C.RESET}             List loaded hooks
@@ -23286,6 +23351,18 @@ def main():
                     print(f"  {C.DIM}Checkpoints: {_rubber_duck_checkpoint_summary(config)}{C.RESET}")
                     print(f"  {C.DIM}Reviewer model: {_resolve_review_model(config) or '(none)'}{C.RESET}")
                     continue
+                elif cmd in ("/accept-review", "/acceptreview"):
+                    sub = args.strip().lower() if args else "all"
+                    ok, message = _accept_rubber_duck_review(session, sub)
+                    if session.runtime_state and ok:
+                        session.runtime_state.update_runtime(
+                            last_rubber_duck_accept_mode=sub,
+                            last_rubber_duck_acknowledged_at=time.time(),
+                            updated_at=time.time(),
+                        )
+                    color = C.GREEN if ok else C.YELLOW
+                    print(f"  {color}{message}{C.RESET}")
+                    continue
                 elif cmd == "/tokens":
                     tokens = session.get_token_estimate()
                     msgs = len(session.messages)
@@ -25163,7 +25240,7 @@ Review this code for:
                         _all_cmds = ["/help", "/exit", "/quit", "/clear", "/model", "/models",
                                      "/status", "/doctor", "/tool-pool", "/command-graph", "/bootstrap-graph",
                                      "/save", "/compact", "/yes", "/no",
-                                     "/tokens", "/usage", "/think", "/no-think", "/map", "/review", "/rubber-duck",
+                                     "/tokens", "/usage", "/think", "/no-think", "/map", "/review", "/rubber-duck", "/accept-review",
                                      "/commit", "/diff", "/git", "/plan",
                                      "/approve", "/act", "/execute", "/undo", "/init",
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",

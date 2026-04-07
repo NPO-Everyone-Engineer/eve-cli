@@ -397,7 +397,7 @@ class TestAgentRuntimeControls(unittest.TestCase):
 
     def test_rubber_duck_review_uses_review_model_and_records_note(self):
         client = _SequenceClient([
-            {"choices": [{"message": {"content": "## Findings\n- Missing verification for edge case\n## Follow-up Checks\n- Run unit tests for the changed branch"}}]},
+            {"choices": [{"message": {"content": "## Findings\n- [blocking] Missing verification for edge case\n- [non-blocking] Consider a clearer variable name\n## Follow-up Checks\n- Run unit tests for the changed branch"}}]},
         ])
         agent, session = self.make_agent(client, [eve_coder.ReadTool(self.project_dir)])
         agent.config.rubber_duck = True
@@ -423,7 +423,11 @@ class TestAgentRuntimeControls(unittest.TestCase):
         self.assertEqual(runtime.get("rubber_duck_checkpoints"), "plan, post-edit")
         self.assertTrue(any("Rubber Duck Review" in str(m.get("content", "")) for m in session.messages))
         self.assertIn("- Missing verification for edge case", agent.tui.rendered[0])
-        self.assertIn("- Run unit tests for the changed branch", agent.tui.rendered[1])
+        self.assertIn("- Consider a clearer variable name", agent.tui.rendered[1])
+        self.assertIn("- Run unit tests for the changed branch", agent.tui.rendered[2])
+        printed = "\n".join(agent.tui.printed)
+        self.assertIn("Blocking Findings", printed)
+        self.assertIn("Non-blocking Findings", printed)
 
     def test_rubber_duck_review_respects_checkpoint_filter(self):
         client = _SequenceClient([
@@ -448,6 +452,33 @@ class TestAgentRuntimeControls(unittest.TestCase):
 
         self.assertEqual(review_text, "")
         self.assertEqual(client.calls, [])
+
+    def test_accept_rubber_duck_review_can_limit_to_blocking_items(self):
+        client = _SequenceClient([
+            {"choices": [{"message": {"content": "## Findings\n- [blocking] Fix failing syntax path\n- [non-blocking] Consider renaming helper\n## Follow-up Checks\n- Run smoke tests"}}]},
+        ])
+        agent, session = self.make_agent(client, [eve_coder.ReadTool(self.project_dir)])
+        agent.config.rubber_duck = True
+        agent.config.review_model = "review-model"
+
+        eve_coder._run_rubber_duck_review(
+            agent.config,
+            client,
+            session,
+            agent.tui,
+            trigger="post_edit",
+            source_kind="diff",
+            source_desc="uncommitted changes",
+            content="diff --git a/foo.py b/foo.py\n+print('hello')\n",
+            force=False,
+        )
+        ok, message = eve_coder._accept_rubber_duck_review(session, "blocking")
+
+        self.assertTrue(ok)
+        self.assertIn("Accepted 1 finding", message)
+        self.assertIn("Fix failing syntax path", session.messages[-1]["content"])
+        self.assertNotIn("Consider renaming helper", session.messages[-1]["content"])
+        self.assertNotIn("Run smoke tests", session.messages[-1]["content"])
 
 
 class TestInputPrompts(unittest.TestCase):
