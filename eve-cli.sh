@@ -21,10 +21,17 @@ STATE_DIR="${HOME}/.local/state/eve-cli"
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 
+# Prefer the checked-out repo script when available so new flags work without reinstall.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
+
 # --- 設定読み込み (安全なパーサー) ---
 CONFIG_FILE="${HOME}/.config/eve-cli/config"
 LIB_DIR="${HOME}/.local/lib/eve-cli"
-EVE_CODER_SCRIPT="${LIB_DIR}/eve-coder.py"
+INSTALLED_EVE_CODER_SCRIPT="${LIB_DIR}/eve-coder.py"
+EVE_CODER_SCRIPT="${SCRIPT_DIR}/eve-coder.py"
+if [ ! -f "$EVE_CODER_SCRIPT" ]; then
+    EVE_CODER_SCRIPT="$INSTALLED_EVE_CODER_SCRIPT"
+fi
 
 # デフォルト値
 MODEL=""
@@ -32,6 +39,9 @@ SIDECAR_MODEL=""
 OLLAMA_HOST="http://localhost:11434"
 EVE_CLI_DEBUG=0
 UI_THEME=""
+REVIEW_MODEL=""
+RUBBER_DUCK=0
+RUBBER_DUCK_CHECKPOINTS=""
 
 # [C1 fix] source ではなく grep + cut で既知キーのみ安全に読む
 # cut is safer than sed for values containing special characters
@@ -79,7 +89,6 @@ fi
 
 # --- eve-coder.py の探索 ---
 if [ ! -f "$EVE_CODER_SCRIPT" ]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
     if [ -n "$SCRIPT_DIR" ] && [ -f "${SCRIPT_DIR}/eve-coder.py" ]; then
         EVE_CODER_SCRIPT="${SCRIPT_DIR}/eve-coder.py"
     else
@@ -162,6 +171,26 @@ while [[ $# -gt 0 ]]; do
             UI_THEME="$2"
             shift 2
             ;;
+        --review-model)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --review-model requires an argument"
+                exit 1
+            fi
+            REVIEW_MODEL="$2"
+            shift 2
+            ;;
+        --rubber-duck)
+            RUBBER_DUCK=1
+            shift
+            ;;
+        --rubber-duck-checkpoints)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --rubber-duck-checkpoints requires an argument"
+                exit 1
+            fi
+            RUBBER_DUCK_CHECKPOINTS="$2"
+            shift 2
+            ;;
         -y|--yes|--dangerously-skip-permissions)
             YES_FLAG=1
             shift
@@ -197,6 +226,9 @@ for arg in "${EXTRA_ARGS[@]:-}"; do
         OLLAMA_HOST="$OLLAMA_HOST" \
         EVE_CLI_MODEL="${MODEL:-}" \
         EVE_CLI_SIDECAR_MODEL="${SIDECAR_MODEL:-}" \
+        EVE_CLI_REVIEW_MODEL="${REVIEW_MODEL:-}" \
+        EVE_CLI_RUBBER_DUCK="${RUBBER_DUCK:-0}" \
+        EVE_CLI_RUBBER_DUCK_CHECKPOINTS="${RUBBER_DUCK_CHECKPOINTS:-}" \
         EVE_CLI_DEBUG="${EVE_CLI_DEBUG:-0}" \
         exec python3 "$EVE_CODER_SCRIPT" --version
     fi
@@ -353,6 +385,9 @@ echo ""
 OLLAMA_HOST="$OLLAMA_HOST" \
 EVE_CLI_MODEL="${MODEL:-}" \
 EVE_CLI_SIDECAR_MODEL="${SIDECAR_MODEL:-}" \
+EVE_CLI_REVIEW_MODEL="${REVIEW_MODEL:-}" \
+EVE_CLI_RUBBER_DUCK="${RUBBER_DUCK:-0}" \
+EVE_CLI_RUBBER_DUCK_CHECKPOINTS="${RUBBER_DUCK_CHECKPOINTS:-}" \
 EVE_CLI_DEBUG="${EVE_CLI_DEBUG:-0}" \
 exec python3 "$EVE_CODER_SCRIPT" \
     ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} \

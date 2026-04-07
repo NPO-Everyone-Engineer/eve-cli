@@ -337,6 +337,10 @@ class TestSecurityHardening(unittest.TestCase):
         content = Path(SCRIPT_DIR, "eve-cli.sh").read_text(encoding="utf-8")
         self.assertIn("https://(ollama\\.com|www\\.ollama\\.com)(/api)?/?$", content)
         self.assertIn('if [[ "$arg" == "--version" ]]', content)
+        self.assertIn('EVE_CLI_REVIEW_MODEL="${REVIEW_MODEL:-}"', content)
+        self.assertIn('EVE_CLI_RUBBER_DUCK="${RUBBER_DUCK:-0}"', content)
+        self.assertIn('EVE_CLI_RUBBER_DUCK_CHECKPOINTS="${RUBBER_DUCK_CHECKPOINTS:-}"', content)
+        self.assertIn('EVE_CODER_SCRIPT="${SCRIPT_DIR}/eve-coder.py"', content)
 
     def test_install_manifest_hashes_match_repo_files(self):
         manifest = json.loads(Path(SCRIPT_DIR, "install-manifest.json").read_text(encoding="utf-8"))
