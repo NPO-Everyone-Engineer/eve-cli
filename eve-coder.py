@@ -1190,6 +1190,7 @@ class Config:
     DEFAULT_UTILITY_MODEL = ""
     DEFAULT_COMPACTION_MODEL = ""
     DEFAULT_SUBAGENT_MODEL = ""
+    DEFAULT_REVIEW_MODEL = ""
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
     DEFAULT_CONTEXT_WINDOW = 65536
@@ -1209,6 +1210,7 @@ class Config:
         self.utility_model = self.DEFAULT_UTILITY_MODEL
         self.compaction_model = self.DEFAULT_COMPACTION_MODEL
         self.subagent_model = self.DEFAULT_SUBAGENT_MODEL
+        self.review_model = self.DEFAULT_REVIEW_MODEL
         self.max_tokens = self.DEFAULT_MAX_TOKENS
         self.temperature = self.DEFAULT_TEMPERATURE
         self.context_window = self.DEFAULT_CONTEXT_WINDOW
@@ -1233,6 +1235,7 @@ class Config:
         self._cli_utility_model_set = False
         self._cli_compaction_model_set = False
         self._cli_subagent_model_set = False
+        self._cli_review_model_set = False
         self._cli_ollama_host_set = False
         self._cli_max_tokens_set = False
         self._cli_temperature_set = False
@@ -1240,6 +1243,7 @@ class Config:
         self.think_mode = None          # None=auto, True=force on, False=force off
         self._cli_think_mode_set = False
         self.thinking_budget = None     # --thinking-budget (max thinking tokens)
+        self.rubber_duck = False
 
         # RAG options
         self.rag = False
@@ -1413,6 +1417,9 @@ class Config:
                     elif key == "SUBAGENT_MODEL" and val:
                         self.subagent_model = val
                         self._cli_subagent_model_set = True
+                    elif key == "REVIEW_MODEL" and val:
+                        self.review_model = val
+                        self._cli_review_model_set = True
                     elif key == "OLLAMA_HOST" and val:
                         self.ollama_host = val
                     elif key == "OLLAMA_API_KEY" and val:
@@ -1493,6 +1500,8 @@ class Config:
                         _SHOW_PROGRESS = val.lower() in ("true", "1", "yes")
                     elif key == "UI_THEME" and val:
                         self.ui_theme = val
+                    elif key == "RUBBER_DUCK" and val:
+                        self.rubber_duck = val.lower() in ("true", "1", "yes", "on")
         except (OSError, IOError):
             pass  # Config file unreadable — skip silently
 
@@ -1523,6 +1532,11 @@ class Config:
         if os.environ.get("EVE_CLI_SUBAGENT_MODEL"):
             self._cli_subagent_model_set = True
             self.subagent_model = os.environ["EVE_CLI_SUBAGENT_MODEL"]
+        if os.environ.get("EVE_CLI_REVIEW_MODEL"):
+            self._cli_review_model_set = True
+            self.review_model = os.environ["EVE_CLI_REVIEW_MODEL"]
+        if _env_truthy("EVE_CLI_RUBBER_DUCK"):
+            self.rubber_duck = True
         if os.environ.get("EVE_CODER_MAX_AGENT_STEPS"):
             parsed = self._normalize_max_agent_steps(os.environ["EVE_CODER_MAX_AGENT_STEPS"])
             if parsed is not None:
@@ -1618,6 +1632,7 @@ class Config:
         )
         parser.add_argument("-p", "--prompt", help=t('help.prompt', default="One-shot prompt (non-interactive)"))
         parser.add_argument("-m", "--model", help=t('help.model', default="Ollama model name"))
+        parser.add_argument("--review-model", help="Model to use for second-opinion reviews (/review, rubber-duck)")
         parser.add_argument("-y", "--yes", action="store_true", help=t('help.yes', default="Auto-approve all tool calls"))
         parser.add_argument("--debug", action="store_true", help=t('help.debug', default="Debug mode"))
         parser.add_argument("--resume", action="store_true", help=t('help.resume', default="Resume last session"))
@@ -1712,6 +1727,8 @@ class Config:
         # Auto mode (sidecar-based permission classification)
         parser.add_argument("-a", "--auto-mode", action="store_true", default=False,
                             help="Auto-approve safe tool calls using sidecar model classification")
+        parser.add_argument("--rubber-duck", action="store_true", default=False,
+                            help="Enable automatic second-opinion reviews at key checkpoints")
         # MCP server mode
         parser.add_argument("--mcp-server", action="store_true", default=False,
                             help="Run as MCP server (JSON-RPC 2.0 over stdio)")
@@ -1722,6 +1739,9 @@ class Config:
         if args.model:
             self.model = args.model
             self._cli_model_set = True
+        if args.review_model:
+            self.review_model = args.review_model
+            self._cli_review_model_set = True
         if args.yes or args.dangerously_skip_permissions:
             self.yes_mode = True
         if args.debug:
@@ -1761,6 +1781,8 @@ class Config:
                 self.max_agent_steps = parsed
         if args.profile:
             self.profile = args.profile
+        if args.rubber_duck:
+            self.rubber_duck = True
         # RAG args
         if args.rag:
             self.rag = True
@@ -2026,6 +2048,11 @@ class Config:
         if prof.get("SUBAGENT_MODEL") and not self._cli_subagent_model_set:
             self.subagent_model = prof["SUBAGENT_MODEL"]
             self._cli_subagent_model_set = True
+        if prof.get("REVIEW_MODEL") and not self._cli_review_model_set:
+            self.review_model = prof["REVIEW_MODEL"]
+            self._cli_review_model_set = True
+        if "RUBBER_DUCK" in prof:
+            self.rubber_duck = str(prof["RUBBER_DUCK"]).strip().lower() in ("true", "1", "yes", "on")
         if prof.get("OLLAMA_HOST") and not self._cli_ollama_host_set:
             self.ollama_host = prof["OLLAMA_HOST"]
         if prof.get("OLLAMA_API_KEY"):
@@ -2259,7 +2286,7 @@ class Config:
         self.notify_on = _normalize_notify_events(self.notify_on)
         # Validate model names — reject shell metacharacters / path traversal
         _SAFE_MODEL_RE = re.compile(r'^[a-zA-Z0-9_.:\-/]+$')
-        for attr in ("model", "sidecar_model", "utility_model", "compaction_model", "subagent_model"):
+        for attr in ("model", "sidecar_model", "utility_model", "compaction_model", "subagent_model", "review_model"):
             val = getattr(self, attr, "")
             if val and not _SAFE_MODEL_RE.match(val):
                 msg = t('warnings.invalid_model_name', default=f"Warning: invalid {attr} name {val!r} — resetting to default.")
@@ -3216,6 +3243,129 @@ Produce a Markdown table followed by a summary:
 
 _REVIEW_MAX_DIFF_BYTES = 100_000  # 100KB cap for diff content
 
+_RUBBER_DUCK_SYSTEM_PROMPT = """You are Rubber Duck, a second-opinion reviewer for another coding model.
+
+Your job is to pressure-test the plan or diff you are given and surface the most important blind spots.
+
+Focus on:
+1. correctness and likely bugs
+2. security and safety risks
+3. missing tests or verification
+4. maintainability or design concerns
+5. one better alternative when it materially improves the outcome
+
+Rules:
+- Report at most 5 findings.
+- Be concrete and cite evidence from the provided content.
+- Prefer high-signal issues over stylistic nits.
+- If the work looks sound, say so explicitly and list at most 2 follow-up checks.
+- Do not ask the user questions.
+"""
+
+
+def _normalize_review_input(content, max_bytes=80_000):
+    text = str(content or "").strip()
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return text
+    clipped = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return clipped + "\n\n... [review input truncated]"
+
+
+def _extract_plain_response_text(resp):
+    if not isinstance(resp, dict):
+        return ""
+    choices = resp.get("choices", [])
+    if not choices:
+        return ""
+    text = choices[0].get("message", {}).get("content", "") or ""
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3:
+            text = "\n".join(lines[1:-1]).strip()
+    return text.strip()
+
+
+def _publish_rubber_duck_review(config, session, tui, trigger, source_desc, model, review_text):
+    if not review_text:
+        return
+    note = (
+        f"[Rubber Duck Review]\n"
+        f"trigger: {trigger}\n"
+        f"source: {source_desc}\n"
+        f"model: {model}\n\n"
+        f"{review_text}"
+    )
+    session.add_system_note(note)
+    if session.runtime_state:
+        count = int(session.runtime_state.get_meta("rubber_duck_review_count", 0) or 0) + 1
+        session.runtime_state.update_runtime(
+            rubber_duck_enabled=bool(getattr(config, "rubber_duck", False)),
+            last_rubber_duck_trigger=trigger,
+            last_rubber_duck_source=source_desc,
+            last_rubber_duck_model=model,
+            last_rubber_duck_summary=_summarize_output_text(review_text, 500),
+            rubber_duck_review_count=count,
+            updated_at=time.time(),
+        )
+        try:
+            session.runtime_state.record_resume_event(
+                "rubber_duck_review",
+                f"{trigger}: {_summarize_output_text(review_text, 180)}",
+            )
+        except Exception:
+            pass
+    if tui is not None:
+        tui._scroll_print(f"\n{C.CYAN}Rubber Duck Review{C.RESET} {C.DIM}({source_desc}, {model}){C.RESET}")
+        tui._render_markdown(review_text)
+        tui._scroll_print("")
+
+
+def _run_rubber_duck_review(config, client, session, tui, *, trigger, source_kind, source_desc, content, force=False):
+    if not force and not getattr(config, "rubber_duck", False):
+        return ""
+    review_model = _resolve_review_model(config)
+    normalized = _normalize_review_input(content)
+    if not review_model or not normalized:
+        return ""
+    review_prompt = (
+        f"Review this {source_kind} and give a concise second opinion.\n\n"
+        f"## Source\n"
+        f"{source_desc}\n\n"
+        f"## Content\n"
+        f"```text\n{normalized}\n```"
+    )
+    messages = [
+        {"role": "system", "content": _RUBBER_DUCK_SYSTEM_PROMPT},
+        {"role": "user", "content": review_prompt},
+    ]
+    try:
+        if hasattr(client, "build_utility_options"):
+            opts = client.build_utility_options(review_model, "review", 0.2)
+        else:
+            opts = {"temperature": 0.2, "max_tokens": 1024}
+        ctx = (
+            client.temporary_reasoning(False, None)
+            if hasattr(client, "temporary_reasoning")
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            resp = client.chat(
+                model=review_model,
+                messages=messages,
+                tools=None,
+                stream=False,
+                options=opts,
+            )
+        review_text = _extract_plain_response_text(resp)
+    except Exception:
+        return ""
+    if not review_text:
+        return ""
+    _publish_rubber_duck_review(config, session, tui, trigger, source_desc, review_model, review_text)
+    return review_text
+
 
 def _get_review_diff(cwd, target=None):
     """Get diff content for code review.
@@ -3294,20 +3444,19 @@ def _run_code_review(config, agent, session, tui, target=None):
         return
 
     print(f"  {C.CYAN}Reviewing {desc}...{C.RESET}")
-
-    # Build review prompt with diff content
-    review_prompt = (
-        f"{_REVIEW_SYSTEM_PROMPT}\n\n"
-        f"## Diff to Review ({desc})\n"
-        f"```diff\n{diff}\n```\n\n"
-        f"Analyze this diff and produce the structured review table."
+    review_text = _run_rubber_duck_review(
+        config,
+        agent.client,
+        session,
+        tui,
+        trigger="manual_review",
+        source_kind="diff",
+        source_desc=desc,
+        content=diff,
+        force=True,
     )
-
-    session.add_user_message(review_prompt)
-    try:
-        agent.run(review_prompt)
-    except Exception as e:
-        print(f"  {C.RED}Review failed: {e}{C.RESET}")
+    if not review_text:
+        print(f"  {C.YELLOW}Review failed or produced no findings.{C.RESET}")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -4333,6 +4482,7 @@ class OllamaClient:
         "suggestions": {"context_window": 8192, "max_tokens": 512},
         "summary": {"context_window": 16384, "max_tokens": 1024},
         "insights": {"context_window": 16384, "max_tokens": 768},
+        "review": {"context_window": 32768, "max_tokens": 1536},
     }
 
     def __init__(self, config):
@@ -15371,11 +15521,21 @@ def _resolve_subagent_model(config, persona_model=""):
     )
 
 
+def _resolve_review_model(config):
+    return (
+        _config_value(config, "review_model", "")
+        or _config_value(config, "utility_model", "")
+        or _config_value(config, "sidecar_model", "")
+        or _config_value(config, "model", "")
+    )
+
+
 def _role_model_snapshot(config):
     return {
         "utility": _resolve_utility_model(config),
         "compaction": _resolve_compaction_model(config),
         "subagent": _resolve_subagent_model(config),
+        "review": _resolve_review_model(config),
     }
 
 
@@ -18193,7 +18353,7 @@ class TUI:
                     "/help", "/exit", "/quit", "/q", "/clear", "/model", "/models",
                     "/status", "/doctor", "/tool-pool", "/command-graph", "/bootstrap-graph",
                     "/save", "/compact", "/yes", "/no", "/tokens", "/usage",
-                    "/think", "/no-think", "/map",
+                    "/think", "/no-think", "/map", "/review", "/rubber-duck",
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/gentest", "/watch", "/skills",
@@ -18317,6 +18477,10 @@ class TUI:
             print(f"  🗜️  {info_dim}Compact{C.RESET} {info_bright}{role_models['compaction']}{C.RESET}")
         if role_models["subagent"] and role_models["subagent"] not in {role_models['utility'], role_models['compaction']}:
             print(f"  🧩 {info_dim}Subagent{C.RESET} {info_bright}{role_models['subagent']}{C.RESET}")
+        if role_models["review"] and role_models["review"] not in {role_models['utility'], role_models['compaction'], role_models['subagent']}:
+            print(f"  🦆 {info_dim}Review{C.RESET} {info_bright}{role_models['review']}{C.RESET}")
+        if getattr(config, "rubber_duck", False):
+            print(f"  🪶 {info_dim}Rubber Duck{C.RESET} {info_bright}ON{C.RESET}")
         print(f"  🔒 {info_dim}Mode{C.RESET}   {mode_str}")
         # Network status
         if config.network_status == "online":
@@ -19754,6 +19918,8 @@ class TUI:
   {_c198}/watch{C.RESET}             Toggle file watcher
   {_c198}/think{C.RESET}             Enable thinking mode (Qwen3 extended reasoning)
   {_c198}/no-think{C.RESET}          Disable thinking mode
+  {_c198}/review{C.RESET} [target]   Run a second-opinion review on current changes
+  {_c198}/rubber-duck{C.RESET} [on|off] Toggle automatic second-opinion checkpoints
   {_c198}/map{C.RESET}               Generate repo map and inject into AI context
   {_c198}/skills{C.RESET}            List loaded skills
   {_c198}/hooks{C.RESET}             List loaded hooks
@@ -19988,6 +20154,8 @@ class Agent:
         self._pending_verification = bool(self._modified_file_paths)
         self._verification_reminders = 0
         self._repo_map_injected = bool(runtime_meta.get("repo_map_injected", False))
+        self._modification_generation = 1 if self._modified_file_paths else 0
+        self._last_rubber_duck_review_generation = self._modification_generation
 
         # Store last assistant output for loop mode completion detection
         self._last_output: str = ""
@@ -20422,6 +20590,7 @@ class Agent:
         if tool_name in self.READ_BEFORE_WRITE_TOOLS and tracked_paths and not is_error:
             self._known_file_paths.update(tracked_paths)
             self._modified_file_paths.update(tracked_paths)
+            self._modification_generation += 1
             self._pending_verification = True
             self._verification_reminders = 0
             self._update_runtime_phase(
@@ -20443,6 +20612,31 @@ class Agent:
                         _summarize_output_text(output, 500),
                     )
                 self._mark_verification_status(passed, command, output, source="manual")
+
+    def _maybe_run_rubber_duck_review(self, trigger, source_kind, source_desc, content):
+        if not getattr(self.config, "rubber_duck", False):
+            return False
+        review_text = _run_rubber_duck_review(
+            self.config,
+            self.client,
+            self.session,
+            self.tui,
+            trigger=trigger,
+            source_kind=source_kind,
+            source_desc=source_desc,
+            content=content,
+            force=False,
+        )
+        if not review_text:
+            return False
+        self._last_rubber_duck_review_generation = self._modification_generation
+        self._update_runtime_phase(
+            "second_opinion",
+            resume_hint="review rubber duck findings",
+            verification_required=self._pending_verification,
+            pending_verification=self._relativize_paths(self._modified_file_paths),
+        )
+        return True
 
     def _maybe_inject_repo_map_context(self, route_candidates):
         if self._repo_map_injected or not self.code_intel or not route_candidates:
@@ -20755,6 +20949,16 @@ class Agent:
                 # 4. If no tool calls, we're done
                 if not tool_calls:
                     if self._pending_verification and iteration < self.max_iterations - 1:
+                        if self._last_rubber_duck_review_generation < self._modification_generation:
+                            diff, desc = _get_review_diff(self.config.cwd)
+                            if diff:
+                                if self._maybe_run_rubber_duck_review(
+                                    "post_edit",
+                                    "diff",
+                                    desc,
+                                    diff,
+                                ):
+                                    continue
                         if self._verification_reminders < 2:
                             self._verification_reminders += 1
                             self._update_runtime_phase(
@@ -21605,6 +21809,17 @@ def _exit_plan_mode(agent, session):
         session.add_system_note(
             "[Act Mode] The following plan was created in Plan mode. Implement it step by step.\n\n"
             + plan_content
+        )
+        _run_rubber_duck_review(
+            agent.config,
+            agent.client,
+            session,
+            agent.tui,
+            trigger="plan_approved",
+            source_kind="plan",
+            source_desc=plan_name,
+            content=plan_content,
+            force=False,
         )
     if session.runtime_state:
         session.runtime_state.update_runtime(
@@ -22907,6 +23122,24 @@ def main():
                     client.think_mode = False
                     print(f"{C.GREEN}Thinking mode disabled. The model will respond without extended reasoning.{C.RESET}")
                     continue
+                elif cmd in ("/rubber-duck", "/rubberduck"):
+                    sub = args.strip().lower() if args else ""
+                    if sub in ("on", "enable", "enabled"):
+                        config.rubber_duck = True
+                    elif sub in ("off", "disable", "disabled"):
+                        config.rubber_duck = False
+                    else:
+                        config.rubber_duck = not config.rubber_duck
+                    if session.runtime_state:
+                        session.runtime_state.update_runtime(
+                            rubber_duck_enabled=config.rubber_duck,
+                            last_rubber_duck_model=_resolve_review_model(config),
+                            updated_at=time.time(),
+                        )
+                    status = f"{C.GREEN}ON{C.RESET}" if config.rubber_duck else f"{C.RED}OFF{C.RESET}"
+                    print(f"  Rubber Duck: {status}")
+                    print(f"  {C.DIM}Reviewer model: {_resolve_review_model(config) or '(none)'}{C.RESET}")
+                    continue
                 elif cmd == "/tokens":
                     tokens = session.get_token_estimate()
                     msgs = len(session.messages)
@@ -24018,6 +24251,8 @@ def main():
                     print(f"  {_c87x}Utility{C.RESET}       {_role_models['utility'] or '(none)'}")
                     print(f"  {_c87x}Compaction{C.RESET}    {_role_models['compaction'] or '(none)'}")
                     print(f"  {_c87x}Subagent{C.RESET}      {_role_models['subagent'] or '(none)'}")
+                    print(f"  {_c87x}Review{C.RESET}        {_role_models['review'] or '(none)'}")
+                    print(f"  {_c87x}Rubber Duck{C.RESET}   {'ON' if config.rubber_duck else 'OFF'}")
                     print(f"  {_c87x}Host{C.RESET}          {config.ollama_host}")
                     print(f"  {_c87x}Temperature{C.RESET}   {config.temperature}")
                     print(f"  {_c87x}Max tokens{C.RESET}    {config.max_tokens}")
@@ -24781,7 +25016,7 @@ Review this code for:
                         _all_cmds = ["/help", "/exit", "/quit", "/clear", "/model", "/models",
                                      "/status", "/doctor", "/tool-pool", "/command-graph", "/bootstrap-graph",
                                      "/save", "/compact", "/yes", "/no",
-                                     "/tokens", "/usage", "/think", "/no-think", "/map",
+                                     "/tokens", "/usage", "/think", "/no-think", "/map", "/review", "/rubber-duck",
                                      "/commit", "/diff", "/git", "/plan",
                                      "/approve", "/act", "/execute", "/undo", "/init",
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",

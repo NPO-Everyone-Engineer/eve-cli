@@ -41,6 +41,12 @@ class TestConfigDefaults(unittest.TestCase):
     def test_default_sidecar_model(self):
         self.assertEqual(self.cfg.sidecar_model, "gemma4:31b-cloud")
 
+    def test_default_review_model(self):
+        self.assertEqual(self.cfg.review_model, "")
+
+    def test_default_rubber_duck_disabled(self):
+        self.assertFalse(self.cfg.rubber_duck)
+
     def test_default_max_tokens(self):
         self.assertEqual(self.cfg.max_tokens, 8192)
 
@@ -234,12 +240,16 @@ class TestParseConfigFile(unittest.TestCase):
             UTILITY_MODEL = qwen3:8b
             COMPACTION_MODEL = gemma4:31b
             SUBAGENT_MODEL = qwen3.5:32b
+            REVIEW_MODEL = gemma4:31b-cloud
+            RUBBER_DUCK = true
         """)
         try:
             self.cfg._parse_config_file(path)
             self.assertEqual(self.cfg.utility_model, "qwen3:8b")
             self.assertEqual(self.cfg.compaction_model, "gemma4:31b")
             self.assertEqual(self.cfg.subagent_model, "qwen3.5:32b")
+            self.assertEqual(self.cfg.review_model, "gemma4:31b-cloud")
+            self.assertTrue(self.cfg.rubber_duck)
         finally:
             os.unlink(path)
 
@@ -640,12 +650,16 @@ class TestLoadEnv(unittest.TestCase):
             EVE_CLI_UTILITY_MODEL="util-v1",
             EVE_CLI_COMPACTION_MODEL="compact-v1",
             EVE_CLI_SUBAGENT_MODEL="sub-v1",
+            EVE_CLI_REVIEW_MODEL="review-v1",
+            EVE_CLI_RUBBER_DUCK="1",
         )
         with patch.dict(os.environ, env):
             self.cfg._load_env()
         self.assertEqual(self.cfg.utility_model, "util-v1")
         self.assertEqual(self.cfg.compaction_model, "compact-v1")
         self.assertEqual(self.cfg.subagent_model, "sub-v1")
+        self.assertEqual(self.cfg.review_model, "review-v1")
+        self.assertTrue(self.cfg.rubber_duck)
 
     def test_max_agent_steps_from_env(self):
         env = self._make_env(EVE_CLI_MAX_AGENT_STEPS="150")
@@ -730,6 +744,15 @@ class TestLoadCliArgs(unittest.TestCase):
         self.cfg._load_cli_args(["-m", "qwen3:8b"])
         self.assertEqual(self.cfg.model, "qwen3:8b")
         self.assertTrue(self.cfg._cli_model_set)
+
+    def test_review_model_flag(self):
+        self.cfg._load_cli_args(["--review-model", "gemma4:31b"])
+        self.assertEqual(self.cfg.review_model, "gemma4:31b")
+        self.assertTrue(self.cfg._cli_review_model_set)
+
+    def test_rubber_duck_flag(self):
+        self.cfg._load_cli_args(["--rubber-duck"])
+        self.assertTrue(self.cfg.rubber_duck)
 
     def test_yes_flag(self):
         self.cfg._load_cli_args(["-y"])
@@ -1263,14 +1286,18 @@ class TestLoadConfigFile(unittest.TestCase):
         cfg.utility_model = "cli-utility"
         cfg.compaction_model = "cli-compaction"
         cfg.subagent_model = "cli-subagent"
+        cfg.review_model = "cli-review"
         cfg._cli_utility_model_set = True
         cfg._cli_compaction_model_set = True
         cfg._cli_subagent_model_set = True
+        cfg._cli_review_model_set = True
         cfg._profiles = {
             "online": {
                 "UTILITY_MODEL": "profile-utility",
                 "COMPACTION_MODEL": "profile-compaction",
                 "SUBAGENT_MODEL": "profile-subagent",
+                "REVIEW_MODEL": "profile-review",
+                "RUBBER_DUCK": "true",
             }
         }
 
@@ -1279,6 +1306,8 @@ class TestLoadConfigFile(unittest.TestCase):
         self.assertEqual(cfg.utility_model, "cli-utility")
         self.assertEqual(cfg.compaction_model, "cli-compaction")
         self.assertEqual(cfg.subagent_model, "cli-subagent")
+        self.assertEqual(cfg.review_model, "cli-review")
+        self.assertTrue(cfg.rubber_duck)
 
 
 class TestModelRoleResolution(unittest.TestCase):
@@ -1301,6 +1330,14 @@ class TestModelRoleResolution(unittest.TestCase):
         self.assertEqual(eve_coder._resolve_subagent_model(cfg), "qwen3:8b")
         cfg.subagent_model = "qwen3.5:32b"
         self.assertEqual(eve_coder._resolve_subagent_model(cfg), "qwen3.5:32b")
+
+    def test_review_model_prefers_explicit_then_utility(self):
+        cfg = Config()
+        cfg.sidecar_model = "gemma4:31b"
+        cfg.utility_model = "qwen3:8b"
+        self.assertEqual(eve_coder._resolve_review_model(cfg), "qwen3:8b")
+        cfg.review_model = "gemma4:31b-cloud"
+        self.assertEqual(eve_coder._resolve_review_model(cfg), "gemma4:31b-cloud")
 
 
 if __name__ == "__main__":

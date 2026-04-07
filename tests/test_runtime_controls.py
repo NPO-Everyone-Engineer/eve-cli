@@ -389,6 +389,33 @@ class TestAgentRuntimeControls(unittest.TestCase):
         self.assertEqual(policy["model"], "utility-fallback")
         self.assertEqual(policy["options"], {"retry_temperature_boost": 0.3})
 
+    def test_rubber_duck_review_uses_review_model_and_records_note(self):
+        client = _SequenceClient([
+            {"choices": [{"message": {"content": "- High | Tests | Missing verification for edge case"}}]},
+        ])
+        agent, session = self.make_agent(client, [eve_coder.ReadTool(self.project_dir)])
+        agent.config.rubber_duck = True
+        agent.config.review_model = "review-model"
+
+        review_text = eve_coder._run_rubber_duck_review(
+            agent.config,
+            client,
+            session,
+            agent.tui,
+            trigger="manual_review",
+            source_kind="diff",
+            source_desc="uncommitted changes",
+            content="diff --git a/foo.py b/foo.py\n+print('hello')\n",
+            force=False,
+        )
+
+        self.assertIn("Missing verification", review_text)
+        self.assertEqual(client.calls[0]["model"], "review-model")
+        runtime = session.runtime_state.load_runtime()
+        self.assertEqual(runtime.get("last_rubber_duck_model"), "review-model")
+        self.assertEqual(runtime.get("last_rubber_duck_trigger"), "manual_review")
+        self.assertTrue(any("Rubber Duck Review" in str(m.get("content", "")) for m in session.messages))
+
 
 class TestInputPrompts(unittest.TestCase):
     def setUp(self):
