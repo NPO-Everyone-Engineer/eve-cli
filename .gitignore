@@ -72,5 +72,7 @@ make.md
 !.eve-cli/commands/*.md
 !.eve-cli/agents/*.md
 
-# 00_Docs/ は開発者向けメモ（gitignore 対象）
-00_Docs/
+# 00_Docs/ は開発者向けメモ（原則 gitignore）。
+# ただし catchup 回帰テスト用のプレースホルダだけは追跡を維持する。
+00_Docs/*
+!00_Docs/20260308_cli_catchup_instruction.md
