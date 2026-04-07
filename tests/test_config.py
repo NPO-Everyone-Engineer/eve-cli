@@ -47,6 +47,9 @@ class TestConfigDefaults(unittest.TestCase):
     def test_default_rubber_duck_disabled(self):
         self.assertFalse(self.cfg.rubber_duck)
 
+    def test_default_rubber_duck_checkpoints(self):
+        self.assertEqual(self.cfg.rubber_duck_checkpoints, "plan,post-edit")
+
     def test_default_max_tokens(self):
         self.assertEqual(self.cfg.max_tokens, 8192)
 
@@ -242,6 +245,7 @@ class TestParseConfigFile(unittest.TestCase):
             SUBAGENT_MODEL = qwen3.5:32b
             REVIEW_MODEL = gemma4:31b-cloud
             RUBBER_DUCK = true
+            RUBBER_DUCK_CHECKPOINTS = plan
         """)
         try:
             self.cfg._parse_config_file(path)
@@ -250,6 +254,7 @@ class TestParseConfigFile(unittest.TestCase):
             self.assertEqual(self.cfg.subagent_model, "qwen3.5:32b")
             self.assertEqual(self.cfg.review_model, "gemma4:31b-cloud")
             self.assertTrue(self.cfg.rubber_duck)
+            self.assertEqual(self.cfg.rubber_duck_checkpoints, "plan")
         finally:
             os.unlink(path)
 
@@ -652,6 +657,7 @@ class TestLoadEnv(unittest.TestCase):
             EVE_CLI_SUBAGENT_MODEL="sub-v1",
             EVE_CLI_REVIEW_MODEL="review-v1",
             EVE_CLI_RUBBER_DUCK="1",
+            EVE_CLI_RUBBER_DUCK_CHECKPOINTS="post-edit",
         )
         with patch.dict(os.environ, env):
             self.cfg._load_env()
@@ -660,6 +666,7 @@ class TestLoadEnv(unittest.TestCase):
         self.assertEqual(self.cfg.subagent_model, "sub-v1")
         self.assertEqual(self.cfg.review_model, "review-v1")
         self.assertTrue(self.cfg.rubber_duck)
+        self.assertEqual(self.cfg.rubber_duck_checkpoints, "post-edit")
 
     def test_max_agent_steps_from_env(self):
         env = self._make_env(EVE_CLI_MAX_AGENT_STEPS="150")
@@ -753,6 +760,10 @@ class TestLoadCliArgs(unittest.TestCase):
     def test_rubber_duck_flag(self):
         self.cfg._load_cli_args(["--rubber-duck"])
         self.assertTrue(self.cfg.rubber_duck)
+
+    def test_rubber_duck_checkpoints_flag(self):
+        self.cfg._load_cli_args(["--rubber-duck-checkpoints", "plan"])
+        self.assertEqual(self.cfg.rubber_duck_checkpoints, "plan")
 
     def test_yes_flag(self):
         self.cfg._load_cli_args(["-y"])
@@ -1298,6 +1309,7 @@ class TestLoadConfigFile(unittest.TestCase):
                 "SUBAGENT_MODEL": "profile-subagent",
                 "REVIEW_MODEL": "profile-review",
                 "RUBBER_DUCK": "true",
+                "RUBBER_DUCK_CHECKPOINTS": "post-edit",
             }
         }
 
@@ -1308,6 +1320,7 @@ class TestLoadConfigFile(unittest.TestCase):
         self.assertEqual(cfg.subagent_model, "cli-subagent")
         self.assertEqual(cfg.review_model, "cli-review")
         self.assertTrue(cfg.rubber_duck)
+        self.assertEqual(cfg.rubber_duck_checkpoints, "post-edit")
 
 
 class TestModelRoleResolution(unittest.TestCase):

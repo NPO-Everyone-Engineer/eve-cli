@@ -1191,6 +1191,7 @@ class Config:
     DEFAULT_COMPACTION_MODEL = ""
     DEFAULT_SUBAGENT_MODEL = ""
     DEFAULT_REVIEW_MODEL = ""
+    DEFAULT_RUBBER_DUCK_CHECKPOINTS = "plan,post-edit"
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
     DEFAULT_CONTEXT_WINDOW = 65536
@@ -1244,6 +1245,7 @@ class Config:
         self._cli_think_mode_set = False
         self.thinking_budget = None     # --thinking-budget (max thinking tokens)
         self.rubber_duck = False
+        self.rubber_duck_checkpoints = self.DEFAULT_RUBBER_DUCK_CHECKPOINTS
 
         # RAG options
         self.rag = False
@@ -1502,6 +1504,10 @@ class Config:
                         self.ui_theme = val
                     elif key == "RUBBER_DUCK" and val:
                         self.rubber_duck = val.lower() in ("true", "1", "yes", "on")
+                    elif key == "RUBBER_DUCK_CHECKPOINTS" and val:
+                        normalized = _normalize_rubber_duck_checkpoints(val)
+                        if normalized is not None:
+                            self.rubber_duck_checkpoints = _format_rubber_duck_checkpoints(normalized)
         except (OSError, IOError):
             pass  # Config file unreadable — skip silently
 
@@ -1537,6 +1543,10 @@ class Config:
             self.review_model = os.environ["EVE_CLI_REVIEW_MODEL"]
         if _env_truthy("EVE_CLI_RUBBER_DUCK"):
             self.rubber_duck = True
+        if os.environ.get("EVE_CLI_RUBBER_DUCK_CHECKPOINTS"):
+            normalized = _normalize_rubber_duck_checkpoints(os.environ["EVE_CLI_RUBBER_DUCK_CHECKPOINTS"])
+            if normalized is not None:
+                self.rubber_duck_checkpoints = _format_rubber_duck_checkpoints(normalized)
         if os.environ.get("EVE_CODER_MAX_AGENT_STEPS"):
             parsed = self._normalize_max_agent_steps(os.environ["EVE_CODER_MAX_AGENT_STEPS"])
             if parsed is not None:
@@ -1633,6 +1643,7 @@ class Config:
         parser.add_argument("-p", "--prompt", help=t('help.prompt', default="One-shot prompt (non-interactive)"))
         parser.add_argument("-m", "--model", help=t('help.model', default="Ollama model name"))
         parser.add_argument("--review-model", help="Model to use for second-opinion reviews (/review, rubber-duck)")
+        parser.add_argument("--rubber-duck-checkpoints", help="Automatic review checkpoints: plan, post-edit, or all")
         parser.add_argument("-y", "--yes", action="store_true", help=t('help.yes', default="Auto-approve all tool calls"))
         parser.add_argument("--debug", action="store_true", help=t('help.debug', default="Debug mode"))
         parser.add_argument("--resume", action="store_true", help=t('help.resume', default="Resume last session"))
@@ -1783,6 +1794,10 @@ class Config:
             self.profile = args.profile
         if args.rubber_duck:
             self.rubber_duck = True
+        if args.rubber_duck_checkpoints:
+            normalized = _normalize_rubber_duck_checkpoints(args.rubber_duck_checkpoints)
+            if normalized is not None:
+                self.rubber_duck_checkpoints = _format_rubber_duck_checkpoints(normalized)
         # RAG args
         if args.rag:
             self.rag = True
@@ -2053,6 +2068,10 @@ class Config:
             self._cli_review_model_set = True
         if "RUBBER_DUCK" in prof:
             self.rubber_duck = str(prof["RUBBER_DUCK"]).strip().lower() in ("true", "1", "yes", "on")
+        if "RUBBER_DUCK_CHECKPOINTS" in prof:
+            normalized = _normalize_rubber_duck_checkpoints(prof["RUBBER_DUCK_CHECKPOINTS"])
+            if normalized is not None:
+                self.rubber_duck_checkpoints = _format_rubber_duck_checkpoints(normalized)
         if prof.get("OLLAMA_HOST") and not self._cli_ollama_host_set:
             self.ollama_host = prof["OLLAMA_HOST"]
         if prof.get("OLLAMA_API_KEY"):
@@ -3243,6 +3262,73 @@ Produce a Markdown table followed by a summary:
 
 _REVIEW_MAX_DIFF_BYTES = 100_000  # 100KB cap for diff content
 
+_RUBBER_DUCK_CHECKPOINT_LABELS = {
+    "plan_approved": "plan",
+    "post_edit": "post-edit",
+}
+
+
+def _normalize_rubber_duck_checkpoints(value):
+    if value is None:
+        return ("plan_approved", "post_edit")
+    text = str(value).strip().lower()
+    if not text:
+        return ("plan_approved", "post_edit")
+    if text in ("all", "on", "true", "1", "yes", "default", "auto"):
+        return ("plan_approved", "post_edit")
+    if text in ("off", "none", "false", "0", "no"):
+        return tuple()
+
+    aliases = {
+        "plan": "plan_approved",
+        "plan-only": "plan_approved",
+        "plan_approved": "plan_approved",
+        "approved-plan": "plan_approved",
+        "post-edit": "post_edit",
+        "post_edit": "post_edit",
+        "edit": "post_edit",
+        "diff": "post_edit",
+        "post": "post_edit",
+    }
+    normalized = []
+    for raw in re.split(r"[\s,]+", text):
+        token = raw.strip()
+        if not token:
+            continue
+        mapped = aliases.get(token)
+        if mapped and mapped not in normalized:
+            normalized.append(mapped)
+    if not normalized:
+        return None
+    return tuple(normalized)
+
+
+def _format_rubber_duck_checkpoints(checkpoints):
+    labels = []
+    for checkpoint in checkpoints or ():
+        label = _RUBBER_DUCK_CHECKPOINT_LABELS.get(checkpoint)
+        if label and label not in labels:
+            labels.append(label)
+    return ",".join(labels)
+
+
+def _rubber_duck_checkpoints(config):
+    normalized = _normalize_rubber_duck_checkpoints(
+        getattr(config, "rubber_duck_checkpoints", Config.DEFAULT_RUBBER_DUCK_CHECKPOINTS)
+    )
+    return normalized or tuple()
+
+
+def _rubber_duck_checkpoint_summary(config):
+    checkpoints = _rubber_duck_checkpoints(config)
+    if not checkpoints:
+        return "manual only"
+    return ", ".join(_RUBBER_DUCK_CHECKPOINT_LABELS.get(item, item) for item in checkpoints)
+
+
+def _rubber_duck_allows_trigger(config, trigger):
+    return trigger in _rubber_duck_checkpoints(config)
+
 _RUBBER_DUCK_SYSTEM_PROMPT = """You are Rubber Duck, a second-opinion reviewer for another coding model.
 
 Your job is to pressure-test the plan or diff you are given and surface the most important blind spots.
@@ -3260,6 +3346,13 @@ Rules:
 - Prefer high-signal issues over stylistic nits.
 - If the work looks sound, say so explicitly and list at most 2 follow-up checks.
 - Do not ask the user questions.
+- Return markdown using exactly these sections:
+  ## Findings
+  - ...
+  ## Follow-up Checks
+  - ...
+- If there are no meaningful findings, write '- No major findings.' under Findings.
+- If there are no follow-up checks, write '- None.' under Follow-up Checks.
 """
 
 
@@ -3287,6 +3380,31 @@ def _extract_plain_response_text(resp):
     return text.strip()
 
 
+def _parse_rubber_duck_sections(review_text):
+    findings = []
+    follow_up_checks = []
+    current = None
+    for raw_line in str(review_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower().rstrip(":")
+        if lowered in ("## findings", "# findings", "findings"):
+            current = findings
+            continue
+        if lowered in ("## follow-up checks", "# follow-up checks", "follow-up checks", "## follow up checks", "# follow up checks", "follow up checks"):
+            current = follow_up_checks
+            continue
+        bullet = re.sub(r"^[-*]\s+", "", line)
+        bullet = re.sub(r"^\d+\.\s+", "", bullet)
+        if current is not None:
+            current.append(bullet)
+    fallback = ""
+    if not findings and not follow_up_checks:
+        fallback = str(review_text or "").strip()
+    return findings, follow_up_checks, fallback
+
+
 def _publish_rubber_duck_review(config, session, tui, trigger, source_desc, model, review_text):
     if not review_text:
         return
@@ -3302,6 +3420,7 @@ def _publish_rubber_duck_review(config, session, tui, trigger, source_desc, mode
         count = int(session.runtime_state.get_meta("rubber_duck_review_count", 0) or 0) + 1
         session.runtime_state.update_runtime(
             rubber_duck_enabled=bool(getattr(config, "rubber_duck", False)),
+            rubber_duck_checkpoints=_rubber_duck_checkpoint_summary(config),
             last_rubber_duck_trigger=trigger,
             last_rubber_duck_source=source_desc,
             last_rubber_duck_model=model,
@@ -3317,13 +3436,24 @@ def _publish_rubber_duck_review(config, session, tui, trigger, source_desc, mode
         except Exception:
             pass
     if tui is not None:
+        findings, follow_up_checks, fallback = _parse_rubber_duck_sections(review_text)
         tui._scroll_print(f"\n{C.CYAN}Rubber Duck Review{C.RESET} {C.DIM}({source_desc}, {model}){C.RESET}")
-        tui._render_markdown(review_text)
+        if findings or follow_up_checks:
+            tui._scroll_print(f"{C.BBLUE}Findings{C.RESET}")
+            tui._render_markdown("\n".join(f"- {item}" for item in (findings or ["No major findings."])))
+            tui._scroll_print("")
+            tui._scroll_print(f"{C.BBLUE}Follow-up Checks{C.RESET}")
+            tui._render_markdown("\n".join(f"- {item}" for item in (follow_up_checks or ["None."])))
+        else:
+            tui._render_markdown(fallback or review_text)
         tui._scroll_print("")
 
 
 def _run_rubber_duck_review(config, client, session, tui, *, trigger, source_kind, source_desc, content, force=False):
-    if not force and not getattr(config, "rubber_duck", False):
+    if not force and (
+        not getattr(config, "rubber_duck", False)
+        or not _rubber_duck_allows_trigger(config, trigger)
+    ):
         return ""
     review_model = _resolve_review_model(config)
     normalized = _normalize_review_input(content)
@@ -18480,7 +18610,10 @@ class TUI:
         if role_models["review"] and role_models["review"] not in {role_models['utility'], role_models['compaction'], role_models['subagent']}:
             print(f"  🦆 {info_dim}Review{C.RESET} {info_bright}{role_models['review']}{C.RESET}")
         if getattr(config, "rubber_duck", False):
-            print(f"  🪶 {info_dim}Rubber Duck{C.RESET} {info_bright}ON{C.RESET}")
+            print(
+                f"  🪶 {info_dim}Rubber Duck{C.RESET} {info_bright}ON{C.RESET} "
+                f"{C.DIM}[{_rubber_duck_checkpoint_summary(config)}]{C.RESET}"
+            )
         print(f"  🔒 {info_dim}Mode{C.RESET}   {mode_str}")
         # Network status
         if config.network_status == "online":
@@ -19919,7 +20052,7 @@ class TUI:
   {_c198}/think{C.RESET}             Enable thinking mode (Qwen3 extended reasoning)
   {_c198}/no-think{C.RESET}          Disable thinking mode
   {_c198}/review{C.RESET} [target]   Run a second-opinion review on current changes
-  {_c198}/rubber-duck{C.RESET} [on|off] Toggle automatic second-opinion checkpoints
+  {_c198}/rubber-duck{C.RESET} [on|off|plan|post-edit|all] Toggle automatic second-opinion checkpoints
   {_c198}/map{C.RESET}               Generate repo map and inject into AI context
   {_c198}/skills{C.RESET}            List loaded skills
   {_c198}/hooks{C.RESET}             List loaded hooks
@@ -23126,18 +23259,31 @@ def main():
                     sub = args.strip().lower() if args else ""
                     if sub in ("on", "enable", "enabled"):
                         config.rubber_duck = True
+                    elif sub in ("plan", "plan-only"):
+                        config.rubber_duck = True
+                        config.rubber_duck_checkpoints = "plan"
+                    elif sub in ("post-edit", "post_edit", "edit", "diff"):
+                        config.rubber_duck = True
+                        config.rubber_duck_checkpoints = "post-edit"
+                    elif sub in ("all", "auto"):
+                        config.rubber_duck = True
+                        config.rubber_duck_checkpoints = "plan,post-edit"
                     elif sub in ("off", "disable", "disabled"):
                         config.rubber_duck = False
+                    elif sub == "status":
+                        pass
                     else:
                         config.rubber_duck = not config.rubber_duck
                     if session.runtime_state:
                         session.runtime_state.update_runtime(
                             rubber_duck_enabled=config.rubber_duck,
+                            rubber_duck_checkpoints=_rubber_duck_checkpoint_summary(config),
                             last_rubber_duck_model=_resolve_review_model(config),
                             updated_at=time.time(),
                         )
                     status = f"{C.GREEN}ON{C.RESET}" if config.rubber_duck else f"{C.RED}OFF{C.RESET}"
                     print(f"  Rubber Duck: {status}")
+                    print(f"  {C.DIM}Checkpoints: {_rubber_duck_checkpoint_summary(config)}{C.RESET}")
                     print(f"  {C.DIM}Reviewer model: {_resolve_review_model(config) or '(none)'}{C.RESET}")
                     continue
                 elif cmd == "/tokens":
@@ -24253,6 +24399,7 @@ def main():
                     print(f"  {_c87x}Subagent{C.RESET}      {_role_models['subagent'] or '(none)'}")
                     print(f"  {_c87x}Review{C.RESET}        {_role_models['review'] or '(none)'}")
                     print(f"  {_c87x}Rubber Duck{C.RESET}   {'ON' if config.rubber_duck else 'OFF'}")
+                    print(f"  {_c87x}Duck checks{C.RESET}   {_rubber_duck_checkpoint_summary(config)}")
                     print(f"  {_c87x}Host{C.RESET}          {config.ollama_host}")
                     print(f"  {_c87x}Temperature{C.RESET}   {config.temperature}")
                     print(f"  {_c87x}Max tokens{C.RESET}    {config.max_tokens}")

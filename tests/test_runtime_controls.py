@@ -57,11 +57,17 @@ class _FakeRegistry:
 class _FakeTUI:
     def __init__(self):
         self.scroll_region = SimpleNamespace(_active=False, update_mode_display=lambda *args, **kwargs: None)
+        self.printed = []
+        self.rendered = []
 
     def _scroll_print(self, *args, **kwargs):
+        if args:
+            self.printed.append(args[0])
         return None
 
     def _render_markdown(self, *args, **kwargs):
+        if args:
+            self.rendered.append(args[0])
         return None
 
     def start_spinner(self, *args, **kwargs):
@@ -391,7 +397,7 @@ class TestAgentRuntimeControls(unittest.TestCase):
 
     def test_rubber_duck_review_uses_review_model_and_records_note(self):
         client = _SequenceClient([
-            {"choices": [{"message": {"content": "- High | Tests | Missing verification for edge case"}}]},
+            {"choices": [{"message": {"content": "## Findings\n- Missing verification for edge case\n## Follow-up Checks\n- Run unit tests for the changed branch"}}]},
         ])
         agent, session = self.make_agent(client, [eve_coder.ReadTool(self.project_dir)])
         agent.config.rubber_duck = True
@@ -402,7 +408,7 @@ class TestAgentRuntimeControls(unittest.TestCase):
             client,
             session,
             agent.tui,
-            trigger="manual_review",
+            trigger="post_edit",
             source_kind="diff",
             source_desc="uncommitted changes",
             content="diff --git a/foo.py b/foo.py\n+print('hello')\n",
@@ -413,8 +419,35 @@ class TestAgentRuntimeControls(unittest.TestCase):
         self.assertEqual(client.calls[0]["model"], "review-model")
         runtime = session.runtime_state.load_runtime()
         self.assertEqual(runtime.get("last_rubber_duck_model"), "review-model")
-        self.assertEqual(runtime.get("last_rubber_duck_trigger"), "manual_review")
+        self.assertEqual(runtime.get("last_rubber_duck_trigger"), "post_edit")
+        self.assertEqual(runtime.get("rubber_duck_checkpoints"), "plan, post-edit")
         self.assertTrue(any("Rubber Duck Review" in str(m.get("content", "")) for m in session.messages))
+        self.assertIn("- Missing verification for edge case", agent.tui.rendered[0])
+        self.assertIn("- Run unit tests for the changed branch", agent.tui.rendered[1])
+
+    def test_rubber_duck_review_respects_checkpoint_filter(self):
+        client = _SequenceClient([
+            {"choices": [{"message": {"content": "## Findings\n- Should not run\n## Follow-up Checks\n- None."}}]},
+        ])
+        agent, session = self.make_agent(client, [eve_coder.ReadTool(self.project_dir)])
+        agent.config.rubber_duck = True
+        agent.config.review_model = "review-model"
+        agent.config.rubber_duck_checkpoints = "plan"
+
+        review_text = eve_coder._run_rubber_duck_review(
+            agent.config,
+            client,
+            session,
+            agent.tui,
+            trigger="post_edit",
+            source_kind="diff",
+            source_desc="uncommitted changes",
+            content="diff --git a/foo.py b/foo.py\n+print('hello')\n",
+            force=False,
+        )
+
+        self.assertEqual(review_text, "")
+        self.assertEqual(client.calls, [])
 
 
 class TestInputPrompts(unittest.TestCase):

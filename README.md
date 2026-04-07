@@ -132,6 +132,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | 自動テスト付きで使う | `eve-cli --autotest` |
 | Thinking モードで使う | `eve-cli --think` |
 | Rubber Duck を有効にする | `eve-cli --review-model gemma4:31b-cloud --rubber-duck` |
+| Rubber Duck を plan だけで使う | `eve-cli --review-model gemma4:31b-cloud --rubber-duck --rubber-duck-checkpoints plan` |
 | 学習モードで使う | `eve-cli --learn --level 4` |
 | CI/CD で実行する | `eve-cli --headless -p "lint修正して" -y --output-format json` |
 | stdin パイプで実行する | `echo "テスト実行" \| eve-cli --headless --output-format json` |
