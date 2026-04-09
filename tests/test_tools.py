@@ -12,6 +12,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SCRIPT_DIR)
@@ -980,7 +981,7 @@ class TestBashTool(unittest.TestCase):
             captured["shell"] = kwargs.get("shell")
             return DummyProc()
 
-        with unittest.mock.patch.object(eve_coder.subprocess, "Popen", side_effect=fake_popen):
+        with mock.patch.object(eve_coder.subprocess, "Popen", side_effect=fake_popen):
             result = self.tool.execute({"command": "echo hello"})
 
         self.assertEqual(result.strip(), "hello")

@@ -43,19 +43,48 @@ class TestSubAgentScaling(unittest.TestCase):
         self.assertTrue(hasattr(eve_coder, 'SubAgentTool'))
 
     def test_subagent_has_max_turns(self):
-        """Test that SubAgent supports max_turns parameter."""
-        # SubAgent should accept max_turns parameter
-        self.assertTrue(True)  # Placeholder - actual implementation check
+        """SubAgent schema should expose max_turns with the configured default."""
+        cfg = SimpleNamespace(
+            cwd=self.test_dir,
+            model="test-model",
+            sidecar_model="",
+            default_subagent_max_turns=13,
+        )
+        tool = eve_coder.SubAgentTool(cfg, object(), MagicMock())
+
+        max_turns = tool.parameters["properties"]["max_turns"]
+
+        self.assertEqual(max_turns["type"], "integer")
+        self.assertIn("default 13", max_turns["description"])
+        self.assertIn(str(tool.HARD_MAX_TURNS), max_turns["description"])
 
     def test_subagent_has_allow_writes(self):
-        """Test that SubAgent supports allow_writes parameter."""
-        # SubAgent should accept allow_writes parameter
-        self.assertTrue(True)  # Placeholder - actual implementation check
+        """SubAgent schema should expose allow_writes."""
+        cfg = SimpleNamespace(
+            cwd=self.test_dir,
+            model="test-model",
+            sidecar_model="",
+        )
+        tool = eve_coder.SubAgentTool(cfg, object(), MagicMock())
+
+        allow_writes = tool.parameters["properties"]["allow_writes"]
+
+        self.assertEqual(allow_writes["type"], "boolean")
+        self.assertIn("Allow write tools", allow_writes["description"])
 
     def test_subagent_has_isolation(self):
-        """Test that SubAgent supports isolation parameter."""
-        # SubAgent should accept isolation parameter
-        self.assertTrue(True)  # Placeholder - actual implementation check
+        """SubAgent schema should expose isolation modes."""
+        cfg = SimpleNamespace(
+            cwd=self.test_dir,
+            model="test-model",
+            sidecar_model="",
+        )
+        tool = eve_coder.SubAgentTool(cfg, object(), MagicMock())
+
+        isolation = tool.parameters["properties"]["isolation"]
+
+        self.assertEqual(isolation["type"], "string")
+        self.assertEqual(isolation["enum"], ["none", "worktree"])
 
     def test_subagent_disallows_allow_writes_in_plan_mode(self):
         """Plan mode should block write-capable sub-agents."""
@@ -166,13 +195,26 @@ class TestParallelAgents(unittest.TestCase):
         self.assertTrue(hasattr(eve_coder, 'ParallelAgentTool'))
 
     def test_parallel_agents_supports_2_4_tasks(self):
-        """Test that ParallelAgents supports 2-4 concurrent tasks."""
-        # ParallelAgents should support 2-4 concurrent tasks
-        self.assertTrue(True)  # Placeholder - actual implementation check
+        """ParallelAgents schema should advertise prompt-driven task items and system max."""
+        coordinator = SimpleNamespace(_config=SimpleNamespace(default_subagent_max_turns=15))
+        tool = eve_coder.ParallelAgentTool(coordinator)
+
+        tasks = tool.parameters["properties"]["tasks"]
+
+        self.assertEqual(tasks["type"], "array")
+        self.assertGreaterEqual(tasks["maxItems"], 1)
+        self.assertEqual(tasks["items"]["required"], ["prompt"])
+        self.assertIn("max", tasks["description"])
 
     def test_parallel_agents_has_max_turns(self):
-        """Test that ParallelAgents supports max_turns per agent."""
-        self.assertTrue(True)  # Placeholder - actual implementation check
+        """ParallelAgents schema should expose per-agent max_turns."""
+        coordinator = SimpleNamespace(_config=SimpleNamespace(default_subagent_max_turns=17))
+        tool = eve_coder.ParallelAgentTool(coordinator)
+
+        max_turns = tool.parameters["properties"]["tasks"]["items"]["properties"]["max_turns"]
+
+        self.assertEqual(max_turns["type"], "integer")
+        self.assertIn("default 17", max_turns["description"])
 
     def test_auto_parallel_uses_configured_default_max_turns(self):
         """Auto-parallel should pass the configured sub-agent turn budget to each task."""

@@ -16923,6 +16923,7 @@ class ActionExecutor:
         Returns: (can_execute: bool, reason: str)
         """
         tool_name = action.get('tool', '')
+        params = action.get('params', {})
         
         # Check allowlist
         if tool_name not in self.allowlist:
