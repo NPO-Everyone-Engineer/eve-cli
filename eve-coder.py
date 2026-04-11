@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.32.1"
+__version__ = "2.32.2"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1186,10 +1186,10 @@ class Config:
 
     DEFAULT_OLLAMA_HOST = "http://localhost:11434"
     DEFAULT_MODEL = "glm-5.1:cloud"
-    DEFAULT_SIDECAR = "gemma4:31b-cloud"
+    DEFAULT_SIDECAR = "gemma4:31b"
     DEFAULT_UTILITY_MODEL = ""
     DEFAULT_COMPACTION_MODEL = ""
-    DEFAULT_SUBAGENT_MODEL = ""
+    DEFAULT_SUBAGENT_MODEL = "glm-5.1:cloud"
     DEFAULT_REVIEW_MODEL = ""
     DEFAULT_RUBBER_DUCK_CHECKPOINTS = "plan,post-edit"
     DEFAULT_MAX_TOKENS = 8192

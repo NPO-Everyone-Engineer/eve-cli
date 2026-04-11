@@ -39,7 +39,7 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(self.cfg.model, "glm-5.1:cloud")
 
     def test_default_sidecar_model(self):
-        self.assertEqual(self.cfg.sidecar_model, "gemma4:31b-cloud")
+        self.assertEqual(self.cfg.sidecar_model, "gemma4:31b")
 
     def test_default_review_model(self):
         self.assertEqual(self.cfg.review_model, "")
