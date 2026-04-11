@@ -160,7 +160,7 @@ $script:MESSAGES = @{
     "ja_reopen"            = "Open a new terminal, then run eve-cli"
     "ja_enjoy"             = "  Free AI Coding wo Tanoshimou  "
     "ja_help_usage"        = "Usage: install.ps1 [--model MODEL_NAME] [--lang LANG]"
-    "ja_help_model"        = "Specify Ollama model (e.g. qwen3:8b)"
+    "ja_help_model"        = "Specify Ollama model (e.g. glm-5:cloud)"
     "ja_help_lang"         = "Language: ja, en, zh"
     "ja_unknown_opt"       = "Unknown option"
 
@@ -234,7 +234,7 @@ $script:MESSAGES = @{
     "en_reopen"            = "Open a new terminal, then run eve-cli"
     "en_enjoy"             = "  ENJOY  FREE  AI  CODING  "
     "en_help_usage"        = "Usage: install.ps1 [--model MODEL_NAME] [--lang LANG]"
-    "en_help_model"        = "Specify Ollama model (e.g. qwen3:8b)"
+    "en_help_model"        = "Specify Ollama model (e.g. glm-5:cloud)"
     "en_help_lang"         = "Language: ja, en, zh"
     "en_unknown_opt"       = "Unknown option"
 
@@ -308,7 +308,7 @@ $script:MESSAGES = @{
     "zh_reopen"            = "Open a new terminal, then run eve-cli"
     "zh_enjoy"             = "  Enjoy Free AI Coding  "
     "zh_help_usage"        = "Usage: install.ps1 [--model MODEL_NAME] [--lang LANG]"
-    "zh_help_model"        = "Specify Ollama model (e.g. qwen3:8b)"
+    "zh_help_model"        = "Specify Ollama model (e.g. glm-5:cloud)"
     "zh_help_lang"         = "Language: ja, en, zh"
     "zh_unknown_opt"       = "Unknown option"
 }
@@ -748,33 +748,47 @@ Write-Host ""
 
 # Model selection
 $SIDECAR_MODEL = ""
+$UTILITY_MODEL = ""
+$COMPACTION_MODEL = ""
+$SUBAGENT_MODEL = ""
+$REVIEW_MODEL = ""
+$CONFIG_OLLAMA_HOST = "http://localhost:11434"
 $MANUAL_MODEL = $Model
+
+function Test-IsCloudModel([string]$ModelName) {
+    return (-not [string]::IsNullOrWhiteSpace($ModelName)) -and ($ModelName.Contains(":cloud") -or $ModelName.Contains("-cloud"))
+}
+
+function Set-CloudRoleDefaults {
+    $script:SIDECAR_MODEL = "gemma4:31b-cloud"
+    $script:UTILITY_MODEL = $script:SIDECAR_MODEL
+    $script:COMPACTION_MODEL = $script:SIDECAR_MODEL
+    $script:REVIEW_MODEL = $script:SIDECAR_MODEL
+    $script:SUBAGENT_MODEL = $script:MODEL
+    $script:CONFIG_OLLAMA_HOST = "https://ollama.com/api"
+}
+
+function Test-UsingCloudModels {
+    return (Test-IsCloudModel $script:MODEL) -or
+           (Test-IsCloudModel $script:SIDECAR_MODEL) -or
+           (Test-IsCloudModel $script:UTILITY_MODEL) -or
+           (Test-IsCloudModel $script:COMPACTION_MODEL) -or
+           (Test-IsCloudModel $script:SUBAGENT_MODEL) -or
+           (Test-IsCloudModel $script:REVIEW_MODEL)
+}
 
 if ($MANUAL_MODEL) {
     $MODEL = $MANUAL_MODEL
+    if (Test-IsCloudModel $MODEL) {
+        Set-CloudRoleDefaults
+    }
     Vapor-Info "$(msg 'manual_model'): $MODEL"
-} elseif ($RAM_GB -ge 32) {
-    $MODEL = "qwen3-coder:30b"
-    $SIDECAR_MODEL = "qwen3:8b"
-    Write-Host "  ${NEON_GREEN}|${NC} ++ ${BOLD}${YELLOW}*** BEST  MODEL ***${NC}"
-    Write-Host "  ${NEON_GREEN}|${NC}    ${BOLD}${WHITE}${MODEL}${NC} ${DIM}(19GB, MoE 3.3B active, $(msg 'model_best'))${NC}"
-    Write-Host "  ${NEON_GREEN}|${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (5GB, fast helper)${NC}"
-} elseif ($RAM_GB -ge 16) {
-    $MODEL = "qwen3:8b"
-    $SIDECAR_MODEL = "qwen3:1.7b"
-    Write-Host "  ${MINT}|${NC} ** ${BOLD}${CYAN}** GREAT  MODEL **${NC}"
-    Write-Host "  ${MINT}|${NC}    ${BOLD}${WHITE}${MODEL}${NC} ${DIM}(5GB, $(msg 'model_great'))${NC}"
-    Write-Host "  ${MINT}|${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (1GB, fast helper)${NC}"
-} elseif ($RAM_GB -ge 8) {
-    $MODEL = "qwen3:1.7b"
-    Vapor-Warn "$MODEL ($(msg 'model_min'))"
-    Vapor-Warn (msg "model_recommend")
 } else {
-    Vapor-Error "$(msg 'mem_lack'): ${RAM_GB}GB ($(msg 'mem_lack_min'))"
-    Write-Host ""
-    Write-Host "  $(msg 'mem_lack_hint1')"
-    Write-Host "  $(msg 'mem_lack_hint2')"
-    exit 1
+    $MODEL = "glm-5:cloud"
+    Set-CloudRoleDefaults
+    Write-Host "  ${NEON_GREEN}|${NC} :: ${BOLD}${YELLOW}*** CLOUD DEFAULT ***${NC}"
+    Write-Host "  ${NEON_GREEN}|${NC}    ${BOLD}${WHITE}${MODEL}${NC} ${DIM}(Cloud, agentic coding default)${NC}"
+    Write-Host "  ${NEON_GREEN}|${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (Cloud helper / review)${NC}"
 }
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -897,7 +911,15 @@ if ($OLLAMA_PATH) {
 Step-Header 4 (msg "step4")
 
 $OLLAMA_PATH = Find-Ollama
-if (-not $OLLAMA_PATH) {
+if (Test-UsingCloudModels) {
+    Vapor-Success "Ollama Cloud :: configured ($CONFIG_OLLAMA_HOST)"
+    if ($env:OLLAMA_API_KEY -or $env:EVE_CLI_OLLAMA_API_KEY) {
+        Vapor-Success "OLLAMA_API_KEY detected"
+    } else {
+        Vapor-Warn "OLLAMA_API_KEY is not set yet. Export it before the first run."
+    }
+    Vapor-Info "Cloud models are checked on first request. No local download is needed."
+} elseif (-not $OLLAMA_PATH) {
     Vapor-Error "Ollama not found. Cannot download models."
     Vapor-Warn "Install Ollama first, then re-run this script."
 } else {
@@ -1182,7 +1204,11 @@ if (Test-Path $CONFIG_FILE) {
 
 MODEL="$MODEL"
 SIDECAR_MODEL="$SIDECAR_MODEL"
-OLLAMA_HOST="http://localhost:11434"
+UTILITY_MODEL="$UTILITY_MODEL"
+COMPACTION_MODEL="$COMPACTION_MODEL"
+SUBAGENT_MODEL="$SUBAGENT_MODEL"
+REVIEW_MODEL="$REVIEW_MODEL"
+OLLAMA_HOST="$CONFIG_OLLAMA_HOST"
 "@
     Set-Content -Path $CONFIG_FILE -Value $configContent -Encoding UTF8
     Vapor-Success "$(msg 'config_file'): $CONFIG_FILE"
@@ -1258,7 +1284,12 @@ if (Test-Path $eveCoder) {
 }
 
 # Model availability
-if (Test-OllamaRunning) {
+if (Test-UsingCloudModels) {
+    Vapor-Info "AI Model ($MODEL) -> checked on first request"
+    if ($SIDECAR_MODEL -and $SIDECAR_MODEL -ne $MODEL) {
+        Vapor-Info "Sidecar  ($SIDECAR_MODEL) -> checked on first request"
+    }
+} elseif (Test-OllamaRunning) {
     try {
         $tagsResp = Invoke-WebRequest -Uri "http://localhost:11434/api/tags" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
         if ($tagsResp.Content -match [regex]::Escape($MODEL)) {

@@ -342,6 +342,13 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertIn('EVE_CLI_RUBBER_DUCK_CHECKPOINTS="${RUBBER_DUCK_CHECKPOINTS:-}"', content)
         self.assertIn('EVE_CODER_SCRIPT="${SCRIPT_DIR}/eve-coder.py"', content)
 
+    def test_powershell_wrapper_allows_official_ollama_cloud(self):
+        content = Path(SCRIPT_DIR, "eve-cli.ps1").read_text(encoding="utf-8")
+        self.assertIn("^https://(ollama\\.com|www\\.ollama\\.com)(/api)?/?$", content)
+        self.assertIn('$OLLAMA_HOST = "https://ollama.com/api"', content)
+        self.assertIn("function Get-OllamaHeaders", content)
+        self.assertIn('$apiKey = $env:OLLAMA_API_KEY', content)
+
     def test_install_manifest_hashes_match_repo_files(self):
         manifest = json.loads(Path(SCRIPT_DIR, "install-manifest.json").read_text(encoding="utf-8"))
         for rel_path, expected_hash in manifest.get("files", {}).items():

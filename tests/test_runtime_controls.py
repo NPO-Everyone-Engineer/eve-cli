@@ -376,23 +376,23 @@ class TestAgentRuntimeControls(unittest.TestCase):
         self.assertTrue(any("[Repo Map]" in str(msg.get("content", "")) for msg in first_call_messages))
         self.assertEqual(code_intel.calls, 1)
 
-    def test_resolve_request_policy_prefers_sidecar_after_retries(self):
+    def test_resolve_request_policy_keeps_primary_model_after_retries(self):
         client = _SequenceClient([])
         agent, _session = self.make_agent(client, [eve_coder.ReadTool(self.project_dir)])
 
         policy = agent._resolve_request_policy([], empty_retries=3)
 
-        self.assertEqual(policy["model"], "fallback-model")
+        self.assertEqual(policy["model"], "test-model")
         self.assertEqual(policy["options"], {"retry_temperature_boost": 0.3})
 
-    def test_resolve_request_policy_prefers_utility_model_after_retries(self):
+    def test_resolve_request_policy_ignores_utility_model_after_retries(self):
         client = _SequenceClient([])
         agent, _session = self.make_agent(client, [eve_coder.ReadTool(self.project_dir)])
         agent.config.utility_model = "utility-fallback"
 
         policy = agent._resolve_request_policy([], empty_retries=3)
 
-        self.assertEqual(policy["model"], "utility-fallback")
+        self.assertEqual(policy["model"], "test-model")
         self.assertEqual(policy["options"], {"retry_temperature_boost": 0.3})
 
     def test_rubber_duck_review_uses_review_model_and_records_note(self):

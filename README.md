@@ -126,7 +126,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | やりたいこと | コマンド |
 |-------------|----------|
 | 普通に使う | `eve-cli` |
-| モデルを指定する | `eve-cli --model qwen3:8b` |
+| モデルを指定する | `eve-cli --model glm-5:cloud` |
 | 前回の続きから始める | `eve-cli --resume` |
 | 1回だけ実行する | `eve-cli -p "テストを書いて実行して"` |
 | 自動テスト付きで使う | `eve-cli --autotest` |
@@ -150,14 +150,12 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 
 ## 推奨環境
 
-以下は **現行インストーラーが選ぶ目安** です。必要なら `--model` で手動指定できます。
+以下は **現行インストーラー / 既定 config の目安** です。必要なら `--model` で手動指定できます。
 
-| 環境 | メモリ | 既定の目安 |
-|------|-------|------------|
-| Apple Silicon Mac / Linux | 32GB+ | `qwen3-coder:30b` |
-| Apple Silicon Mac / Linux | 16GB+ | `qwen3.5:397b-cloud` |
-| 省メモリ環境 | 8GB+ | `qwen3.5:32b` |
-| 手動で軽いモデルを使いたい | 制限なし | `--model qwen3:8b` など |
+| 構成 | 条件 | 既定の目安 |
+|------|------|------------|
+| 標準構成 | ネットワーク接続あり | `MODEL=glm-5:cloud` + `SIDECAR_MODEL=gemma4:31b-cloud` |
+| オフライン / ローカル重視 | ローカル Ollama を使う | `--model qwen3:8b` など |
 
 ```bash
 eve-cli --model qwen3:8b
@@ -174,10 +172,14 @@ eve-cli --model qwen3:8b
 毎回同じモデルや設定を使いたい場合は、このファイルを編集してください。
 
 ```ini
-MODEL=qwen3:8b
-SIDECAR_MODEL=qwen3:4b
-OLLAMA_HOST=http://localhost:11434
-CONTEXT_WINDOW=65536
+MODEL=glm-5:cloud
+SIDECAR_MODEL=gemma4:31b-cloud
+UTILITY_MODEL=gemma4:31b-cloud
+COMPACTION_MODEL=gemma4:31b-cloud
+SUBAGENT_MODEL=glm-5:cloud
+REVIEW_MODEL=gemma4:31b-cloud
+OLLAMA_HOST=https://ollama.com/api
+CONTEXT_WINDOW=202752
 PROFILE=auto
 UI_THEME=normal
 ```
@@ -189,7 +191,7 @@ Ollama Cloud を使う場合は、`OLLAMA_HOST` を `https://ollama.com/api` に
 
 ```bash
 export OLLAMA_API_KEY=your-ollama-api-key
-eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
+eve-cli --ollama-host https://ollama.com/api --model glm-5:cloud
 ```
 
 補足:

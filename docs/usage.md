@@ -64,7 +64,7 @@ eve-cli -p "Hello Worldを作って"
 会話の自動圧縮など内部処理に使う軽量モデルを、環境変数で設定できます：
 
 ```bash
-EVE_CLI_SIDECAR_MODEL=qwen3.5:3b eve-cli
+EVE_CLI_SIDECAR_MODEL=gemma4:31b-cloud eve-cli
 ```
 
 ---

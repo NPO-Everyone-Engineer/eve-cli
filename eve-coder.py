@@ -7,7 +7,7 @@ Usage:
     python3 eve-coder.py                        # interactive mode
     python3 eve-coder.py -p "ls -la を実行して"  # one-shot
     python3 eve-coder.py --model qwen3:8b       # local model
-    python3 eve-coder.py --model minimax-m2.5:cloud  # cloud model via Ollama
+    python3 eve-coder.py --model glm-5:cloud    # cloud model via Ollama
     python3 eve-coder.py -y                     # auto-approve all tools
     python3 eve-coder.py --resume               # resume last session
 """
@@ -1185,7 +1185,7 @@ class Config:
     """Configuration from CLI args, config file, and environment variables."""
 
     DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-    DEFAULT_MODEL = "gemma4:31b-cloud"
+    DEFAULT_MODEL = "glm-5:cloud"
     DEFAULT_SIDECAR = "gemma4:31b-cloud"
     DEFAULT_UTILITY_MODEL = ""
     DEFAULT_COMPACTION_MODEL = ""
@@ -1934,7 +1934,7 @@ class Config:
         "qwen3:235b": 32768,
         "qwen3.5:397b": 262144,        # Cloud alias, 256K ctx
         "qwen3.5:397b-cloud": 262144,  # Cloud model, 256K ctx
-        "glm-5:cloud":       204800,   # Zhipu AI GLM-5 Cloud, 200K ctx
+        "glm-5:cloud":       202752,   # Zhipu AI GLM-5 Cloud
         "gemma4:31b-cloud":  262144,   # Cloud model, 256K ctx
         "gemma4:31b":        262144,   # 256K ctx
         "qwen3.5:35b-a3b": 262144,     # MoE 35B (3B active), 256K ctx
@@ -1985,7 +1985,7 @@ class Config:
         # Tier A — Expert: excellent coding + reasoning
         ("qwen3.5:397b",            256, "A"),  # Cloud alias
         ("qwen3.5:397b-cloud",      256, "A"),  # Cloud model
-        ("glm-5:cloud",               32, "A"),  # Zhipu AI GLM-5 Cloud, 200K ctx
+        ("glm-5:cloud",               32, "A"),  # Zhipu AI GLM-5 Cloud
         ("gemma4:31b-cloud",         32, "A"),  # Cloud model, 31B
         ("gemma4:31b",               32, "A"),  # 31B
         ("qwen3.5:35b-a3b",         256, "A"),  # MoE 35B (3B active)
@@ -2182,7 +2182,11 @@ class Config:
         """Query Ollama API for installed model names. Returns list or empty."""
         url = f"{self.ollama_host}/api/tags"
         try:
-            resp = urllib.request.urlopen(url, timeout=3)
+            headers = {}
+            if self.ollama_api_key:
+                headers["Authorization"] = f"Bearer {self.ollama_api_key}"
+            req = urllib.request.Request(url, headers=headers)
+            resp = urllib.request.urlopen(req, timeout=3)
             try:
                 data = json.loads(resp.read(10 * 1024 * 1024))
             finally:
@@ -2661,6 +2665,10 @@ def _is_cloud_model(model_name):
 
 def _is_gemma4_model(model_name):
     return bool(model_name) and model_name.lower().startswith("gemma4:")
+
+
+def _is_glm5_model(model_name):
+    return bool(model_name) and model_name.lower().startswith("glm-5")
 
 
 def _strip_thinking_tags(content):
@@ -5097,7 +5105,7 @@ class OllamaClient:
 
         temp = self.temperature
         if tools:
-            if _is_gemma4_model(model):
+            if _is_gemma4_model(model) or _is_glm5_model(model):
                 temp = min(temp, 0.25)
             else:
                 _tier, _ = Config.get_model_tier(model)
@@ -5244,7 +5252,12 @@ class OllamaClient:
             finally:
                 e.close()
             if e.code == 404:
-                raise RuntimeError(t('errors.model_not_found', default=f"Model '{model}' not found. Run: ollama pull {model}")) from e
+                _hostname = urllib.parse.urlparse(self.base_url).hostname or ""
+                if Config._is_local_ollama_host(_hostname):
+                    msg = t('errors.model_not_found', default=f"Model '{model}' not found. Run: ollama pull {model}")
+                else:
+                    msg = f"Model '{model}' is not available on the configured Ollama endpoint. Check OLLAMA_HOST / OLLAMA_API_KEY and model access."
+                raise RuntimeError(msg) from e
             elif e.code == 400:
                 if "tool" in error_body.lower() or "function" in error_body.lower():
                     msg = t('errors.model_no_tool_support', default=f"Model '{model}' does not support tool/function calling.")
@@ -15711,9 +15724,9 @@ def _resolve_subagent_model(config, persona_model=""):
     return (
         persona_model
         or _config_value(config, "subagent_model", "")
+        or _config_value(config, "model", "")
         or _config_value(config, "utility_model", "")
         or _config_value(config, "sidecar_model", "")
-        or _config_value(config, "model", "")
     )
 
 
@@ -18696,8 +18709,12 @@ class TUI:
         print(f"  📁 {info_dim}CWD{C.RESET}    {C.WHITE}{os.getcwd()}{C.RESET}")
 
         if not model_ok:
-            print(f"\n  {C.RED}⚠ Model '{config.model}' not downloaded yet.{C.RESET}")
-            print(f"  {C.DIM}  Download it:  ollama pull {config.model}{C.RESET}")
+            if config.uses_local_ollama():
+                print(f"\n  {C.RED}⚠ Model '{config.model}' not downloaded yet.{C.RESET}")
+                print(f"  {C.DIM}  Download it:  ollama pull {config.model}{C.RESET}")
+            else:
+                print(f"\n  {C.RED}⚠ Model '{config.model}' is not available on the configured Ollama endpoint.{C.RESET}")
+                print(f"  {C.DIM}  Check OLLAMA_HOST / OLLAMA_API_KEY and your Ollama Cloud access.{C.RESET}")
 
         print(sep_line)
         # Recommend -y mode if not already enabled
@@ -20686,12 +20703,6 @@ class Agent:
         }
         if empty_retries >= 2:
             policy["options"]["retry_temperature_boost"] = 0.3
-        if (
-            empty_retries >= 3
-            and _resolve_utility_model(self.config)
-            and _resolve_utility_model(self.config) != self.config.model
-        ):
-            policy["model"] = _resolve_utility_model(self.config)
         if not policy["options"]:
             policy["options"] = None
         return policy
@@ -21112,15 +21123,9 @@ class Agent:
                         _p(f"  {C.DIM}[retry with temperature {_retry_temp:.1f}]{C.RESET}")
                         time.sleep(0.5)
                         continue
-                    # Step 3: Sidecar model fallback
-                    _fallback_model = _resolve_utility_model(self.config)
-                    if _empty_retries == 3 and _fallback_model and _fallback_model != self.config.model:
-                        _p(f"  {C.DIM}[fallback to sidecar: {_fallback_model}]{C.RESET}")
-                        time.sleep(0.5)
-                        continue
-                    # Step 4: Give up with actionable suggestions
-                    if _empty_retries > 3:
-                        _p(f"\n{C.YELLOW}AI から空のレスポンスが返されました（4回リトライ後も失敗）{C.RESET}")
+                    # Step 3: Give up with actionable suggestions
+                    if _empty_retries > 2:
+                        _p(f"\n{C.YELLOW}AI から空のレスポンスが返されました（3回リトライ後も失敗）{C.RESET}")
                         _p(f"{C.DIM}対処法:{C.RESET}")
                         _p(f"{C.DIM}  1. /compact — コンテキストを圧縮{C.RESET}")
                         _p(f"{C.DIM}  2. /model <name> — 別モデルに切替{C.RESET}")
@@ -21594,8 +21599,12 @@ class Agent:
                         pass
                 _p(f"\n{C.RED}HTTP {e.code} {e.reason}: {body}{C.RESET}")
                 if e.code == 404:
-                    _p(f"{C.DIM}The model '{self.config.model}' may not be downloaded yet.{C.RESET}")
-                    _p(f"{C.DIM}Download it:  ollama pull {self.config.model}{C.RESET}")
+                    if self.config.uses_local_ollama():
+                        _p(f"{C.DIM}The model '{self.config.model}' may not be downloaded yet.{C.RESET}")
+                        _p(f"{C.DIM}Download it:  ollama pull {self.config.model}{C.RESET}")
+                    else:
+                        _p(f"{C.DIM}The model '{self.config.model}' is not available on the configured Ollama endpoint.{C.RESET}")
+                        _p(f"{C.DIM}Check OLLAMA_HOST / OLLAMA_API_KEY and your Ollama Cloud access.{C.RESET}")
                 elif e.code == 400:
                     _p(f"{C.DIM}The request was rejected — the model name or context may be invalid.{C.RESET}")
                 break
@@ -21888,7 +21897,7 @@ def _call_sidecar_for_suggestions(agent, config, client, system_prompt, user_pro
     """
     import json
 
-    sidecar_model = _resolve_utility_model(config) or os.environ.get('EVE_CLI_SIDECAR_MODEL', 'qwen3:8b')
+    sidecar_model = _resolve_utility_model(config) or os.environ.get('EVE_CLI_SIDECAR_MODEL', Config.DEFAULT_SIDECAR)
 
     # Build messages
     messages = [
@@ -23273,10 +23282,16 @@ def main():
                             print(f"{C.DIM}Context window: {config.context_window} tokens{C.RESET}")
                         else:
                             avail = fresh_models if _ok else []
-                            print(f"{C.YELLOW}Model '{new_model}' is not downloaded yet.{C.RESET}")
+                            if config.uses_local_ollama():
+                                print(f"{C.YELLOW}Model '{new_model}' is not downloaded yet.{C.RESET}")
+                            else:
+                                print(f"{C.YELLOW}Model '{new_model}' is not available on the configured Ollama endpoint.{C.RESET}")
                             if avail:
                                 _show_model_list(avail)
-                            print(f"{C.DIM}Download it:  ollama pull {new_model}{C.RESET}")
+                            if config.uses_local_ollama():
+                                print(f"{C.DIM}Download it:  ollama pull {new_model}{C.RESET}")
+                            else:
+                                print(f"{C.DIM}Check OLLAMA_HOST / OLLAMA_API_KEY and your Ollama Cloud access.{C.RESET}")
                     else:
                         _ok, fresh_models = client.check_connection()
                         avail = fresh_models if _ok else []
@@ -23293,7 +23308,10 @@ def main():
                         if avail:
                             print(f"\n  {C.BOLD}Installed models:{C.RESET}")
                             _show_model_list(avail)
-                        print(f"\n  {C.DIM}Switch: /model <name>  |  Download: ollama pull <name>{C.RESET}")
+                        if config.uses_local_ollama():
+                            print(f"\n  {C.DIM}Switch: /model <name>  |  Download: ollama pull <name>{C.RESET}")
+                        else:
+                            print(f"\n  {C.DIM}Switch: /model <name>  |  Verify access with OLLAMA_HOST / OLLAMA_API_KEY{C.RESET}")
                         _tier_legend = (f"  {C.DIM}Tiers: "
                                         f"{_ansi(chr(27)+'[38;5;196m')}S{C.RESET}{C.DIM}=Frontier "
                                         f"{_ansi(chr(27)+'[38;5;208m')}A{C.RESET}{C.DIM}=Expert "
@@ -24462,10 +24480,16 @@ def main():
                                     print(f"\n  {C.GREEN}Model changed to: {new_model}{C.RESET}")
                                     print(f"  {_c240x}To make this permanent, add MODEL={new_model} to {config.config_file}{C.RESET}\n")
                                 else:
-                                    print(f"\n  {C.YELLOW}Model '{new_model}' is not downloaded yet.{C.RESET}")
+                                    if config.uses_local_ollama():
+                                        print(f"\n  {C.YELLOW}Model '{new_model}' is not downloaded yet.{C.RESET}")
+                                    else:
+                                        print(f"\n  {C.YELLOW}Model '{new_model}' is not available on the configured Ollama endpoint.{C.RESET}")
                                     if _ok and fresh_models:
                                         _show_model_list(fresh_models)
-                                    print(f"  {_c240x}Download it first: ollama pull {new_model}{C.RESET}\n")
+                                    if config.uses_local_ollama():
+                                        print(f"  {_c240x}Download it first: ollama pull {new_model}{C.RESET}\n")
+                                    else:
+                                        print(f"  {_c240x}Check OLLAMA_HOST / OLLAMA_API_KEY and your Ollama Cloud access.{C.RESET}\n")
                             else:
                                 print(f"\n  {C.RED}Invalid model name. Use only alphanumeric, dots, colons, hyphens, underscores, and slashes.{C.RESET}\n")
                             continue

@@ -8,7 +8,7 @@
 #   .\eve-cli.ps1                      # インタラクティブモード
 #   .\eve-cli.ps1 -p "質問"            # ワンショット
 #   .\eve-cli.ps1 --auto               # ネットワーク状況で自動判定
-#   .\eve-cli.ps1 --model qwen3:8b     # モデル手動指定
+#   .\eve-cli.ps1 --model glm-5:cloud  # モデル手動指定
 #   .\eve-cli.ps1 -y                   # パーミッション確認スキップ (自己責任)
 #   .\eve-cli.ps1 --debug              # デバッグモード
 
@@ -73,17 +73,25 @@ if (Test-Path $CONFIG_FILE) {
     }
 }
 
-# --- [SEC] OLLAMA_HOST 検証 - localhost のみ許可 (SSRF防止) ---
+# --- [SEC] OLLAMA_HOST 検証 - localhost または公式 Ollama Cloud のみ許可 (SSRF防止) ---
 # Strict regex: @-credential injection を拒否 (e.g. http://localhost:11434@attacker.com)
 $hostValid = $false
+$IS_CLOUD_HOST = $false
 if ($OLLAMA_HOST -match '^http://(localhost|127\.0\.0\.1|\[::1\]):\d{1,5}(/.*)?$') {
     if ($OLLAMA_HOST -notmatch '@') {
         $hostValid = $true
     }
 }
+if ($OLLAMA_HOST -match '^https://(ollama\.com|www\.ollama\.com)(/api)?/?$') {
+    if ($OLLAMA_HOST -notmatch '@') {
+        $hostValid = $true
+        $IS_CLOUD_HOST = $true
+        $OLLAMA_HOST = "https://ollama.com/api"
+    }
+}
 if (-not $hostValid) {
-    Write-Host "Warning: OLLAMA_HOST='$OLLAMA_HOST' is not localhost. Resetting to localhost for security." -ForegroundColor Yellow
-    Write-Host "  OLLAMA_HOST='$OLLAMA_HOST' はlocalhostではありません。セキュリティのためlocalhostにリセットします。" -ForegroundColor Yellow
+    Write-Host "Warning: OLLAMA_HOST='$OLLAMA_HOST' is not an allowed Ollama host. Resetting to localhost for security." -ForegroundColor Yellow
+    Write-Host "  OLLAMA_HOST='$OLLAMA_HOST' は許可されていない Ollama host です。セキュリティのためlocalhostにリセットします。" -ForegroundColor Yellow
     $OLLAMA_HOST = "http://localhost:11434"
 }
 
@@ -150,10 +158,24 @@ if (-not (Test-Path $EVE_CODER_SCRIPT)) {
     }
 }
 
+function Get-OllamaHeaders {
+    if ($script:IS_CLOUD_HOST) {
+        $apiKey = $env:OLLAMA_API_KEY
+        if (-not $apiKey) {
+            $apiKey = $env:EVE_CLI_OLLAMA_API_KEY
+        }
+        if ($apiKey) {
+            return @{ Authorization = "Bearer $apiKey" }
+        }
+    }
+    return @{}
+}
+
 # --- Ollama 起動確認・起動関数 ---
 function Test-OllamaRunning {
     try {
-        $null = Invoke-WebRequest -Uri "$OLLAMA_HOST/api/tags" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+        $headers = Get-OllamaHeaders
+        $null = Invoke-WebRequest -Uri "$OLLAMA_HOST/api/tags" -Headers $headers -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
         return $true
     } catch {
         return $false
@@ -161,6 +183,9 @@ function Test-OllamaRunning {
 }
 
 function Ensure-Ollama {
+    if ($script:IS_CLOUD_HOST) {
+        return $true
+    }
     if (Test-OllamaRunning) {
         return $true
     }
@@ -339,7 +364,8 @@ try {
     if ($MODEL -ne "") {
         $modelFound = $false
         try {
-            $apiResponse = Invoke-WebRequest -Uri "$OLLAMA_HOST/api/tags" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+            $headers = Get-OllamaHeaders
+            $apiResponse = Invoke-WebRequest -Uri "$OLLAMA_HOST/api/tags" -Headers $headers -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
             $apiJson = $apiResponse.Content
 
             if ($apiJson) {
@@ -373,6 +399,13 @@ except:
                 Remove-Item Env:TARGET_MODEL -ErrorAction SilentlyContinue
             }
         } catch {}
+
+        if ($IS_CLOUD_HOST -and -not $modelFound) {
+            Write-Host "⚠️  Ollama Cloud ではローカルの download 済み判定を行いません。"
+            Write-Host "   そのまま起動して、実際の API 呼び出し時にモデル可用性を確認します。"
+            Write-Host ""
+            $modelFound = $true
+        }
 
         if (-not $modelFound) {
             Write-Host "Error: AIモデル $MODEL がまだダウンロードされていません" -ForegroundColor Red

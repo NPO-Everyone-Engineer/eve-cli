@@ -106,8 +106,13 @@ EvE CLI のカスタマイズや高度な設定について解説します。
 PROFILE=auto
 
 [profile:online]
-MODEL=qwen3.5:397b-cloud
-SIDECAR_MODEL=qwen3:8b
+MODEL=glm-5:cloud
+SIDECAR_MODEL=gemma4:31b-cloud
+UTILITY_MODEL=gemma4:31b-cloud
+COMPACTION_MODEL=gemma4:31b-cloud
+SUBAGENT_MODEL=glm-5:cloud
+REVIEW_MODEL=gemma4:31b-cloud
+OLLAMA_HOST=https://ollama.com/api
 PLAN_MODE_REASONING_EFFORT=high
 
 [profile:offline]
@@ -655,8 +660,12 @@ eve-cli --channels discord,slack,webhook
 
 | 変数 | 説明 | 例 |
 |------|------|-----|
-| `EVE_CLI_MODEL` | デフォルトモデル | `qwen3:8b` |
-| `EVE_CLI_SIDECAR_MODEL` | サイドカーモデル | `qwen3:4b` |
+| `EVE_CLI_MODEL` | デフォルトモデル | `glm-5:cloud` |
+| `EVE_CLI_SIDECAR_MODEL` | サイドカーモデル | `gemma4:31b-cloud` |
+| `EVE_CLI_UTILITY_MODEL` | helper / utility モデル | `gemma4:31b-cloud` |
+| `EVE_CLI_COMPACTION_MODEL` | 会話圧縮モデル | `gemma4:31b-cloud` |
+| `EVE_CLI_SUBAGENT_MODEL` | サブエージェントモデル | `glm-5:cloud` |
+| `EVE_CLI_REVIEW_MODEL` | Rubber Duck / review モデル | `gemma4:31b-cloud` |
 | `EVE_CLI_PROFILE` | 接続プロファイル | `auto` |
 | `EVE_CLI_DEBUG` | デバッグモード | `1` |
 | `EVE_CLI_MAX_AGENT_STEPS` | AI ステップ上限 | `80` |
@@ -678,10 +687,14 @@ eve-cli --channels discord,slack,webhook
 ### 設定ファイル（~/.config/eve-cli/config）
 
 ```ini
-MODEL=qwen3:8b
-SIDECAR_MODEL=qwen3:4b
-OLLAMA_HOST=http://localhost:11434
-CONTEXT_WINDOW=65536
+MODEL=glm-5:cloud
+SIDECAR_MODEL=gemma4:31b-cloud
+UTILITY_MODEL=gemma4:31b-cloud
+COMPACTION_MODEL=gemma4:31b-cloud
+SUBAGENT_MODEL=glm-5:cloud
+REVIEW_MODEL=gemma4:31b-cloud
+OLLAMA_HOST=https://ollama.com/api
+CONTEXT_WINDOW=202752
 MAX_TOKENS=4096
 TEMPERATURE=0.25
 SUBAGENT_DEFAULT_MAX_TURNS=15
@@ -700,7 +713,7 @@ Ollama Cloud を使う場合の例：
 
 ```bash
 export OLLAMA_API_KEY=your-ollama-api-key
-eve-cli --ollama-host https://ollama.com/api --model qwen3.5:397b-cloud
+eve-cli --ollama-host https://ollama.com/api --model glm-5:cloud
 ```
 
 補足:
