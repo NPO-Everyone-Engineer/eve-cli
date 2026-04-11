@@ -36,7 +36,7 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(self.cfg.ollama_host, "http://localhost:11434")
 
     def test_default_model(self):
-        self.assertEqual(self.cfg.model, "glm-5:cloud")
+        self.assertEqual(self.cfg.model, "glm-5.1:cloud")
 
     def test_default_sidecar_model(self):
         self.assertEqual(self.cfg.sidecar_model, "gemma4:31b-cloud")
@@ -967,12 +967,12 @@ class TestOllamaClientHeaders(unittest.TestCase):
         cfg.ollama_api_key = "secret-token"
 
         fake_resp = MagicMock()
-        fake_resp.read.return_value = b'{"models":[{"name":"glm-5:cloud"}]}'
+        fake_resp.read.return_value = b'{"models":[{"name":"glm-5.1:cloud"}]}'
 
         with patch("urllib.request.urlopen", return_value=fake_resp) as mock_urlopen:
             models = cfg._query_installed_models()
 
-        self.assertEqual(models, ["glm-5:cloud"])
+        self.assertEqual(models, ["glm-5.1:cloud"])
         req = mock_urlopen.call_args[0][0]
         self.assertEqual(req.get_header("Authorization"), "Bearer secret-token")
 
@@ -983,7 +983,7 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
         self.assertTrue(eve_coder._is_cloud_model("gemma4:31b-cloud"))
 
     def test_glm5_cloud_is_treated_as_cloud(self):
-        self.assertTrue(eve_coder._is_cloud_model("glm-5:cloud"))
+        self.assertTrue(eve_coder._is_cloud_model("glm-5.1:cloud"))
 
     def test_qwen397_alias_is_treated_as_cloud(self):
         self.assertTrue(eve_coder._is_cloud_model("qwen3.5:397b"))
@@ -991,8 +991,8 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
 
     def test_glm5_cloud_uses_explicit_context_window(self):
         cfg = Config()
-        cfg._apply_context_window("glm-5:cloud")
-        self.assertEqual(cfg.context_window, 202752)
+        cfg._apply_context_window("glm-5.1:cloud")
+        self.assertEqual(cfg.context_window, 204800)
 
     def test_gemma_defaults_to_google_temperature(self):
         cfg = Config()
@@ -1045,7 +1045,7 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
         cfg = Config()
         client = eve_coder.OllamaClient(cfg)
 
-        temp = client._resolve_request_temperature("glm-5:cloud", tools=True)
+        temp = client._resolve_request_temperature("glm-5.1:cloud", tools=True)
 
         self.assertEqual(temp, 0.25)
 
@@ -1368,10 +1368,10 @@ class TestModelRoleResolution(unittest.TestCase):
 
     def test_subagent_model_prefers_specific_then_primary_model(self):
         cfg = Config()
-        cfg.model = "glm-5:cloud"
+        cfg.model = "glm-5.1:cloud"
         cfg.sidecar_model = "gemma4:31b"
         cfg.utility_model = "qwen3:8b"
-        self.assertEqual(eve_coder._resolve_subagent_model(cfg), "glm-5:cloud")
+        self.assertEqual(eve_coder._resolve_subagent_model(cfg), "glm-5.1:cloud")
         cfg.subagent_model = "qwen3.5:32b"
         self.assertEqual(eve_coder._resolve_subagent_model(cfg), "qwen3.5:32b")
 

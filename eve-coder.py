@@ -7,7 +7,7 @@ Usage:
     python3 eve-coder.py                        # interactive mode
     python3 eve-coder.py -p "ls -la を実行して"  # one-shot
     python3 eve-coder.py --model qwen3:8b       # local model
-    python3 eve-coder.py --model glm-5:cloud    # cloud model via Ollama
+    python3 eve-coder.py --model glm-5.1:cloud  # cloud model via Ollama
     python3 eve-coder.py -y                     # auto-approve all tools
     python3 eve-coder.py --resume               # resume last session
 """
@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.32.0"
+__version__ = "2.32.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1185,7 +1185,7 @@ class Config:
     """Configuration from CLI args, config file, and environment variables."""
 
     DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-    DEFAULT_MODEL = "glm-5:cloud"
+    DEFAULT_MODEL = "glm-5.1:cloud"
     DEFAULT_SIDECAR = "gemma4:31b-cloud"
     DEFAULT_UTILITY_MODEL = ""
     DEFAULT_COMPACTION_MODEL = ""
@@ -1934,7 +1934,7 @@ class Config:
         "qwen3:235b": 32768,
         "qwen3.5:397b": 262144,        # Cloud alias, 256K ctx
         "qwen3.5:397b-cloud": 262144,  # Cloud model, 256K ctx
-        "glm-5:cloud":       202752,   # Zhipu AI GLM-5 Cloud
+        "glm-5.1:cloud":     204800,   # Zhipu AI GLM-5.1 Cloud, 200K ctx
         "gemma4:31b-cloud":  262144,   # Cloud model, 256K ctx
         "gemma4:31b":        262144,   # 256K ctx
         "qwen3.5:35b-a3b": 262144,     # MoE 35B (3B active), 256K ctx
@@ -1985,7 +1985,7 @@ class Config:
         # Tier A — Expert: excellent coding + reasoning
         ("qwen3.5:397b",            256, "A"),  # Cloud alias
         ("qwen3.5:397b-cloud",      256, "A"),  # Cloud model
-        ("glm-5:cloud",               32, "A"),  # Zhipu AI GLM-5 Cloud
+        ("glm-5.1:cloud",             32, "A"),  # Zhipu AI GLM-5.1 Cloud, 200K ctx
         ("gemma4:31b-cloud",         32, "A"),  # Cloud model, 31B
         ("gemma4:31b",               32, "A"),  # 31B
         ("qwen3.5:35b-a3b",         256, "A"),  # MoE 35B (3B active)
