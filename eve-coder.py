@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.31.0"
+__version__ = "2.32.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1934,6 +1934,7 @@ class Config:
         "qwen3:235b": 32768,
         "qwen3.5:397b": 262144,        # Cloud alias, 256K ctx
         "qwen3.5:397b-cloud": 262144,  # Cloud model, 256K ctx
+        "glm-5:cloud":       204800,   # Zhipu AI GLM-5 Cloud, 200K ctx
         "gemma4:31b-cloud":  262144,   # Cloud model, 256K ctx
         "gemma4:31b":        262144,   # 256K ctx
         "qwen3.5:35b-a3b": 262144,     # MoE 35B (3B active), 256K ctx
@@ -1984,6 +1985,7 @@ class Config:
         # Tier A — Expert: excellent coding + reasoning
         ("qwen3.5:397b",            256, "A"),  # Cloud alias
         ("qwen3.5:397b-cloud",      256, "A"),  # Cloud model
+        ("glm-5:cloud",               32, "A"),  # Zhipu AI GLM-5 Cloud, 200K ctx
         ("gemma4:31b-cloud",         32, "A"),  # Cloud model, 31B
         ("gemma4:31b",               32, "A"),  # 31B
         ("qwen3.5:35b-a3b",         256, "A"),  # MoE 35B (3B active)
