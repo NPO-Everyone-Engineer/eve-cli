@@ -160,7 +160,7 @@ $script:MESSAGES = @{
     "ja_reopen"            = "Open a new terminal, then run eve-cli"
     "ja_enjoy"             = "  Free AI Coding wo Tanoshimou  "
     "ja_help_usage"        = "Usage: install.ps1 [--model MODEL_NAME] [--lang LANG]"
-    "ja_help_model"        = "Specify Ollama model (e.g. glm-5:cloud)"
+    "ja_help_model"        = "Specify Ollama model (e.g. glm-5.1:cloud)"
     "ja_help_lang"         = "Language: ja, en, zh"
     "ja_unknown_opt"       = "Unknown option"
 
@@ -234,7 +234,7 @@ $script:MESSAGES = @{
     "en_reopen"            = "Open a new terminal, then run eve-cli"
     "en_enjoy"             = "  ENJOY  FREE  AI  CODING  "
     "en_help_usage"        = "Usage: install.ps1 [--model MODEL_NAME] [--lang LANG]"
-    "en_help_model"        = "Specify Ollama model (e.g. glm-5:cloud)"
+    "en_help_model"        = "Specify Ollama model (e.g. glm-5.1:cloud)"
     "en_help_lang"         = "Language: ja, en, zh"
     "en_unknown_opt"       = "Unknown option"
 
@@ -308,7 +308,7 @@ $script:MESSAGES = @{
     "zh_reopen"            = "Open a new terminal, then run eve-cli"
     "zh_enjoy"             = "  Enjoy Free AI Coding  "
     "zh_help_usage"        = "Usage: install.ps1 [--model MODEL_NAME] [--lang LANG]"
-    "zh_help_model"        = "Specify Ollama model (e.g. glm-5:cloud)"
+    "zh_help_model"        = "Specify Ollama model (e.g. glm-5.1:cloud)"
     "zh_help_lang"         = "Language: ja, en, zh"
     "zh_unknown_opt"       = "Unknown option"
 }
@@ -752,6 +752,7 @@ $UTILITY_MODEL = ""
 $COMPACTION_MODEL = ""
 $SUBAGENT_MODEL = ""
 $REVIEW_MODEL = ""
+$VISION_MODEL = ""
 $CONFIG_OLLAMA_HOST = "http://localhost:11434"
 $MANUAL_MODEL = $Model
 
@@ -764,6 +765,7 @@ function Set-CloudRoleDefaults {
     $script:UTILITY_MODEL = $script:SIDECAR_MODEL
     $script:COMPACTION_MODEL = $script:SIDECAR_MODEL
     $script:REVIEW_MODEL = $script:SIDECAR_MODEL
+    $script:VISION_MODEL = $script:SIDECAR_MODEL
     $script:SUBAGENT_MODEL = $script:MODEL
     $script:CONFIG_OLLAMA_HOST = "https://ollama.com/api"
 }
@@ -774,6 +776,7 @@ function Test-UsingCloudModels {
            (Test-IsCloudModel $script:UTILITY_MODEL) -or
            (Test-IsCloudModel $script:COMPACTION_MODEL) -or
            (Test-IsCloudModel $script:SUBAGENT_MODEL) -or
+           (Test-IsCloudModel $script:VISION_MODEL) -or
            (Test-IsCloudModel $script:REVIEW_MODEL)
 }
 
@@ -784,11 +787,11 @@ if ($MANUAL_MODEL) {
     }
     Vapor-Info "$(msg 'manual_model'): $MODEL"
 } else {
-    $MODEL = "glm-5:cloud"
+    $MODEL = "glm-5.1:cloud"
     Set-CloudRoleDefaults
     Write-Host "  ${NEON_GREEN}|${NC} :: ${BOLD}${YELLOW}*** CLOUD DEFAULT ***${NC}"
     Write-Host "  ${NEON_GREEN}|${NC}    ${BOLD}${WHITE}${MODEL}${NC} ${DIM}(Cloud, agentic coding default)${NC}"
-    Write-Host "  ${NEON_GREEN}|${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (Cloud helper / review)${NC}"
+    Write-Host "  ${NEON_GREEN}|${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (Cloud helper / review / vision)${NC}"
 }
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -1208,6 +1211,7 @@ UTILITY_MODEL="$UTILITY_MODEL"
 COMPACTION_MODEL="$COMPACTION_MODEL"
 SUBAGENT_MODEL="$SUBAGENT_MODEL"
 REVIEW_MODEL="$REVIEW_MODEL"
+VISION_MODEL="$VISION_MODEL"
 OLLAMA_HOST="$CONFIG_OLLAMA_HOST"
 "@
     Set-Content -Path $CONFIG_FILE -Value $configContent -Encoding UTF8

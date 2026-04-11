@@ -126,7 +126,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | やりたいこと | コマンド |
 |-------------|----------|
 | 普通に使う | `eve-cli` |
-| モデルを指定する | `eve-cli --model glm-5:cloud` |
+| モデルを指定する | `eve-cli --model glm-5.1:cloud` |
 | 前回の続きから始める | `eve-cli --resume` |
 | 1回だけ実行する | `eve-cli -p "テストを書いて実行して"` |
 | 自動テスト付きで使う | `eve-cli --autotest` |
@@ -154,7 +154,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 
 | 構成 | 条件 | 既定の目安 |
 |------|------|------------|
-| 標準構成 | ネットワーク接続あり | `MODEL=glm-5:cloud` + `SIDECAR_MODEL=gemma4:31b-cloud` |
+| 標準構成 | ネットワーク接続あり | `MODEL=glm-5.1:cloud` + `SIDECAR_MODEL=gemma4:31b-cloud` + `VISION_MODEL=gemma4:31b-cloud` |
 | オフライン / ローカル重視 | ローカル Ollama を使う | `--model qwen3:8b` など |
 
 ```bash
@@ -172,11 +172,12 @@ eve-cli --model qwen3:8b
 毎回同じモデルや設定を使いたい場合は、このファイルを編集してください。
 
 ```ini
-MODEL=glm-5:cloud
+MODEL=glm-5.1:cloud
 SIDECAR_MODEL=gemma4:31b-cloud
+VISION_MODEL=gemma4:31b-cloud
 UTILITY_MODEL=gemma4:31b-cloud
 COMPACTION_MODEL=gemma4:31b-cloud
-SUBAGENT_MODEL=glm-5:cloud
+SUBAGENT_MODEL=glm-5.1:cloud
 REVIEW_MODEL=gemma4:31b-cloud
 OLLAMA_HOST=https://ollama.com/api
 CONTEXT_WINDOW=202752
@@ -191,7 +192,7 @@ Ollama Cloud を使う場合は、`OLLAMA_HOST` を `https://ollama.com/api` に
 
 ```bash
 export OLLAMA_API_KEY=your-ollama-api-key
-eve-cli --ollama-host https://ollama.com/api --model glm-5:cloud
+eve-cli --ollama-host https://ollama.com/api --model glm-5.1:cloud
 ```
 
 補足:

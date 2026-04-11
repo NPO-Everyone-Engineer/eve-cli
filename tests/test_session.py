@@ -34,8 +34,17 @@ def _make_config(tmpdir, session_id=None, context_window=32768):
         session_id=session_id,
         sessions_dir=sessions_dir,
         cwd=tmpdir,
+        model="glm-5.1:cloud",
         sidecar_model="",
     )
+
+
+class _FakeVisionClient:
+    def __init__(self, support_map):
+        self.support_map = dict(support_map)
+
+    def check_vision_support(self, model, assume_if_unknown=True):
+        return self.support_map.get(model, assume_if_unknown)
 
 
 class TestSessionInit(unittest.TestCase):
@@ -478,6 +487,22 @@ class TestSessionAddToolResults(unittest.TestCase):
         self.assertEqual(content[0]["type"], "text")
         self.assertEqual(content[1]["type"], "image_url")
 
+    def test_multiple_tool_results_keep_tool_sequence_before_image_followups(self):
+        image_marker = json.dumps({
+            "type": "image",
+            "media_type": "image/png",
+            "data": "iVBORw0KGgo=",
+        })
+        results = [
+            ToolResult("tc1", image_marker),
+            ToolResult("tc2", "plain text"),
+        ]
+        self.sess.add_tool_results(results)
+        self.assertEqual(
+            [msg["role"] for msg in self.sess.messages],
+            ["tool", "tool", "user"],
+        )
+
 
 class TestSessionMaxMessagesEnforcement(unittest.TestCase):
     """Tests that MAX_MESSAGES is enforced via add_user_message."""
@@ -589,6 +614,40 @@ class TestSessionRuntimeState(unittest.TestCase):
         summary = resumed.get_resume_summary()
         self.assertEqual(summary["running_jobs"], 0)
         self.assertEqual(summary["orphaned_jobs"], 1)
+
+    def test_save_sanitizes_image_history_for_non_vision_primary(self):
+        cfg = _make_config(self.tmpdir, session_id="vision_save")
+        sess = Session(cfg, "prompt")
+        sess.set_client(_FakeVisionClient({"glm-5.1:cloud": False}))
+        sess.add_multimodal_user_message([
+            {"type": "text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+        sess.add_assistant_message("It shows a terminal error dialog.")
+
+        sess.save()
+
+        self.assertIsInstance(sess.messages[0]["content"], str)
+        self.assertIn("omitted from saved history", sess.messages[0]["content"])
+        path = os.path.join(cfg.sessions_dir, "vision_save.jsonl")
+        with open(path, encoding="utf-8") as f:
+            payload = f.read()
+        self.assertNotIn("image_url", payload)
+        self.assertNotIn("data:image/png", payload)
+
+    def test_save_keeps_image_history_for_vision_primary(self):
+        cfg = _make_config(self.tmpdir, session_id="vision_keep")
+        cfg.model = "gemma4:31b"
+        sess = Session(cfg, "prompt")
+        sess.set_client(_FakeVisionClient({"gemma4:31b": True}))
+        sess.add_multimodal_user_message([
+            {"type": "text", "text": "Describe this image"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+
+        sess.save()
+
+        self.assertIsInstance(sess.messages[0]["content"], list)
 
 
 if __name__ == "__main__":

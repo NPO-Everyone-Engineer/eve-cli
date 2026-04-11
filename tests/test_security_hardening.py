@@ -330,8 +330,20 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertIn("function Download-RepoFileVerified", content)
         self.assertIn("install-manifest.json", content)
         self.assertIn("EVE_CLI_INSTALL_REF", content)
-        self.assertIn("Confirm-UnverifiedRemoteInstaller", content)
-        self.assertIn("EVE_CLI_OLLAMA_SETUP_SHA256", content)
+
+    def test_install_scripts_pin_cloud_role_config(self):
+        shell_content = Path(SCRIPT_DIR, "install.sh").read_text(encoding="utf-8")
+        powershell_content = Path(SCRIPT_DIR, "install.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('MODEL="glm-5.1:cloud"', shell_content)
+        self.assertIn('VISION_MODEL="${VISION_MODEL}"', shell_content)
+        self.assertIn('OLLAMA_HOST="${CONFIG_OLLAMA_HOST}"', shell_content)
+
+        self.assertIn('$MODEL = "glm-5.1:cloud"', powershell_content)
+        self.assertIn('$script:VISION_MODEL = $script:SIDECAR_MODEL', powershell_content)
+        self.assertIn('VISION_MODEL="$VISION_MODEL"', powershell_content)
+        self.assertIn("Confirm-UnverifiedRemoteInstaller", powershell_content)
+        self.assertIn("EVE_CLI_OLLAMA_SETUP_SHA256", powershell_content)
 
     def test_shell_wrapper_allows_official_ollama_cloud_and_version_passthrough(self):
         content = Path(SCRIPT_DIR, "eve-cli.sh").read_text(encoding="utf-8")

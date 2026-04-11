@@ -91,11 +91,12 @@ class _FakeTUI:
 
 
 class _SequenceClient:
-    def __init__(self, responses):
+    def __init__(self, responses, vision_support=None):
         self.responses = list(responses)
         self.calls = []
         self.think_mode = False
         self.thinking_budget = 0
+        self.vision_support = dict(vision_support or {})
 
     def chat(self, model, messages, tools=None, stream=True, options=None):
         self.calls.append({
@@ -107,6 +108,9 @@ class _SequenceClient:
         if not self.responses:
             raise AssertionError("No fake response queued")
         return self.responses.pop(0)
+
+    def check_vision_support(self, model, assume_if_unknown=True):
+        return self.vision_support.get(model, assume_if_unknown)
 
 
 class _FakeCodeIntel:
@@ -394,6 +398,36 @@ class TestAgentRuntimeControls(unittest.TestCase):
 
         self.assertEqual(policy["model"], "test-model")
         self.assertEqual(policy["options"], {"retry_temperature_boost": 0.3})
+
+    def test_resolve_request_policy_routes_images_to_vision_model(self):
+        client = _SequenceClient([], vision_support={
+            "test-model": False,
+            "vision-helper": True,
+        })
+        agent, session = self.make_agent(client, [eve_coder.ReadTool(self.project_dir)])
+        agent.config.vision_model = "vision-helper"
+        session.add_multimodal_user_message([
+            {"type": "text", "text": "Explain this screenshot"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+
+        policy = agent._resolve_request_policy([], empty_retries=0)
+
+        self.assertEqual(policy["model"], "vision-helper")
+        self.assertTrue(policy["vision_route"])
+
+    def test_resolve_request_policy_keeps_primary_for_vision_capable_main_model(self):
+        client = _SequenceClient([], vision_support={"test-model": True})
+        agent, session = self.make_agent(client, [eve_coder.ReadTool(self.project_dir)])
+        session.add_multimodal_user_message([
+            {"type": "text", "text": "Explain this screenshot"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+
+        policy = agent._resolve_request_policy([], empty_retries=0)
+
+        self.assertEqual(policy["model"], "test-model")
+        self.assertFalse(policy["vision_route"])
 
     def test_rubber_duck_review_uses_review_model_and_records_note(self):
         client = _SequenceClient([

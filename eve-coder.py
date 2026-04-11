@@ -1186,11 +1186,12 @@ class Config:
 
     DEFAULT_OLLAMA_HOST = "http://localhost:11434"
     DEFAULT_MODEL = "glm-5.1:cloud"
-    DEFAULT_SIDECAR = "gemma4:31b"
+    DEFAULT_SIDECAR = "gemma4:31b-cloud"
     DEFAULT_UTILITY_MODEL = ""
     DEFAULT_COMPACTION_MODEL = ""
     DEFAULT_SUBAGENT_MODEL = "glm-5.1:cloud"
     DEFAULT_REVIEW_MODEL = ""
+    DEFAULT_VISION_MODEL = "gemma4:31b-cloud"
     DEFAULT_RUBBER_DUCK_CHECKPOINTS = "plan,post-edit"
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
@@ -1212,6 +1213,7 @@ class Config:
         self.compaction_model = self.DEFAULT_COMPACTION_MODEL
         self.subagent_model = self.DEFAULT_SUBAGENT_MODEL
         self.review_model = self.DEFAULT_REVIEW_MODEL
+        self.vision_model = self.DEFAULT_VISION_MODEL
         self.max_tokens = self.DEFAULT_MAX_TOKENS
         self.temperature = self.DEFAULT_TEMPERATURE
         self.context_window = self.DEFAULT_CONTEXT_WINDOW
@@ -1237,6 +1239,7 @@ class Config:
         self._cli_compaction_model_set = False
         self._cli_subagent_model_set = False
         self._cli_review_model_set = False
+        self._cli_vision_model_set = False
         self._cli_ollama_host_set = False
         self._cli_max_tokens_set = False
         self._cli_temperature_set = False
@@ -1422,6 +1425,9 @@ class Config:
                     elif key == "REVIEW_MODEL" and val:
                         self.review_model = val
                         self._cli_review_model_set = True
+                    elif key == "VISION_MODEL" and val:
+                        self.vision_model = val
+                        self._cli_vision_model_set = True
                     elif key == "OLLAMA_HOST" and val:
                         self.ollama_host = val
                     elif key == "OLLAMA_API_KEY" and val:
@@ -1541,6 +1547,9 @@ class Config:
         if os.environ.get("EVE_CLI_REVIEW_MODEL"):
             self._cli_review_model_set = True
             self.review_model = os.environ["EVE_CLI_REVIEW_MODEL"]
+        if os.environ.get("EVE_CLI_VISION_MODEL"):
+            self._cli_vision_model_set = True
+            self.vision_model = os.environ["EVE_CLI_VISION_MODEL"]
         if _env_truthy("EVE_CLI_RUBBER_DUCK"):
             self.rubber_duck = True
         if os.environ.get("EVE_CLI_RUBBER_DUCK_CHECKPOINTS"):
@@ -2068,6 +2077,9 @@ class Config:
         if prof.get("REVIEW_MODEL") and not self._cli_review_model_set:
             self.review_model = prof["REVIEW_MODEL"]
             self._cli_review_model_set = True
+        if prof.get("VISION_MODEL") and not self._cli_vision_model_set:
+            self.vision_model = prof["VISION_MODEL"]
+            self._cli_vision_model_set = True
         if "RUBBER_DUCK" in prof:
             self.rubber_duck = str(prof["RUBBER_DUCK"]).strip().lower() in ("true", "1", "yes", "on")
         if "RUBBER_DUCK_CHECKPOINTS" in prof:
@@ -2274,6 +2286,16 @@ class Config:
         parsed = urllib.parse.urlparse(self.ollama_host)
         return self._is_local_ollama_host(parsed.hostname or "")
 
+    def _apply_role_model_defaults(self):
+        primary_model = (self.model or self.DEFAULT_MODEL or "").strip()
+        use_cloud_helper_roles = _is_cloud_model(primary_model) or not self.uses_local_ollama()
+        if not self._cli_sidecar_set:
+            self.sidecar_model = self.DEFAULT_SIDECAR if use_cloud_helper_roles else primary_model
+        if not self._cli_subagent_model_set:
+            self.subagent_model = primary_model
+        if not self._cli_vision_model_set:
+            self.vision_model = self.DEFAULT_VISION_MODEL if use_cloud_helper_roles else ""
+
     def _validate_ollama_host(self):
         raw_host = (self.ollama_host or "").strip()
         if "://" not in raw_host:
@@ -2311,12 +2333,13 @@ class Config:
         self.notify_on = _normalize_notify_events(self.notify_on)
         # Validate model names — reject shell metacharacters / path traversal
         _SAFE_MODEL_RE = re.compile(r'^[a-zA-Z0-9_.:\-/]+$')
-        for attr in ("model", "sidecar_model", "utility_model", "compaction_model", "subagent_model", "review_model"):
+        for attr in ("model", "sidecar_model", "utility_model", "compaction_model", "subagent_model", "review_model", "vision_model"):
             val = getattr(self, attr, "")
             if val and not _SAFE_MODEL_RE.match(val):
                 msg = t('warnings.invalid_model_name', default=f"Warning: invalid {attr} name {val!r} — resetting to default.")
                 print(f"{C.YELLOW}{msg}{C.RESET}", file=sys.stderr)
                 setattr(self, attr, "" if attr != "model" else self.DEFAULT_MODEL)
+        self._apply_role_model_defaults()
 
     def _ensure_dirs(self):
         for d in [self.config_dir, self.state_dir, self.sessions_dir, self.commands_dir]:
@@ -4692,6 +4715,7 @@ class OllamaClient:
     def __init__(self, config):
         self._supports_tool_streaming = None  # None=untested, True/False=detected
         self._response_cache = ResponseCache()
+        self._vision_support_cache = {}
         self.refresh_from_config(config)
 
     def refresh_from_config(self, config):
@@ -4713,6 +4737,7 @@ class OllamaClient:
         self.timeout = 300
         if prev_base_url is not None and prev_base_url != self.base_url:
             self._supports_tool_streaming = None
+            self._vision_support_cache.clear()
 
     def _api_url(self, path):
         return f"{self.base_url}{path}"
@@ -4808,9 +4833,14 @@ class OllamaClient:
             self._supports_tool_streaming = False
             return False
 
-    def check_vision_support(self, model):
+    def check_vision_support(self, model, assume_if_unknown=True):
         """Check if a model supports vision/images via /api/show.
         Returns True if vision is likely supported, False otherwise."""
+        if not model:
+            return False
+        cached = self._vision_support_cache.get(model)
+        if cached is not None:
+            return cached
         try:
             body = json.dumps({"name": model}).encode("utf-8")
             req = urllib.request.Request(
@@ -4830,18 +4860,23 @@ class OllamaClient:
             families = details.get("families", [])
             # Known vision model families / projector indicators
             if any(f in families for f in ["clip", "mllama"]):
+                self._vision_support_cache[model] = True
                 return True
             if "vision" in model.lower() or "llava" in model.lower():
+                self._vision_support_cache[model] = True
                 return True
             if model.lower().startswith("gemma4:"):
+                self._vision_support_cache[model] = True
                 return True
             # Check parameters/template for image token
             template = data.get("template", "")
             if "image" in template.lower() or ".image" in template:
+                self._vision_support_cache[model] = True
                 return True
+            self._vision_support_cache[model] = False
             return False
         except Exception:
-            return True  # Assume yes if check fails (don't block user)
+            return assume_if_unknown
 
     def check_model(self, model_name, available_models=None):
         """Check if a specific model is available (exact or tag match).
@@ -15739,12 +15774,62 @@ def _resolve_review_model(config):
     )
 
 
+def _resolve_vision_model(config):
+    return _config_value(config, "vision_model", "")
+
+
+def _vision_model_candidates(config):
+    candidates = [
+        _resolve_vision_model(config),
+        _config_value(config, "sidecar_model", ""),
+        _config_value(config, "utility_model", ""),
+        "gemma4:31b-cloud",
+        "gemma4:31b",
+    ]
+    ordered = []
+    seen = set()
+    for candidate in candidates:
+        name = (candidate or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
+def _pick_vision_route_model(config, client):
+    primary_model = _config_value(config, "model", "")
+    if not primary_model or client is None:
+        return ""
+    try:
+        primary_has_vision = client.check_vision_support(primary_model, assume_if_unknown=False)
+    except TypeError:
+        primary_has_vision = client.check_vision_support(primary_model)
+    except Exception:
+        primary_has_vision = False
+    if primary_has_vision:
+        return ""
+    for candidate in _vision_model_candidates(config):
+        if candidate == primary_model:
+            continue
+        try:
+            if client.check_vision_support(candidate, assume_if_unknown=False):
+                return candidate
+        except TypeError:
+            if client.check_vision_support(candidate):
+                return candidate
+        except Exception:
+            continue
+    return ""
+
+
 def _role_model_snapshot(config):
     return {
         "utility": _resolve_utility_model(config),
         "compaction": _resolve_compaction_model(config),
         "subagent": _resolve_subagent_model(config),
         "review": _resolve_review_model(config),
+        "vision": _resolve_vision_model(config),
     }
 
 
@@ -17735,6 +17820,7 @@ class Session:
         self._token_estimate = 0
         self._last_compact_msg_count = 0  # prevent infinite re-compaction
         self._just_compacted = False  # skip token reconciliation right after compaction
+        self._sanitize_vision_history_on_save = False
         self.runtime_state = SessionRuntimeStore(config, self.session_id)
         self.runtime_state.ensure_defaults(
             cwd=os.path.abspath(getattr(config, "cwd", "")),
@@ -17753,6 +17839,8 @@ class Session:
     def set_client(self, client):
         """Set OllamaClient reference for sidecar model summarization."""
         self._client = client
+        if self.has_image_messages() and self._should_sanitize_vision_history():
+            self._sanitize_vision_history_on_save = True
 
     @staticmethod
     def _project_index_path(config):
@@ -17821,6 +17909,106 @@ class Session:
         return cjk_count + non_cjk // 4
 
     @classmethod
+    def _estimate_message_content_tokens(cls, content, image_token_cost=800):
+        total = 0
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    total += cls._estimate_tokens(part.get("text", ""))
+                elif part.get("type") == "image_url":
+                    total += image_token_cost
+            return total
+        return cls._estimate_tokens(content or "")
+
+    @staticmethod
+    def _message_has_images(msg):
+        if not isinstance(msg, dict):
+            return False
+        if isinstance(msg.get("images"), list) and msg.get("images"):
+            return True
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return False
+        return any(
+            isinstance(part, dict) and part.get("type") == "image_url"
+            for part in content
+        )
+
+    @classmethod
+    def _sanitize_message_image_content(cls, msg):
+        content = msg.get("content")
+        text_parts = []
+        image_count = 0
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    text = part.get("text", "")
+                    if text:
+                        text_parts.append(text)
+                elif part.get("type") == "image_url":
+                    image_count += 1
+        elif isinstance(content, str) and content.strip():
+            text_parts.append(content.strip())
+        if isinstance(msg.get("images"), list):
+            image_count += len(msg["images"])
+        if image_count <= 0:
+            return dict(msg)
+        label = "Image attachment" if image_count == 1 else f"{image_count} image attachments"
+        note = (
+            f"[{label} omitted from saved history to keep future turns compatible with non-vision models. "
+            "Reattach the image for more visual inspection.]"
+        )
+        summary = "\n".join(part for part in text_parts if part).strip()
+        sanitized = dict(msg)
+        sanitized["content"] = f"{summary}\n{note}" if summary else note
+        sanitized.pop("images", None)
+        return sanitized
+
+    def has_image_messages(self):
+        return any(self._message_has_images(msg) for msg in self.messages)
+
+    def _should_sanitize_vision_history(self):
+        if self._client is None:
+            return False
+        model = getattr(self.config, "model", "")
+        if not model:
+            return False
+        try:
+            return not self._client.check_vision_support(model, assume_if_unknown=False)
+        except TypeError:
+            return not self._client.check_vision_support(model)
+        except Exception:
+            return False
+
+    def _sanitize_vision_history(self):
+        changed = False
+        for idx, msg in enumerate(self.messages):
+            if not self._message_has_images(msg):
+                continue
+            sanitized = self._sanitize_message_image_content(msg)
+            if sanitized != msg:
+                self.messages[idx] = sanitized
+                changed = True
+        self._sanitize_vision_history_on_save = False
+        if changed:
+            self._recalculate_tokens()
+        return changed
+
+    def _append_user_message_content(self, content):
+        self.messages.append({"role": "user", "content": content})
+        self._token_estimate += self._estimate_message_content_tokens(content)
+        if self._message_has_images({"content": content}) and self._should_sanitize_vision_history():
+            self._sanitize_vision_history_on_save = True
+
+    def add_multimodal_user_message(self, content):
+        self._append_user_message_content(content)
+        self._enforce_max_messages()
+
+    @classmethod
     def context_policy_for(cls, config):
         model_name = getattr(config, "model", "") or ""
         context_window = getattr(config, "context_window", Config.DEFAULT_CONTEXT_WINDOW) or Config.DEFAULT_CONTEXT_WINDOW
@@ -17881,17 +18069,9 @@ class Session:
         """Recalculate token estimate from current messages."""
         total = 0
         for m in self.messages:
-            content = m.get("content")
-            if isinstance(content, list):
-                # Multipart content (e.g. image messages): sum text parts + estimate images
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            total += self._estimate_tokens(part.get("text", ""))
-                        elif part.get("type") == "image_url":
-                            total += 800  # approximate token cost for an image
-            else:
-                total += self._estimate_tokens(content or "")
+            total += self._estimate_message_content_tokens(m.get("content"))
+            if isinstance(m.get("images"), list):
+                total += len(m["images"]) * 800
             if m.get("tool_calls"):
                 total += len(json.dumps(m["tool_calls"], ensure_ascii=False)) // 4
         self._token_estimate = total
@@ -18012,6 +18192,7 @@ class Session:
         """Add tool results as separate messages (OpenAI format).
         Image results are formatted as multipart content with image_url for multimodal models."""
         max_result_tokens = int(self.config.context_window * 0.25)
+        pending_image_messages = []
         for r in results:
             output = str(r.output) if r.output is not None else ""
 
@@ -18026,16 +18207,11 @@ class Session:
                     "tool_call_id": r.id,
                     "content": f"[Image loaded: {media_type}]",
                 })
-                # Add a user message with the actual image content (multipart format)
-                self.messages.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Image from ReadTool:"},
-                        {"type": "image_url", "image_url": {"url": data_uri}},
-                    ],
-                })
-                # Rough token estimate for the image (images are typically ~765 tokens)
-                self._token_estimate += 800
+                self._token_estimate += self._estimate_tokens(f"[Image loaded: {media_type}]")
+                pending_image_messages.append([
+                    {"type": "text", "text": "Image from ReadTool:"},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ])
                 continue
 
             # Pre-truncate very large results (H19 fix)
@@ -18048,6 +18224,8 @@ class Session:
                 "content": output,
             })
             self._token_estimate += self._estimate_tokens(output)
+        for content in pending_image_messages:
+            self._append_user_message_content(content)
         self._enforce_max_messages()
 
     def get_messages(self):
@@ -18262,6 +18440,8 @@ class Session:
         """Save session to JSONL file and update project index."""
         if not self.messages:
             return  # nothing to persist; don't create empty files
+        if self._sanitize_vision_history_on_save:
+            self._sanitize_vision_history()
         path = os.path.join(self.config.sessions_dir, f"{self.session_id}.jsonl")
         # Verify resolved path stays inside sessions_dir (path traversal guard)
         real_path = os.path.realpath(path)
@@ -18402,6 +18582,8 @@ class Session:
             _set_active_runtime_state(self.runtime_state)
             _restore_task_store(self.runtime_state)
             self._recalculate_tokens()
+            if self.has_image_messages() and self._should_sanitize_vision_history():
+                self._sanitize_vision_history_on_save = True
             return True
         except OSError as e:
             print(f"{C.RED}{t('errors.session_load_failed', default=f'Error loading session: {e}')}{C.RESET}", file=sys.stderr)
@@ -20340,6 +20522,7 @@ class Agent:
         self._route_prefilter_names = None
         self._last_route_report = None
         self._last_stop_reason = None
+        self._last_route_notice = ""
 
         self.git_checkpoint = GitCheckpoint(config.cwd, runtime_state=session.runtime_state)
         self.change_tracker = GitChangeTracker(config.cwd)
@@ -20700,7 +20883,13 @@ class Agent:
             "options": {},
             "reasoning": self._active_reasoning_profile(),
             "tools": tool_schemas if tool_schemas else None,
+            "vision_route": False,
         }
+        if self.session.has_image_messages():
+            routed_model = _pick_vision_route_model(self.config, self.client)
+            if routed_model:
+                policy["model"] = routed_model
+                policy["vision_route"] = True
         if empty_retries >= 2:
             policy["options"]["retry_temperature_boost"] = 0.3
         if not policy["options"]:
@@ -20965,10 +21154,6 @@ class Agent:
         # Check if scroll region is already active (managed by main loop)
         _scroll_mode = self.tui.scroll_region._active
 
-        # Display current model in footer
-        if self.tui.scroll_region._active:
-            self.tui.scroll_region.update_mode_display(f"Model: {self.config.model}")
-
         # ESC key monitor for real-time interrupt
         _esc_monitor = InputMonitor()
         _esc_monitor.start()
@@ -21002,6 +21187,14 @@ class Agent:
                 # 1. Call Ollama (with retry for malformed responses)
                 tools = self._get_tool_schemas()
                 request_policy = self._resolve_request_policy(tools, _empty_retries)
+                if self.tui.scroll_region._active:
+                    self.tui.scroll_region.update_mode_display(f"Model: {request_policy['model']}")
+                route_notice = ""
+                if request_policy.get("vision_route") and request_policy["model"] != self.config.model:
+                    route_notice = request_policy["model"]
+                    if route_notice != self._last_route_notice:
+                        _p(f"  {C.DIM}[vision route: {self.config.model} → {request_policy['model']}]{C.RESET}")
+                self._last_route_notice = route_notice
                 _esc_hint = " — ESC: 中断" if HAS_TERMIOS else ""
                 # P2: フッターにツール呼び出し数を渡す
                 self.tui._current_iteration = iteration
@@ -21116,7 +21309,7 @@ class Agent:
                     # Step 2: Retry with slightly higher temperature
                     if _empty_retries == 2:
                         _retry_temp = self.client._resolve_request_temperature(
-                            self.config.model,
+                            request_policy["model"],
                             tools=bool(tools),
                             options={"retry_temperature_boost": 0.3},
                         )
@@ -25343,23 +25536,23 @@ Review this code for:
                 if not text.strip():
                     text = "この画像について説明してください。"
                 user_input = text
-                # Check if model supports vision
                 _model_name = config.model or ""
                 if not hasattr(session, '_vision_warned'):
                     session._vision_warned = False
-                if not session._vision_warned and _model_name:
-                    _has_vision = client.check_vision_support(_model_name)
-                    if not _has_vision:
+                _vision_route_model = _pick_vision_route_model(config, client)
+                _primary_has_vision = False
+                if _model_name:
+                    _primary_has_vision = client.check_vision_support(_model_name, assume_if_unknown=False)
+                if _vision_route_model and _vision_route_model != _model_name:
+                    print(f"  {C.DIM}📷 Vision route: {_model_name} → {_vision_route_model}{C.RESET}")
+                elif not session._vision_warned and _model_name and not _primary_has_vision:
                         print(f"  {C.YELLOW}⚠️  モデル '{_model_name}' はビジョン(画像認識)非対応の可能性があります。{C.RESET}")
                         print(f"  {C.DIM}ビジョン対応モデル例: llava, llama3.2-vision, gemma3, gemma4 等{C.RESET}")
                         session._vision_warned = True
-                # Temporarily override add_user_message to send multimodal content
                 content = _build_multimodal_content(text, _images_for_msg)
                 n_imgs = len(_images_for_msg)
                 print(f"  {C.DIM}Sending with {n_imgs} image{'s' if n_imgs > 1 else ''}...{C.RESET}")
-                session.messages.append({"role": "user", "content": content})
-                session._token_estimate += session._estimate_tokens(text) + n_imgs * 1000
-                session._enforce_max_messages()
+                session.add_multimodal_user_message(content)
                 # Run agent without adding user message again
                 agent._run_without_add(user_input)
             else:

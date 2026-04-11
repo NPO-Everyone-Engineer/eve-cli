@@ -39,7 +39,10 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(self.cfg.model, "glm-5.1:cloud")
 
     def test_default_sidecar_model(self):
-        self.assertEqual(self.cfg.sidecar_model, "gemma4:31b")
+        self.assertEqual(self.cfg.sidecar_model, "gemma4:31b-cloud")
+
+    def test_default_vision_model(self):
+        self.assertEqual(self.cfg.vision_model, "gemma4:31b-cloud")
 
     def test_default_review_model(self):
         self.assertEqual(self.cfg.review_model, "")
@@ -244,6 +247,7 @@ class TestParseConfigFile(unittest.TestCase):
             COMPACTION_MODEL = gemma4:31b
             SUBAGENT_MODEL = qwen3.5:32b
             REVIEW_MODEL = gemma4:31b-cloud
+            VISION_MODEL = gemma4:27b-cloud
             RUBBER_DUCK = true
             RUBBER_DUCK_CHECKPOINTS = plan
         """)
@@ -253,6 +257,7 @@ class TestParseConfigFile(unittest.TestCase):
             self.assertEqual(self.cfg.compaction_model, "gemma4:31b")
             self.assertEqual(self.cfg.subagent_model, "qwen3.5:32b")
             self.assertEqual(self.cfg.review_model, "gemma4:31b-cloud")
+            self.assertEqual(self.cfg.vision_model, "gemma4:27b-cloud")
             self.assertTrue(self.cfg.rubber_duck)
             self.assertEqual(self.cfg.rubber_duck_checkpoints, "plan")
         finally:
@@ -656,6 +661,7 @@ class TestLoadEnv(unittest.TestCase):
             EVE_CLI_COMPACTION_MODEL="compact-v1",
             EVE_CLI_SUBAGENT_MODEL="sub-v1",
             EVE_CLI_REVIEW_MODEL="review-v1",
+            EVE_CLI_VISION_MODEL="vision-v1",
             EVE_CLI_RUBBER_DUCK="1",
             EVE_CLI_RUBBER_DUCK_CHECKPOINTS="post-edit",
         )
@@ -665,6 +671,7 @@ class TestLoadEnv(unittest.TestCase):
         self.assertEqual(self.cfg.compaction_model, "compact-v1")
         self.assertEqual(self.cfg.subagent_model, "sub-v1")
         self.assertEqual(self.cfg.review_model, "review-v1")
+        self.assertEqual(self.cfg.vision_model, "vision-v1")
         self.assertTrue(self.cfg.rubber_duck)
         self.assertEqual(self.cfg.rubber_duck_checkpoints, "post-edit")
 
@@ -941,6 +948,19 @@ class TestOllamaHostValidation(unittest.TestCase):
         with patch("builtins.print"):
             self.cfg._validate_ollama_host()
         self.assertEqual(self.cfg.ollama_host, Config.DEFAULT_OLLAMA_HOST)
+
+    def test_local_models_reuse_primary_when_helper_roles_not_explicit(self):
+        self.cfg.model = "qwen3:8b"
+        self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.sidecar_model, "qwen3:8b")
+        self.assertEqual(self.cfg.subagent_model, "qwen3:8b")
+        self.assertEqual(self.cfg.vision_model, "")
+
+    def test_invalid_vision_model_name_resets_to_default(self):
+        self.cfg.vision_model = "gemma4:31b-cloud;rm -rf /"
+        with patch("builtins.print"):
+            self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.vision_model, Config.DEFAULT_VISION_MODEL)
 
 
 class TestOllamaClientHeaders(unittest.TestCase):
@@ -1329,16 +1349,19 @@ class TestLoadConfigFile(unittest.TestCase):
         cfg.compaction_model = "cli-compaction"
         cfg.subagent_model = "cli-subagent"
         cfg.review_model = "cli-review"
+        cfg.vision_model = "cli-vision"
         cfg._cli_utility_model_set = True
         cfg._cli_compaction_model_set = True
         cfg._cli_subagent_model_set = True
         cfg._cli_review_model_set = True
+        cfg._cli_vision_model_set = True
         cfg._profiles = {
             "online": {
                 "UTILITY_MODEL": "profile-utility",
                 "COMPACTION_MODEL": "profile-compaction",
                 "SUBAGENT_MODEL": "profile-subagent",
                 "REVIEW_MODEL": "profile-review",
+                "VISION_MODEL": "profile-vision",
                 "RUBBER_DUCK": "true",
                 "RUBBER_DUCK_CHECKPOINTS": "post-edit",
             }
@@ -1350,6 +1373,7 @@ class TestLoadConfigFile(unittest.TestCase):
         self.assertEqual(cfg.compaction_model, "cli-compaction")
         self.assertEqual(cfg.subagent_model, "cli-subagent")
         self.assertEqual(cfg.review_model, "cli-review")
+        self.assertEqual(cfg.vision_model, "cli-vision")
         self.assertTrue(cfg.rubber_duck)
         self.assertEqual(cfg.rubber_duck_checkpoints, "post-edit")
 
@@ -1382,6 +1406,24 @@ class TestModelRoleResolution(unittest.TestCase):
         self.assertEqual(eve_coder._resolve_review_model(cfg), "qwen3:8b")
         cfg.review_model = "gemma4:31b-cloud"
         self.assertEqual(eve_coder._resolve_review_model(cfg), "gemma4:31b-cloud")
+
+    def test_vision_model_prefers_explicit_override(self):
+        cfg = Config()
+        cfg.sidecar_model = "gemma4:31b"
+        self.assertEqual(eve_coder._resolve_vision_model(cfg), "gemma4:31b-cloud")
+        cfg.vision_model = "gemma4:27b-cloud"
+        self.assertEqual(eve_coder._resolve_vision_model(cfg), "gemma4:27b-cloud")
+
+    def test_pick_vision_route_model_uses_gemma_helper_for_non_vision_primary(self):
+        cfg = Config()
+        cfg.model = "glm-5.1:cloud"
+        cfg.sidecar_model = "glm-5.1:cloud"
+        client = MagicMock()
+        client.check_vision_support.side_effect = lambda model, assume_if_unknown=True: {
+            "glm-5.1:cloud": False,
+            "gemma4:31b-cloud": True,
+        }.get(model, False if not assume_if_unknown else True)
+        self.assertEqual(eve_coder._pick_vision_route_model(cfg, client), "gemma4:31b-cloud")
 
 
 if __name__ == "__main__":
