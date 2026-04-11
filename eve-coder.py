@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.32.2"
+__version__ = "2.32.3"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -22419,7 +22419,12 @@ def main():
         if not ok:
             sys.exit(1)
 
-    model_ok = client.check_model(config.model, available_models=models)
+    # Cloud models (e.g. glm-5.1:cloud) may not appear in /api/tags from the
+    # cloud endpoint. Trust the configuration and verify at first request time.
+    if _is_cloud_model(config.model) and not config.uses_local_ollama():
+        model_ok = True
+    else:
+        model_ok = client.check_model(config.model, available_models=models)
 
     if not model_ok:
         if config.uses_local_ollama():
