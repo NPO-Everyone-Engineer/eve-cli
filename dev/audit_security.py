@@ -128,7 +128,7 @@ if 'os.system' in code:
         'recommendation': 'subprocess.run() を使用'
     })
 
-# 診断 6: 临时ファイル競合
+# 診断 6: 臨時ファイル競合
 if 'tempfile' not in code and '/tmp/' in code:
     vulnerabilities.append({
         'severity': 'MEDIUM',
