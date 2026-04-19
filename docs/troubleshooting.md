@@ -89,6 +89,15 @@ ollama list
 - **Mac**: アプリケーションフォルダから Ollama を起動
 - **Linux**: `ollama serve &`
 
+Ollama Cloud を使っている場合は、ローカル起動ではなく接続先を確認してください：
+
+```bash
+echo $OLLAMA_API_KEY
+eve-cli --ollama-host https://ollama.com/api --model glm-5.1:cloud
+```
+
+`OLLAMA_HOST=https://ollama.com/api` と API キーが正しいかを確認してください。
+
 ### 「モデルが見つからない」エラー
 
 指定したモデルがダウンロード済みか確認：
@@ -102,6 +111,8 @@ ollama list
 ```bash
 ollama pull qwen3.5:9b
 ```
+
+Ollama Cloud を使っている場合は `pull` ではなく、モデル名・契約・接続先を確認してください。
 
 ### 起動が異常に遅い
 
@@ -128,6 +139,8 @@ ollama pull qwen3.5:9b
 ```
 
 会話を圧縮して続行できます。または `/clear` で新しい会話を始めてください。
+
+コーディング用途では `CONTEXT_WINDOW=65536` 以上がおすすめです。
 
 ### ファイルを間違って変更された
 
@@ -199,10 +212,11 @@ ollama rm 使わないモデル名
 
 ### クラウドモデルを使いたい
 
-Ollama のクラウドモデル対応が必要です：
+Ollama Cloud を使う場合は、ホストと API キーを設定してください：
 
 ```bash
-eve-cli --model qwen3.5:397b-cloud
+export OLLAMA_API_KEY=your-ollama-api-key
+eve-cli --ollama-host https://ollama.com/api --model glm-5.1:cloud
 ```
 
 ネットワーク接続が必要です。プロファイル機能でオンライン/オフラインの自動切替もできます。詳しくは [高度な機能](advanced.md) を参照してください。

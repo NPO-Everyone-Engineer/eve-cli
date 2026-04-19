@@ -160,7 +160,7 @@ $script:MESSAGES = @{
     "ja_reopen"            = "Open a new terminal, then run eve-cli"
     "ja_enjoy"             = "  Free AI Coding wo Tanoshimou  "
     "ja_help_usage"        = "Usage: install.ps1 [--model MODEL_NAME] [--lang LANG]"
-    "ja_help_model"        = "Specify Ollama model (e.g. qwen3:8b)"
+    "ja_help_model"        = "Specify Ollama model (e.g. glm-5.1:cloud)"
     "ja_help_lang"         = "Language: ja, en, zh"
     "ja_unknown_opt"       = "Unknown option"
 
@@ -234,7 +234,7 @@ $script:MESSAGES = @{
     "en_reopen"            = "Open a new terminal, then run eve-cli"
     "en_enjoy"             = "  ENJOY  FREE  AI  CODING  "
     "en_help_usage"        = "Usage: install.ps1 [--model MODEL_NAME] [--lang LANG]"
-    "en_help_model"        = "Specify Ollama model (e.g. qwen3:8b)"
+    "en_help_model"        = "Specify Ollama model (e.g. glm-5.1:cloud)"
     "en_help_lang"         = "Language: ja, en, zh"
     "en_unknown_opt"       = "Unknown option"
 
@@ -308,7 +308,7 @@ $script:MESSAGES = @{
     "zh_reopen"            = "Open a new terminal, then run eve-cli"
     "zh_enjoy"             = "  Enjoy Free AI Coding  "
     "zh_help_usage"        = "Usage: install.ps1 [--model MODEL_NAME] [--lang LANG]"
-    "zh_help_model"        = "Specify Ollama model (e.g. qwen3:8b)"
+    "zh_help_model"        = "Specify Ollama model (e.g. glm-5.1:cloud)"
     "zh_help_lang"         = "Language: ja, en, zh"
     "zh_unknown_opt"       = "Unknown option"
 }
@@ -471,6 +471,52 @@ function Test-OllamaRunning {
     }
 }
 
+function Test-Truthy($value) {
+    if ($null -eq $value) { return $false }
+    switch ($value.ToString().ToLowerInvariant()) {
+        "1" { return $true }
+        "true" { return $true }
+        "yes" { return $true }
+        "on" { return $true }
+        default { return $false }
+    }
+}
+
+function New-TempDownloadPath($suffix = ".tmp") {
+    return (Join-Path $env:TEMP ("eve-cli-" + [guid]::NewGuid().ToString("N") + $suffix))
+}
+
+function Get-Sha256($path) {
+    try {
+        return (Get-FileHash -Algorithm SHA256 -Path $path -ErrorAction Stop).Hash.ToLowerInvariant()
+    } catch {
+        return $null
+    }
+}
+
+function Verify-Checksum($path, $expectedHash, $label) {
+    if ([string]::IsNullOrWhiteSpace($expectedHash)) {
+        Vapor-Warn "No checksum provided for $label; skipping verification."
+        return $true
+    }
+
+    $actualHash = Get-Sha256 $path
+    if (-not $actualHash) {
+        Vapor-Error "Failed to compute checksum for $label"
+        return $false
+    }
+    if ($actualHash -ne $expectedHash.ToLowerInvariant()) {
+        Vapor-Error "Checksum verification failed for $label"
+        Vapor-Error "  Expected: $expectedHash"
+        Vapor-Error "  Actual:   $actualHash"
+        Remove-Item $path -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+
+    Vapor-Info "Checksum verified for $label"
+    return $true
+}
+
 function Download-File($url, $dest) {
     try {
         $ProgressPreference = 'SilentlyContinue'
@@ -479,6 +525,93 @@ function Download-File($url, $dest) {
     } catch {
         return $false
     }
+}
+
+function Resolve-InstallRef {
+    if ($env:EVE_CLI_INSTALL_REF) {
+        return $env:EVE_CLI_INSTALL_REF
+    }
+
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        $resp = Invoke-WebRequest -Uri "https://api.github.com/repos/NPO-Everyone-Engineer/eve-cli/commits/main" -UseBasicParsing -ErrorAction Stop
+        $json = $resp.Content | ConvertFrom-Json
+        return $json.sha
+    } catch {
+        return $null
+    }
+}
+
+function Get-ManifestHash($manifestPath, $name) {
+    try {
+        $manifest = Get-Content $manifestPath -Encoding UTF8 -Raw | ConvertFrom-Json
+        return $manifest.files.$name
+    } catch {
+        return $null
+    }
+}
+
+function Download-RepoFileVerified($ref, $manifestPath, $name, $dest) {
+    $expectedHash = Get-ManifestHash $manifestPath $name
+    if ([string]::IsNullOrWhiteSpace($expectedHash)) {
+        Vapor-Error "Checksum entry missing for $name"
+        return $false
+    }
+
+    $tmpPath = New-TempDownloadPath ".download"
+    try {
+        $url = "https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/$ref/$name"
+        if (-not (Download-File $url $tmpPath)) {
+            return $false
+        }
+        if (-not (Verify-Checksum $tmpPath $expectedHash $name)) {
+            return $false
+        }
+        Move-Item -Path $tmpPath -Destination $dest -Force
+        return $true
+    } finally {
+        if (Test-Path $tmpPath) {
+            Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Confirm-UnverifiedRemoteInstaller($label, $url, $checksumEnvName, $allowEnvName) {
+    $checksumValue = [System.Environment]::GetEnvironmentVariable($checksumEnvName)
+    $allowValue = [System.Environment]::GetEnvironmentVariable($allowEnvName)
+    $allowAllValue = [System.Environment]::GetEnvironmentVariable("EVE_CLI_ALLOW_UNVERIFIED_INSTALLERS")
+
+    if (-not [string]::IsNullOrWhiteSpace($checksumValue)) {
+        return $true
+    }
+    if ((Test-Truthy $allowValue) -or (Test-Truthy $allowAllValue)) {
+        Vapor-Warn "Proceeding without checksum verification for $label because an override was provided."
+        return $true
+    }
+
+    Write-Host ""
+    Vapor-Warn "Unverified remote installer download detected."
+    Write-Host "  $label: $url"
+    Write-Host "  Provide checksum via $checksumEnvName=<sha256> to verify the download."
+    Write-Host "  Or allow without verification via $allowEnvName=1"
+    Write-Host "  Or allow all unverified installers via EVE_CLI_ALLOW_UNVERIFIED_INSTALLERS=1"
+
+    try {
+        if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+            Vapor-Error "Refusing unverified remote installer in non-interactive mode."
+            return $false
+        }
+    } catch {
+        # If console state cannot be determined, continue to explicit prompt.
+    }
+
+    $reply = Read-Host "  Continue anyway? [y/N]"
+    if ($reply -match '^(?i:y|yes)$') {
+        return $true
+    }
+
+    Vapor-Error "Remote installer download aborted."
+    return $false
 }
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -615,33 +748,50 @@ Write-Host ""
 
 # Model selection
 $SIDECAR_MODEL = ""
+$UTILITY_MODEL = ""
+$COMPACTION_MODEL = ""
+$SUBAGENT_MODEL = ""
+$REVIEW_MODEL = ""
+$VISION_MODEL = ""
+$CONFIG_OLLAMA_HOST = "http://localhost:11434"
 $MANUAL_MODEL = $Model
+
+function Test-IsCloudModel([string]$ModelName) {
+    return (-not [string]::IsNullOrWhiteSpace($ModelName)) -and ($ModelName.Contains(":cloud") -or $ModelName.Contains("-cloud"))
+}
+
+function Set-CloudRoleDefaults {
+    $script:SIDECAR_MODEL = "gemma4:31b-cloud"
+    $script:UTILITY_MODEL = $script:SIDECAR_MODEL
+    $script:COMPACTION_MODEL = $script:SIDECAR_MODEL
+    $script:REVIEW_MODEL = $script:SIDECAR_MODEL
+    $script:VISION_MODEL = $script:SIDECAR_MODEL
+    $script:SUBAGENT_MODEL = $script:MODEL
+    $script:CONFIG_OLLAMA_HOST = "https://ollama.com/api"
+}
+
+function Test-UsingCloudModels {
+    return (Test-IsCloudModel $script:MODEL) -or
+           (Test-IsCloudModel $script:SIDECAR_MODEL) -or
+           (Test-IsCloudModel $script:UTILITY_MODEL) -or
+           (Test-IsCloudModel $script:COMPACTION_MODEL) -or
+           (Test-IsCloudModel $script:SUBAGENT_MODEL) -or
+           (Test-IsCloudModel $script:VISION_MODEL) -or
+           (Test-IsCloudModel $script:REVIEW_MODEL)
+}
 
 if ($MANUAL_MODEL) {
     $MODEL = $MANUAL_MODEL
+    if (Test-IsCloudModel $MODEL) {
+        Set-CloudRoleDefaults
+    }
     Vapor-Info "$(msg 'manual_model'): $MODEL"
-} elseif ($RAM_GB -ge 32) {
-    $MODEL = "qwen3-coder:30b"
-    $SIDECAR_MODEL = "qwen3:8b"
-    Write-Host "  ${NEON_GREEN}|${NC} ++ ${BOLD}${YELLOW}*** BEST  MODEL ***${NC}"
-    Write-Host "  ${NEON_GREEN}|${NC}    ${BOLD}${WHITE}${MODEL}${NC} ${DIM}(19GB, MoE 3.3B active, $(msg 'model_best'))${NC}"
-    Write-Host "  ${NEON_GREEN}|${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (5GB, fast helper)${NC}"
-} elseif ($RAM_GB -ge 16) {
-    $MODEL = "qwen3:8b"
-    $SIDECAR_MODEL = "qwen3:1.7b"
-    Write-Host "  ${MINT}|${NC} ** ${BOLD}${CYAN}** GREAT  MODEL **${NC}"
-    Write-Host "  ${MINT}|${NC}    ${BOLD}${WHITE}${MODEL}${NC} ${DIM}(5GB, $(msg 'model_great'))${NC}"
-    Write-Host "  ${MINT}|${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (1GB, fast helper)${NC}"
-} elseif ($RAM_GB -ge 8) {
-    $MODEL = "qwen3:1.7b"
-    Vapor-Warn "$MODEL ($(msg 'model_min'))"
-    Vapor-Warn (msg "model_recommend")
 } else {
-    Vapor-Error "$(msg 'mem_lack'): ${RAM_GB}GB ($(msg 'mem_lack_min'))"
-    Write-Host ""
-    Write-Host "  $(msg 'mem_lack_hint1')"
-    Write-Host "  $(msg 'mem_lack_hint2')"
-    exit 1
+    $MODEL = "glm-5.1:cloud"
+    Set-CloudRoleDefaults
+    Write-Host "  ${NEON_GREEN}|${NC} :: ${BOLD}${YELLOW}*** CLOUD DEFAULT ***${NC}"
+    Write-Host "  ${NEON_GREEN}|${NC}    ${BOLD}${WHITE}${MODEL}${NC} ${DIM}(Cloud, agentic coding default)${NC}"
+    Write-Host "  ${NEON_GREEN}|${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (Cloud helper / review / vision)${NC}"
 }
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -724,9 +874,17 @@ if ($OLLAMA_PATH) {
         # Fallback: direct download
         $setupUrl = "https://ollama.com/download/OllamaSetup.exe"
         $setupPath = Join-Path $env:TEMP "OllamaSetup.exe"
+        $setupChecksum = [System.Environment]::GetEnvironmentVariable("EVE_CLI_OLLAMA_SETUP_SHA256")
         Vapor-Info "Downloading OllamaSetup.exe..."
 
-        if (Download-File $setupUrl $setupPath) {
+        if ((Confirm-UnverifiedRemoteInstaller "OllamaSetup.exe" $setupUrl "EVE_CLI_OLLAMA_SETUP_SHA256" "EVE_CLI_ALLOW_UNVERIFIED_OLLAMA_SETUP") -and
+                (Download-File $setupUrl $setupPath)) {
+            if (-not (Verify-Checksum $setupPath $setupChecksum "OllamaSetup.exe")) {
+                Vapor-Error "Ollama :: $(msg 'install_fail')"
+                Vapor-Warn (msg "ollama_manual")
+                Remove-Item $setupPath -Force -ErrorAction SilentlyContinue
+                exit 1
+            }
             Vapor-Info "Running OllamaSetup.exe (follow the installer prompts)..."
             try {
                 Start-Process -FilePath $setupPath -Wait
@@ -756,7 +914,15 @@ if ($OLLAMA_PATH) {
 Step-Header 4 (msg "step4")
 
 $OLLAMA_PATH = Find-Ollama
-if (-not $OLLAMA_PATH) {
+if (Test-UsingCloudModels) {
+    Vapor-Success "Ollama Cloud :: configured ($CONFIG_OLLAMA_HOST)"
+    if ($env:OLLAMA_API_KEY -or $env:EVE_CLI_OLLAMA_API_KEY) {
+        Vapor-Success "OLLAMA_API_KEY detected"
+    } else {
+        Vapor-Warn "OLLAMA_API_KEY is not set yet. Export it before the first run."
+    }
+    Vapor-Info "Cloud models are checked on first request. No local download is needed."
+} elseif (-not $OLLAMA_PATH) {
     Vapor-Error "Ollama not found. Cannot download models."
     Vapor-Warn "Install Ollama first, then re-run this script."
 } else {
@@ -905,18 +1071,36 @@ if ($SCRIPT_DIR -and (Test-Path (Join-Path $SCRIPT_DIR "eve-coder.py"))) {
     }
 } else {
     Vapor-Info (msg "source_github")
-    $GITHUB_RAW = "https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/main"
+    $INSTALL_REF = Resolve-InstallRef
+    if (-not $INSTALL_REF) {
+        Vapor-Error "Failed to resolve an immutable GitHub ref for installer downloads"
+        Write-Host "  Re-run from a full checkout, or set EVE_CLI_INSTALL_REF=<commit-sha>."
+        exit 1
+    }
+    $manifestPath = New-TempDownloadPath ".json"
+    if (-not (Download-File "https://raw.githubusercontent.com/NPO-Everyone-Engineer/eve-cli/$INSTALL_REF/install-manifest.json" $manifestPath)) {
+        Vapor-Error "Failed to download install-manifest.json from GitHub"
+        Write-Host "  Ref: $INSTALL_REF"
+        exit 1
+    }
+    Vapor-Info "Verified ref: $INSTALL_REF"
 
-    $dlOk = Download-File "${GITHUB_RAW}/eve-coder.py" (Join-Path $LIB_DIR "eve-coder.py")
+    $dlOk = Download-RepoFileVerified $INSTALL_REF $manifestPath "eve-coder.py" (Join-Path $LIB_DIR "eve-coder.py")
     if (-not $dlOk) {
         Vapor-Error "Failed to download eve-coder.py from GitHub"
-        Write-Host "  Check your internet connection."
+        Write-Host "  Check your internet connection or verify install-manifest.json."
+        Remove-Item $manifestPath -Force -ErrorAction SilentlyContinue
+        exit 1
     }
 
-    $dlOk2 = Download-File "${GITHUB_RAW}/eve-cli.sh" (Join-Path $LIB_DIR "eve-cli.sh")
+    $dlOk2 = Download-RepoFileVerified $INSTALL_REF $manifestPath "eve-cli.sh" (Join-Path $LIB_DIR "eve-cli.sh")
     if (-not $dlOk2) {
-        Vapor-Warn "Failed to download eve-cli.sh (non-critical on Windows)"
+        Vapor-Error "Failed to download eve-cli.sh from GitHub"
+        Write-Host "  Check your internet connection or verify install-manifest.json."
+        Remove-Item $manifestPath -Force -ErrorAction SilentlyContinue
+        exit 1
     }
+    Remove-Item $manifestPath -Force -ErrorAction SilentlyContinue
 }
 
 # Create eve-cli.ps1 launcher
@@ -1023,7 +1207,12 @@ if (Test-Path $CONFIG_FILE) {
 
 MODEL="$MODEL"
 SIDECAR_MODEL="$SIDECAR_MODEL"
-OLLAMA_HOST="http://localhost:11434"
+UTILITY_MODEL="$UTILITY_MODEL"
+COMPACTION_MODEL="$COMPACTION_MODEL"
+SUBAGENT_MODEL="$SUBAGENT_MODEL"
+REVIEW_MODEL="$REVIEW_MODEL"
+VISION_MODEL="$VISION_MODEL"
+OLLAMA_HOST="$CONFIG_OLLAMA_HOST"
 "@
     Set-Content -Path $CONFIG_FILE -Value $configContent -Encoding UTF8
     Vapor-Success "$(msg 'config_file'): $CONFIG_FILE"
@@ -1099,7 +1288,12 @@ if (Test-Path $eveCoder) {
 }
 
 # Model availability
-if (Test-OllamaRunning) {
+if (Test-UsingCloudModels) {
+    Vapor-Info "AI Model ($MODEL) -> checked on first request"
+    if ($SIDECAR_MODEL -and $SIDECAR_MODEL -ne $MODEL) {
+        Vapor-Info "Sidecar  ($SIDECAR_MODEL) -> checked on first request"
+    }
+} elseif (Test-OllamaRunning) {
     try {
         $tagsResp = Invoke-WebRequest -Uri "http://localhost:11434/api/tags" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
         if ($tagsResp.Content -match [regex]::Escape($MODEL)) {

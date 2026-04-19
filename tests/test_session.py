@@ -22,6 +22,7 @@ spec.loader.exec_module(eve_coder)
 
 Session = eve_coder.Session
 ToolResult = eve_coder.ToolResult
+GitCheckpoint = eve_coder.GitCheckpoint
 
 
 def _make_config(tmpdir, session_id=None, context_window=32768):
@@ -33,8 +34,17 @@ def _make_config(tmpdir, session_id=None, context_window=32768):
         session_id=session_id,
         sessions_dir=sessions_dir,
         cwd=tmpdir,
+        model="glm-5.1:cloud",
         sidecar_model="",
     )
+
+
+class _FakeVisionClient:
+    def __init__(self, support_map):
+        self.support_map = dict(support_map)
+
+    def check_vision_support(self, model, assume_if_unknown=True):
+        return self.support_map.get(model, assume_if_unknown)
 
 
 class TestSessionInit(unittest.TestCase):
@@ -477,6 +487,22 @@ class TestSessionAddToolResults(unittest.TestCase):
         self.assertEqual(content[0]["type"], "text")
         self.assertEqual(content[1]["type"], "image_url")
 
+    def test_multiple_tool_results_keep_tool_sequence_before_image_followups(self):
+        image_marker = json.dumps({
+            "type": "image",
+            "media_type": "image/png",
+            "data": "iVBORw0KGgo=",
+        })
+        results = [
+            ToolResult("tc1", image_marker),
+            ToolResult("tc2", "plain text"),
+        ]
+        self.sess.add_tool_results(results)
+        self.assertEqual(
+            [msg["role"] for msg in self.sess.messages],
+            ["tool", "tool", "user"],
+        )
+
 
 class TestSessionMaxMessagesEnforcement(unittest.TestCase):
     """Tests that MAX_MESSAGES is enforced via add_user_message."""
@@ -499,6 +525,129 @@ class TestSessionMaxMessagesEnforcement(unittest.TestCase):
         # Trigger enforcement
         self.sess.add_user_message("trigger trim")
         self.assertLessEqual(len(self.sess.messages), Session.MAX_MESSAGES + 1)
+
+
+class TestSessionRuntimeState(unittest.TestCase):
+    """Tests for durable runtime state backing sessions."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_runtime_store_file_created(self):
+        cfg = _make_config(self.tmpdir, session_id="runtime_test")
+        sess = Session(cfg, "prompt")
+        self.assertTrue(os.path.isfile(sess.runtime_state.path))
+
+    def test_task_store_restored_for_same_session(self):
+        cfg = _make_config(self.tmpdir, session_id="runtime_test")
+        sess = Session(cfg, "prompt")
+        snapshot = {
+            "next_id": 2,
+            "tasks": {
+                "1": {
+                    "id": "1",
+                    "subject": "Persist task",
+                    "description": "Keep this task across resume",
+                    "activeForm": "Persisting task",
+                    "status": "pending",
+                    "blocks": [],
+                    "blockedBy": [],
+                }
+            },
+        }
+        sess.runtime_state.save_task_store(snapshot)
+
+        Session(cfg, "prompt")
+        self.assertIn("1", eve_coder._task_store["tasks"])
+        self.assertEqual(eve_coder._task_store["tasks"]["1"]["subject"], "Persist task")
+
+    def test_resume_summary_includes_runtime_state(self):
+        cfg = _make_config(self.tmpdir, session_id="runtime_test")
+        sess = Session(cfg, "prompt")
+        sess.runtime_state.update_runtime(
+            plan_mode=True,
+            active_plan_path="/tmp/example-plan.md",
+            last_known_phase="planning",
+            resume_hint="review active plan",
+        )
+        sess.runtime_state.upsert_job("bg_1", "bash", "orphaned", command_or_prompt="sleep 10")
+        sess.runtime_state.record_verifier_run("autotest", "python3 -m unittest", "failed", "3 tests failed")
+        sess.runtime_state.record_resume_event("verifier_failed", "Verifier failed: test=3 failures.")
+
+        summary = sess.get_resume_summary()
+        self.assertTrue(summary["plan_mode"])
+        self.assertEqual(summary["last_known_phase"], "planning")
+        self.assertEqual(summary["orphaned_jobs"], 1)
+        self.assertEqual(summary["latest_verifier"]["status"], "failed")
+        self.assertEqual(summary["recent_events"][-1]["event_type"], "verifier_failed")
+
+    def test_checkpoint_metadata_persists(self):
+        cfg = _make_config(self.tmpdir, session_id="runtime_test")
+        sess = Session(cfg, "prompt")
+        sess.runtime_state.save_checkpoints([
+            {
+                "git_ref": "deadbeef",
+                "label": "before-change",
+                "timestamp": 123.0,
+                "status_lines": ["M file.py"],
+                "snapshot_dir": "/tmp/eve-checkpoint-demo",
+                "untracked_files": ["notes.txt"],
+            }
+        ])
+
+        checkpoint_mgr = GitCheckpoint(cfg.cwd, runtime_state=sess.runtime_state)
+        self.assertEqual(checkpoint_mgr.summary()["latest"], "before-change")
+        self.assertEqual(len(checkpoint_mgr.list_checkpoints()), 1)
+
+    def test_load_reconciles_running_jobs(self):
+        cfg = _make_config(self.tmpdir, session_id="runtime_test")
+        sess = Session(cfg, "prompt")
+        sess.add_user_message("hello")
+        sess.save()
+        sess.runtime_state.upsert_job("bg_1", "bash", "running", command_or_prompt="sleep 10")
+
+        resumed = Session(cfg, "prompt")
+        self.assertTrue(resumed.load("runtime_test"))
+        summary = resumed.get_resume_summary()
+        self.assertEqual(summary["running_jobs"], 0)
+        self.assertEqual(summary["orphaned_jobs"], 1)
+
+    def test_save_sanitizes_image_history_for_non_vision_primary(self):
+        cfg = _make_config(self.tmpdir, session_id="vision_save")
+        sess = Session(cfg, "prompt")
+        sess.set_client(_FakeVisionClient({"glm-5.1:cloud": False}))
+        sess.add_multimodal_user_message([
+            {"type": "text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+        sess.add_assistant_message("It shows a terminal error dialog.")
+
+        sess.save()
+
+        self.assertIsInstance(sess.messages[0]["content"], str)
+        self.assertIn("omitted from saved history", sess.messages[0]["content"])
+        path = os.path.join(cfg.sessions_dir, "vision_save.jsonl")
+        with open(path, encoding="utf-8") as f:
+            payload = f.read()
+        self.assertNotIn("image_url", payload)
+        self.assertNotIn("data:image/png", payload)
+
+    def test_save_keeps_image_history_for_vision_primary(self):
+        cfg = _make_config(self.tmpdir, session_id="vision_keep")
+        cfg.model = "gemma4:31b"
+        sess = Session(cfg, "prompt")
+        sess.set_client(_FakeVisionClient({"gemma4:31b": True}))
+        sess.add_multimodal_user_message([
+            {"type": "text", "text": "Describe this image"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+
+        sess.save()
+
+        self.assertIsInstance(sess.messages[0]["content"], list)
 
 
 if __name__ == "__main__":

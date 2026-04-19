@@ -1,38 +1,36 @@
 """
 Test suite for parallel file editing functionality.
-Tests MultiEditTool parallel execution, progress indicators, and configuration.
+
+These tests are written with unittest so they are collected by the default
+`python -m unittest discover` harness used in this repository.
 """
 
+import importlib.util
 import os
+import shutil
 import sys
 import tempfile
-import shutil
-import time
 import threading
+import time
+import unittest
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import from eve-coder.py (note: hyphen in filename)
-import importlib.util
-spec = importlib.util.spec_from_file_location("eve_coder", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "eve-coder.py"))
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, SCRIPT_DIR)
+
+spec = importlib.util.spec_from_file_location(
+    "eve_coder", os.path.join(SCRIPT_DIR, "eve-coder.py")
+)
 eve_coder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(eve_coder)
 
 MultiEditTool = eve_coder.MultiEditTool
-_MAX_PARALLEL_FILES = eve_coder._MAX_PARALLEL_FILES
-_SHOW_PROGRESS = eve_coder._SHOW_PROGRESS
 
 
-class TestParallelFileEditing:
-    """Test parallel file editing functionality."""
-
-    def setup_method(self):
-        """Create temporary directory and test files."""
+class ParallelFileEditingTestCase(unittest.TestCase):
+    def setUp(self):
         self.test_dir = tempfile.mkdtemp()
-        self.tool = MultiEditTool()
-        
-        # Create test files
+        self.tool = MultiEditTool(cwd=self.test_dir)
         self.test_files = []
         for i in range(5):
             fpath = os.path.join(self.test_dir, f"file{i}.txt")
@@ -40,228 +38,229 @@ class TestParallelFileEditing:
                 f.write(f"Hello World {i}\nLine 2\nLine 3\n")
             self.test_files.append(fpath)
 
-    def teardown_method(self):
-        """Clean up temporary directory."""
+    def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
+
+class TestParallelFileEditing(ParallelFileEditingTestCase):
+    """Tests for parallel file editing functionality."""
+
     def test_single_edit(self):
-        """Test single file edit works correctly."""
         edits = [{
             "file_path": self.test_files[0],
             "old_string": "Hello World 0",
-            "new_string": "Goodbye World 0"
+            "new_string": "Goodbye World 0",
         }]
-        
+
         result = self.tool.execute({"edits": edits})
-        
-        assert "OK: file0.txt" in result
-        assert "1/1 edits applied" in result
-        
+
+        self.assertIn("OK: file0.txt", result)
+        self.assertIn("1/1 edits applied", result)
         with open(self.test_files[0], "r", encoding="utf-8") as f:
             content = f.read()
-        assert "Goodbye World 0" in content
-        assert "Hello World 0" not in content
+        self.assertIn("Goodbye World 0", content)
+        self.assertNotIn("Hello World 0", content)
 
     def test_multiple_edits_parallel(self):
-        """Test multiple files are edited in parallel."""
         edits = []
         for i in range(5):
             edits.append({
                 "file_path": self.test_files[i],
                 "old_string": f"Hello World {i}",
-                "new_string": f"Modified {i}"
+                "new_string": f"Modified {i}",
             })
-        
+
         start_time = time.time()
         result = self.tool.execute({"edits": edits})
         elapsed = time.time() - start_time
-        
-        # All edits should succeed
-        assert "5/5 edits applied" in result
-        
-        # Verify all files were modified
+
+        self.assertIn("5/5 edits applied", result)
         for i in range(5):
             with open(self.test_files[i], "r", encoding="utf-8") as f:
                 content = f.read()
-            assert f"Modified {i}" in content
-            assert f"Hello World {i}" not in content
-        
-        # Parallel execution should be faster than sequential
-        # (each edit has small delay, so 5 parallel should be < 5x sequential)
-        assert elapsed < 2.0  # Should complete quickly
+            self.assertIn(f"Modified {i}", content)
+            self.assertNotIn(f"Hello World {i}", content)
+        self.assertLess(elapsed, 2.0)
 
     def test_partial_failure(self):
-        """Test that partial failures don't stop other edits."""
         edits = [
             {
                 "file_path": self.test_files[0],
                 "old_string": "Hello World 0",
-                "new_string": "Modified 0"
+                "new_string": "Modified 0",
             },
             {
                 "file_path": self.test_files[1],
-                "old_string": "NonExistent String",  # Will fail
-                "new_string": "Modified 1"
+                "old_string": "NonExistent String",
+                "new_string": "Modified 1",
             },
             {
                 "file_path": self.test_files[2],
                 "old_string": "Hello World 2",
-                "new_string": "Modified 2"
-            }
+                "new_string": "Modified 2",
+            },
         ]
-        
+
         result = self.tool.execute({"edits": edits})
-        
-        # Should have 2 successes, 1 failure
-        assert "2/3 edits applied" in result
-        assert "Error: old_string not found" in result
-        
-        # Verify successful edits
+
+        self.assertIn("2/3 edits applied", result)
+        self.assertIn("Error: old_string not found", result)
         with open(self.test_files[0], "r", encoding="utf-8") as f:
-            assert "Modified 0" in f.read()
+            self.assertIn("Modified 0", f.read())
         with open(self.test_files[2], "r", encoding="utf-8") as f:
-            assert "Modified 2" in f.read()
-        # File 1 should be unchanged
+            self.assertIn("Modified 2", f.read())
         with open(self.test_files[1], "r", encoding="utf-8") as f:
-            assert "Hello World 1" in f.read()
+            self.assertIn("Hello World 1", f.read())
 
     def test_invalid_path(self):
-        """Test invalid path handling."""
         edits = [{
             "file_path": "/nonexistent/path/file.txt",
             "old_string": "test",
-            "new_string": "test"
+            "new_string": "test",
         }]
-        
+
         result = self.tool.execute({"edits": edits})
-        assert "Error: invalid path" in result or "file not found" in result
+        self.assertTrue(
+            "Error: invalid path" in result or "file not found" in result,
+            msg=result,
+        )
 
     def test_protected_path(self):
-        """Test protected path rejection."""
-        # Try to edit a file in system directory
         edits = [{
             "file_path": "/etc/hosts",
             "old_string": "test",
-            "new_string": "test"
+            "new_string": "test",
         }]
-        
+
         result = self.tool.execute({"edits": edits})
-        assert "Error:" in result
+        self.assertIn("Error:", result)
 
     def test_symlink_rejection(self):
-        """Test that symlinks are rejected."""
-        # Create a symlink
         original = os.path.join(self.test_dir, "original.txt")
         link = os.path.join(self.test_dir, "link.txt")
-        
+
         with open(original, "w", encoding="utf-8") as f:
             f.write("Original content\n")
-        
+
         os.symlink(original, link)
-        
         edits = [{
             "file_path": link,
             "old_string": "Original content",
-            "new_string": "Modified content"
+            "new_string": "Modified content",
         }]
-        
+
         result = self.tool.execute({"edits": edits})
-        assert "symlink not allowed" in result
+        self.assertIn("symlink not allowed", result)
+
+    def test_outside_repo_rejected(self):
+        outside_dir = tempfile.mkdtemp()
+        try:
+            outside_file = os.path.join(outside_dir, "outside.txt")
+            with open(outside_file, "w", encoding="utf-8") as f:
+                f.write("secret\n")
+            edits = [{
+                "file_path": outside_file,
+                "old_string": "secret",
+                "new_string": "public",
+            }]
+            result = self.tool.execute({"edits": edits})
+            self.assertIn("outside repository", result)
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
+
+    def test_parent_symlink_escape_rejected(self):
+        outside_dir = tempfile.mkdtemp()
+        try:
+            outside_file = os.path.join(outside_dir, "outside.txt")
+            with open(outside_file, "w", encoding="utf-8") as f:
+                f.write("secret\n")
+            link_dir = os.path.join(self.test_dir, "linked")
+            os.symlink(outside_dir, link_dir)
+            edits = [{
+                "file_path": os.path.join(link_dir, "outside.txt"),
+                "old_string": "secret",
+                "new_string": "public",
+            }]
+            result = self.tool.execute({"edits": edits})
+            self.assertIn("outside repository", result)
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
 
     def test_multiple_edits_same_file(self):
-        """Test multiple edits to the same file."""
         edits = [
             {
                 "file_path": self.test_files[0],
                 "old_string": "Line 2",
-                "new_string": "Modified Line 2"
+                "new_string": "Modified Line 2",
             },
             {
                 "file_path": self.test_files[0],
                 "old_string": "Line 3",
-                "new_string": "Modified Line 3"
-            }
+                "new_string": "Modified Line 3",
+            },
         ]
-        
+
         result = self.tool.execute({"edits": edits})
-        
-        # Both edits should succeed
-        assert "2/2 edits applied" in result
-        
+
+        self.assertIn("2/2 edits applied", result)
         with open(self.test_files[0], "r", encoding="utf-8") as f:
             content = f.read()
-        assert "Modified Line 2" in content
-        assert "Modified Line 3" in content
+        self.assertIn("Modified Line 2", content)
+        self.assertIn("Modified Line 3", content)
 
     def test_file_lock_prevents_corruption(self):
-        """Test that file locks prevent concurrent write corruption."""
-        # Create a file with known content
         test_file = os.path.join(self.test_dir, "concurrent.txt")
         with open(test_file, "w", encoding="utf-8") as f:
             f.write("Line 0\nLine 1\nLine 2\nLine 3\nLine 4\n")
-        
-        # Create multiple edits to the same file
+
         edits = []
         for i in range(5):
             edits.append({
                 "file_path": test_file,
                 "old_string": f"Line {i}",
-                "new_string": f"Modified {i}"
+                "new_string": f"Modified {i}",
             })
-        
+
         result = self.tool.execute({"edits": edits})
-        
-        # All edits should succeed
-        assert "5/5 edits applied" in result
-        
-        # Verify file integrity
+
+        self.assertIn("5/5 edits applied", result)
         with open(test_file, "r", encoding="utf-8") as f:
             content = f.read()
-        
         for i in range(5):
-            assert f"Modified {i}" in content
-            assert f"Line {i}\n" not in content or f"Modified {i}" in content
+            self.assertIn(f"Modified {i}", content)
 
     def test_max_edits_limit(self):
-        """Test that max edits limit is enforced."""
         edits = []
         for i in range(25):
             edits.append({
                 "file_path": self.test_files[0],
                 "old_string": f"test{i}",
-                "new_string": f"modified{i}"
+                "new_string": f"modified{i}",
             })
-        
+
         result = self.tool.execute({"edits": edits})
-        assert "too many edits (max 20)" in result
+        self.assertIn("too many edits (max 20)", result)
 
     def test_empty_edits(self):
-        """Test empty edits list handling."""
         result = self.tool.execute({"edits": []})
-        assert "no edits provided" in result
+        self.assertIn("no edits provided", result)
 
 
-class TestParallelConfiguration:
-    """Test configuration for parallel file operations."""
-
+class TestParallelConfiguration(unittest.TestCase):
     def test_max_parallel_files_range(self):
-        """Test that MAX_PARALLEL_FILES is within valid range."""
-        assert 1 <= _MAX_PARALLEL_FILES <= 10
+        self.assertGreaterEqual(eve_coder._MAX_PARALLEL_FILES, 1)
+        self.assertLessEqual(eve_coder._MAX_PARALLEL_FILES, 10)
 
     def test_show_progress_default(self):
-        """Test that SHOW_PROGRESS defaults to True."""
-        assert _SHOW_PROGRESS is True
+        self.assertTrue(eve_coder._SHOW_PROGRESS)
 
 
-class TestThreadSafety:
+class TestThreadSafety(unittest.TestCase):
     """Test thread safety of parallel file operations."""
 
-    def setup_method(self):
-        """Create temporary directory and test files."""
+    def setUp(self):
         self.test_dir = tempfile.mkdtemp()
-        self.tool = MultiEditTool()
-        
-        # Create test files
+        self.tool = MultiEditTool(cwd=self.test_dir)
         self.test_files = []
         for i in range(10):
             fpath = os.path.join(self.test_dir, f"file{i}.txt")
@@ -269,48 +268,44 @@ class TestThreadSafety:
                 f.write(f"Content {i}\n")
             self.test_files.append(fpath)
 
-    def teardown_method(self):
-        """Clean up temporary directory."""
+    def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_concurrent_execution(self):
-        """Test that concurrent executions don't interfere."""
         results = []
         errors = []
-        
+        results_lock = threading.Lock()
+
         def run_edit(file_idx):
             try:
                 edits = [{
                     "file_path": self.test_files[file_idx],
                     "old_string": f"Content {file_idx}",
-                    "new_string": f"Modified {file_idx}"
+                    "new_string": f"Modified {file_idx}",
                 }]
                 result = self.tool.execute({"edits": edits})
-                results.append(result)
-            except Exception as e:
-                errors.append(str(e))
-        
-        # Run multiple edits concurrently
+                with results_lock:
+                    results.append(result)
+            except Exception as exc:
+                with results_lock:
+                    errors.append(str(exc))
+
         threads = []
         for i in range(10):
-            t = threading.Thread(target=run_edit, args=(i,))
-            threads.append(t)
-            t.start()
-        
-        for t in threads:
-            t.join()
-        
-        # All should succeed
-        assert len(errors) == 0
-        assert len(results) == 10
-        
-        # Verify all files were modified
+            thread = threading.Thread(target=run_edit, args=(i,))
+            threads.append(thread)
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 10)
         for i in range(10):
             with open(self.test_files[i], "r", encoding="utf-8") as f:
                 content = f.read()
-            assert f"Modified {i}" in content
+            self.assertIn(f"Modified {i}", content)
 
 
 if __name__ == "__main__":
-    import pytest
-    pytest.main([__file__, "-v"])
+    unittest.main()

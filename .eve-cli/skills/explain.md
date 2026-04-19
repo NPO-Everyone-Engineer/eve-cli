@@ -1,5 +1,5 @@
 ---
-description: Explain how code works
+description: "ユーザーがコードの動作・構造・設計意図について質問したとき、または /explain で解説を依頼したとき"
 allowed-tools: [Read, Glob, Grep]
 ---
 # コード解説 (Code Explain)
@@ -45,6 +45,12 @@ allowed-tools: [Read, Glob, Grep]
 - Rust (.rs)
 - Ruby (.rb)
 - Java (.java)
+
+## Gotchas（よくある落とし穴）
+
+- **eve-coder.py は約8500行の単一ファイル**: 全体を一度に読むとコンテキストを圧迫する。CLAUDE.md のセクション表（行番号目安）を参考に、関連セクションだけを Read すること
+- **行番号目安は変動する**: eve-coder.py の更新で行番号がずれるため、目安として使い、実際は Grep で関数名・クラス名を検索すること
+- **ゼロ依存の設計意図を見落とす**: 「なぜ requests を使わないのか」等の質問には、pip install 不要・標準ライブラリのみという設計方針を説明する必要がある
 
 ## ヒント
 

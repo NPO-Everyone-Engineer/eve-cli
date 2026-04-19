@@ -846,34 +846,64 @@ echo -e "  ${PURPLE}┃${NC} 🧠 ${BOLD}${WHITE}$(msg mem_label): ${NEON_GREEN}
 echo -e "  ${PURPLE}┃${NC}    ${CYAN}▐${NEON_GREEN}${RAM_BAR}${CYAN}▌${NC} ${DIM}${GRAY}(${RAM_GB}/${RAM_DISPLAY_MAX}GB)${NC}"
 echo ""
 
-# Sidecar model: lightweight model for permission checks, summaries, etc.
+# Helper role models
 SIDECAR_MODEL=""
+UTILITY_MODEL=""
+COMPACTION_MODEL=""
+SUBAGENT_MODEL=""
+REVIEW_MODEL=""
+VISION_MODEL=""
+CONFIG_OLLAMA_HOST="http://localhost:11434"
+
+is_cloud_model() {
+    local model_name="${1:-}"
+    local model_lower=""
+    if [ -z "$model_name" ]; then
+        return 1
+    fi
+    model_lower="$(printf '%s' "$model_name" | tr '[:upper:]' '[:lower:]')"
+    case "$model_lower" in
+        gemma4:31b|qwen3.5:397b|*:cloud*|*-cloud*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+set_cloud_role_defaults() {
+    SIDECAR_MODEL="gemma4:31b-cloud"
+    UTILITY_MODEL="$SIDECAR_MODEL"
+    COMPACTION_MODEL="$SIDECAR_MODEL"
+    REVIEW_MODEL="$SIDECAR_MODEL"
+    VISION_MODEL="$SIDECAR_MODEL"
+    SUBAGENT_MODEL="$MODEL"
+    CONFIG_OLLAMA_HOST="https://ollama.com/api"
+}
+
+using_cloud_models() {
+    is_cloud_model "$MODEL" ||
+    is_cloud_model "$SIDECAR_MODEL" ||
+    is_cloud_model "$UTILITY_MODEL" ||
+    is_cloud_model "$COMPACTION_MODEL" ||
+    is_cloud_model "$SUBAGENT_MODEL" ||
+    is_cloud_model "$VISION_MODEL" ||
+    is_cloud_model "$REVIEW_MODEL"
+}
 
 if [ -n "$MANUAL_MODEL" ]; then
     MODEL="$MANUAL_MODEL"
+    if is_cloud_model "$MODEL"; then
+        set_cloud_role_defaults
+    fi
     vapor_info "$(msg manual_model): $MODEL"
-elif [ "$RAM_GB" -ge 32 ]; then
-    MODEL="qwen3-coder:30b"
-    SIDECAR_MODEL="qwen3:8b"
-    echo -e "  ${NEON_GREEN}┃${NC} 🏆 ${BOLD}${YELLOW}★★★ ＢＥＳＴ  ＭＯＤＥＬ ★★★${NC}"
-    echo -e "  ${NEON_GREEN}┃${NC}    ${BOLD}${WHITE}$MODEL${NC} ${DIM}(19GB, MoE 3.3B active, $(msg model_best))${NC}"
-    echo -e "  ${NEON_GREEN}┃${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (5GB, fast helper)${NC}"
-elif [ "$RAM_GB" -ge 16 ]; then
-    MODEL="qwen3.5:397b-cloud"
-    SIDECAR_MODEL="qwen3.5:32b"
-    echo -e "  ${MINT}┃${NC} ⭐ ${BOLD}${CYAN}★★ ＧＲＥＡＴ  ＭＯＤＥＬ ★★${NC}"
-    echo -e "  ${MINT}┃${NC}    ${BOLD}${WHITE}$MODEL${NC} ${DIM}(Cloud, $(msg model_great))${NC}"
-    echo -e "  ${MINT}┃${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (fast helper)${NC}"
-elif [ "$RAM_GB" -ge 8 ]; then
-    MODEL="qwen3.5:32b"
-    vapor_warn "$MODEL ($(msg model_min))"
-    vapor_warn "$(msg model_recommend)"
 else
-    vapor_error "$(msg mem_lack): ${RAM_GB}GB ($(msg mem_lack_min))"
-    echo ""
-    echo "  $(msg mem_lack_hint1)"
-    echo "  $(msg mem_lack_hint2)"
-    exit 1
+    MODEL="glm-5.1:cloud"
+    set_cloud_role_defaults
+    echo -e "  ${NEON_GREEN}┃${NC} ☁️ ${BOLD}${YELLOW}*** CLOUD DEFAULT ***${NC}"
+    echo -e "  ${NEON_GREEN}┃${NC}    ${BOLD}${WHITE}$MODEL${NC} ${DIM}(Cloud, agentic coding default)${NC}"
+    echo -e "  ${NEON_GREEN}┃${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (Cloud helper / review / vision)${NC}"
 fi
 
 # =============================================
@@ -936,7 +966,14 @@ if [ "$IS_MAC" -eq 1 ]; then
 fi
 
 # --- Ollama ---
-if command -v ollama &>/dev/null; then
+if using_cloud_models; then
+    vapor_success "Ollama Cloud ☁️ configured ($CONFIG_OLLAMA_HOST)"
+    if [ -n "${OLLAMA_API_KEY:-${EVE_CLI_OLLAMA_API_KEY:-}}" ]; then
+        vapor_success "OLLAMA_API_KEY detected"
+    else
+        vapor_warn "OLLAMA_API_KEY not set — cloud requests will fail until you export it"
+    fi
+elif command -v ollama &>/dev/null; then
     vapor_success "Ollama 🦙 $(msg installed) ($(ollama --version 2>/dev/null || echo '?'))"
 else
     if [ "$IS_MAC" -eq 1 ] && command -v brew &>/dev/null; then
@@ -1037,111 +1074,115 @@ fi
 # =============================================
 step_header 4 "$(msg step4)"
 
-# Ollama 起動確認 (スピナー付きで待つ)
-if ! curl -s --max-time 2 "http://localhost:11434/api/tags" &>/dev/null; then
-    vapor_info "$(msg ollama_starting)"
-    if [ "$IS_MAC" -eq 1 ]; then
-        open -a Ollama 2>/dev/null || (ollama serve &>/dev/null &)
-    else
-        ollama serve &>/dev/null &
-    fi
-
-    # スピナー付きで起動待ち (最大30秒)
-    local_sparkles=("🦙" "✨" "💫" "🌟")
-    for i in $(seq 1 30); do
-        if curl -s --max-time 1 "http://localhost:11434/api/tags" &>/dev/null; then
-            break
+if using_cloud_models; then
+    vapor_success "Cloud models selected — skipping local ollama pull"
+else
+    # Ollama 起動確認 (スピナー付きで待つ)
+    if ! curl -s --max-time 2 "http://localhost:11434/api/tags" &>/dev/null; then
+        vapor_info "$(msg ollama_starting)"
+        if [ "$IS_MAC" -eq 1 ]; then
+            open -a Ollama 2>/dev/null || (ollama serve &>/dev/null &)
+        else
+            ollama serve &>/dev/null &
         fi
-        si=$(( (i - 1) % ${#local_sparkles[@]} ))
-        printf "\r  ${local_sparkles[$si]} ${CYAN}$(msg ollama_wait)${NC} ${DIM}${GRAY}%ds${NC}  " "$i"
-        sleep 1
-    done
-    printf "\r%-60s\r" " "
 
-    if curl -s --max-time 2 "http://localhost:11434/api/tags" &>/dev/null; then
-        vapor_success "Ollama 🦙 $(msg online)"
-    else
-        vapor_error "Ollama failed to start after 30 seconds."
-        echo "  Possible causes:"
-        echo "    - Ollama was not installed correctly"
-        echo "    - Another process is using port 11434"
-        echo "  Try:"
-        echo "    ollama serve    (in a separate terminal)"
-        echo "  Then re-run: bash install.sh"
-        exit 1
+        # スピナー付きで起動待ち (最大30秒)
+        local_sparkles=("🦙" "✨" "💫" "🌟")
+        for i in $(seq 1 30); do
+            if curl -s --max-time 1 "http://localhost:11434/api/tags" &>/dev/null; then
+                break
+            fi
+            si=$(( (i - 1) % ${#local_sparkles[@]} ))
+            printf "\r  ${local_sparkles[$si]} ${CYAN}$(msg ollama_wait)${NC} ${DIM}${GRAY}%ds${NC}  " "$i"
+            sleep 1
+        done
+        printf "\r%-60s\r" " "
+
+        if curl -s --max-time 2 "http://localhost:11434/api/tags" &>/dev/null; then
+            vapor_success "Ollama 🦙 $(msg online)"
+        else
+            vapor_error "Ollama failed to start after 30 seconds."
+            echo "  Possible causes:"
+            echo "    - Ollama was not installed correctly"
+            echo "    - Another process is using port 11434"
+            echo "  Try:"
+            echo "    ollama serve    (in a separate terminal)"
+            echo "  Then re-run: bash install.sh"
+            exit 1
+        fi
     fi
-fi
 
-# Check disk space (warn if < 20GB free)
-if command -v df &>/dev/null; then
-    AVAIL_KB=$(df -k "$HOME" | awk 'NR==2{print $4}')
-    AVAIL_GB=$((AVAIL_KB / 1024 / 1024))
-    if [ "$AVAIL_GB" -lt 20 ]; then
-        vapor_warn "Low disk space: ${AVAIL_GB}GB available (20GB+ recommended for model download)"
-        echo "  Free up disk space if the download fails."
+    # Check disk space (warn if < 20GB free)
+    if command -v df &>/dev/null; then
+        AVAIL_KB=$(df -k "$HOME" | awk 'NR==2{print $4}')
+        AVAIL_GB=$((AVAIL_KB / 1024 / 1024))
+        if [ "$AVAIL_GB" -lt 20 ]; then
+            vapor_warn "Low disk space: ${AVAIL_GB}GB available (20GB+ recommended for model download)"
+            echo "  Free up disk space if the download fails."
+        fi
     fi
-fi
 
-# Helper: download a model if not already present
-download_model() {
-    local model_name="$1"
-    local label="${2:-}"
-    if curl -s "http://localhost:11434/api/tags" 2>/dev/null | grep -qF "$model_name"; then
-        vapor_success "$model_name $(msg model_downloaded) 🧠✨ ${label}"
+    # Helper: download a model if not already present
+    download_model() {
+        local model_name="$1"
+        local label="${2:-}"
+        if curl -s "http://localhost:11434/api/tags" 2>/dev/null | grep -qF "$model_name"; then
+            vapor_success "$model_name $(msg model_downloaded) 🧠✨ ${label}"
+            return 0
+        fi
+        echo ""
+        echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
+        echo -e "  ${BOLD}${MAGENTA}  🔽  ${WHITE}$model_name ${CYAN}$(msg model_downloading) ${label}${NC}"
+        echo -e "  ${DIM}${AQUA}      $(msg model_download_hint)${NC}"
+        echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
+        echo ""
+        # Pull with retry (up to 3 attempts). Use timeout if available (not on macOS by default).
+        local pull_ok=0
+        local _timeout_cmd=""
+        if command -v timeout &>/dev/null; then
+            _timeout_cmd="timeout 1800"
+        elif command -v gtimeout &>/dev/null; then
+            _timeout_cmd="gtimeout 1800"
+        fi
+        for attempt in 1 2 3; do
+            if ${_timeout_cmd} ollama pull "$model_name"; then
+                pull_ok=1
+                break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+                echo -e "  ${YELLOW}⚠️  Download interrupted (attempt $attempt/3), retrying in 5s...${NC}"
+                sleep 5
+            fi
+        done
+        if [ "$pull_ok" -eq 0 ]; then
+            echo -e "  ${RED}⚠️  ダウンロード失敗 (3回試行) / Download failed after 3 attempts${NC}"
+            echo -e "  ${DIM}手動で再試行: ollama pull $model_name${NC}"
+            return 1
+        fi
+        echo ""
+        if curl -s "http://localhost:11434/api/tags" 2>/dev/null | grep -qF "$model_name"; then
+            echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
+            vapor_success "$model_name $(msg model_dl_done) 🧠🎉 ${label}"
+            echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
+        else
+            vapor_warn "$model_name $(msg install_fail) - ollama pull $model_name"
+            return 1
+        fi
+        echo ""
         return 0
-    fi
-    echo ""
-    echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
-    echo -e "  ${BOLD}${MAGENTA}  🔽  ${WHITE}$model_name ${CYAN}$(msg model_downloading) ${label}${NC}"
-    echo -e "  ${DIM}${AQUA}      $(msg model_download_hint)${NC}"
-    echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
-    echo ""
-    # Pull with retry (up to 3 attempts). Use timeout if available (not on macOS by default).
-    local pull_ok=0
-    local _timeout_cmd=""
-    if command -v timeout &>/dev/null; then
-        _timeout_cmd="timeout 1800"
-    elif command -v gtimeout &>/dev/null; then
-        _timeout_cmd="gtimeout 1800"
-    fi
-    for attempt in 1 2 3; do
-        if ${_timeout_cmd} ollama pull "$model_name"; then
-            pull_ok=1
-            break
-        fi
-        if [ "$attempt" -lt 3 ]; then
-            echo -e "  ${YELLOW}⚠️  Download interrupted (attempt $attempt/3), retrying in 5s...${NC}"
-            sleep 5
-        fi
-    done
-    if [ "$pull_ok" -eq 0 ]; then
-        echo -e "  ${RED}⚠️  ダウンロード失敗 (3回試行) / Download failed after 3 attempts${NC}"
-        echo -e "  ${DIM}手動で再試行: ollama pull $model_name${NC}"
-        return 1
-    fi
-    echo ""
-    if curl -s "http://localhost:11434/api/tags" 2>/dev/null | grep -qF "$model_name"; then
-        echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
-        vapor_success "$model_name $(msg model_dl_done) 🧠🎉 ${label}"
-        echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
-    else
-        vapor_warn "$model_name $(msg install_fail) - ollama pull $model_name"
-        return 1
-    fi
-    echo ""
-    return 0
-}
+    }
 
-# Download main model
-if ! download_model "$MODEL" "(main)"; then
-    vapor_error "Failed to download main model: $MODEL"
-    vapor_warn "Try manually: ollama pull $MODEL"
-fi
+    # Download main model
+    if ! download_model "$MODEL" "(main)"; then
+        vapor_error "Failed to download main model: $MODEL"
+        vapor_warn "Try manually: ollama pull $MODEL"
+    fi
 
-# Download sidecar model if different from main
-if [ -n "$SIDECAR_MODEL" ] && [ "$SIDECAR_MODEL" != "$MODEL" ]; then
-    if ! download_model "$SIDECAR_MODEL" "(sidecar)"; then
-        vapor_warn "Sidecar model download failed (non-critical): $SIDECAR_MODEL"
+    # Download sidecar model if different from main
+    if [ -n "$SIDECAR_MODEL" ] && [ "$SIDECAR_MODEL" != "$MODEL" ]; then
+        if ! download_model "$SIDECAR_MODEL" "(sidecar)"; then
+            vapor_warn "Sidecar model download failed (non-critical): $SIDECAR_MODEL"
+        fi
     fi
 fi
 
@@ -1243,7 +1284,12 @@ else
 
 MODEL="$MODEL"
 SIDECAR_MODEL="${SIDECAR_MODEL}"
-OLLAMA_HOST="http://localhost:11434"
+UTILITY_MODEL="${UTILITY_MODEL}"
+COMPACTION_MODEL="${COMPACTION_MODEL}"
+SUBAGENT_MODEL="${SUBAGENT_MODEL}"
+REVIEW_MODEL="${REVIEW_MODEL}"
+VISION_MODEL="${VISION_MODEL}"
+OLLAMA_HOST="${CONFIG_OLLAMA_HOST}"
 EOF
     vapor_success "$(msg config_file): $CONFIG_FILE"
 fi
@@ -1327,17 +1373,24 @@ else
     vapor_info "Claude Code CLI     → not installed (not needed)"
 fi
 
-if curl -s "http://localhost:11434/api/tags" 2>/dev/null | grep -qF "$MODEL"; then
-    vapor_success "AI Model ($MODEL) → 🟢 $(msg loaded)"
+if using_cloud_models; then
+    vapor_success "AI Model ($MODEL) → ☁️ Cloud"
+    if [ -n "$SIDECAR_MODEL" ] && [ "$SIDECAR_MODEL" != "$MODEL" ]; then
+        vapor_success "Sidecar  ($SIDECAR_MODEL) → ☁️ Cloud"
+    fi
 else
-    vapor_warn "AI Model ($MODEL) → 🟡 $(msg not_loaded)"
-fi
-
-if [ -n "$SIDECAR_MODEL" ] && [ "$SIDECAR_MODEL" != "$MODEL" ]; then
-    if curl -s "http://localhost:11434/api/tags" 2>/dev/null | grep -qF "$SIDECAR_MODEL"; then
-        vapor_success "Sidecar  ($SIDECAR_MODEL) → 🟢 $(msg loaded)"
+    if curl -s "http://localhost:11434/api/tags" 2>/dev/null | grep -qF "$MODEL"; then
+        vapor_success "AI Model ($MODEL) → 🟢 $(msg loaded)"
     else
-        vapor_warn "Sidecar  ($SIDECAR_MODEL) → 🟡 $(msg not_loaded)"
+        vapor_warn "AI Model ($MODEL) → 🟡 $(msg not_loaded)"
+    fi
+
+    if [ -n "$SIDECAR_MODEL" ] && [ "$SIDECAR_MODEL" != "$MODEL" ]; then
+        if curl -s "http://localhost:11434/api/tags" 2>/dev/null | grep -qF "$SIDECAR_MODEL"; then
+            vapor_success "Sidecar  ($SIDECAR_MODEL) → 🟢 $(msg loaded)"
+        else
+            vapor_warn "Sidecar  ($SIDECAR_MODEL) → 🟡 $(msg not_loaded)"
+        fi
     fi
 fi
 

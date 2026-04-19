@@ -214,7 +214,8 @@ class TestFileHash(unittest.TestCase):
         data = "verify this hash"
         with open(fpath, "w") as f:
             f.write(data)
-        expected = hashlib.sha256(open(fpath, "rb").read()).hexdigest()
+        with open(fpath, "rb") as f:
+            expected = hashlib.sha256(f.read()).hexdigest()
         self.assertEqual(RAGEngine._file_hash(fpath), expected)
 
 

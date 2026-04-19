@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location("eve_coder", os.path.join(SCRIPT_D
 eve_coder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(eve_coder)
 
-from tests import HookFixtureMixin
+from tests.hook_fixtures import HookFixtureMixin
 
 Config = eve_coder.Config
 
@@ -153,17 +153,17 @@ class TestCatchupDocumentation(unittest.TestCase):
     def test_instruction_file_exists(self):
         """Test that catchup instruction file exists."""
         instruction_path = os.path.join(
-            SCRIPT_DIR, "00_Docs", "20260308_cli_catchup_instruction.md"
+            SCRIPT_DIR, "tests", "fixtures", "20260308_cli_catchup_instruction.md"
         )
         self.assertTrue(os.path.exists(instruction_path))
 
-    def test_readme_has_catchup_section(self):
-        """Test that README mentions catchup plan."""
+    def test_readme_has_docs_links(self):
+        """Test that README links to docs/ documentation."""
         readme_path = os.path.join(SCRIPT_DIR, "README.md")
         with open(readme_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        self.assertIn("CLI キャッチアップ計画", content)
-        self.assertIn("20260308_cli_catchup_instruction.md", content)
+        self.assertIn("docs/usage.md", content)
+        self.assertIn("docs/commands.md", content)
 
 
 if __name__ == "__main__":

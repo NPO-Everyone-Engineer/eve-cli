@@ -147,7 +147,7 @@ class TestToolRegistryDefaults(unittest.TestCase):
     """Tests for register_defaults()."""
 
     EXPECTED_TOOL_NAMES = {
-        "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep",
+        "Bash", "Read", "Write", "Edit", "ApplyPatch", "MultiEdit", "Glob", "Grep",
         "WebFetch", "WebSearch", "NotebookEdit",
         "TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
         "AskUserQuestion", "AskUserQuestionBatch",

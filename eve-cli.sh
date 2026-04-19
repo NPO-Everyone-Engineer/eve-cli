@@ -21,10 +21,17 @@ STATE_DIR="${HOME}/.local/state/eve-cli"
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 
+# Prefer the checked-out repo script when available so new flags work without reinstall.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
+
 # --- 設定読み込み (安全なパーサー) ---
 CONFIG_FILE="${HOME}/.config/eve-cli/config"
 LIB_DIR="${HOME}/.local/lib/eve-cli"
-EVE_CODER_SCRIPT="${LIB_DIR}/eve-coder.py"
+INSTALLED_EVE_CODER_SCRIPT="${LIB_DIR}/eve-coder.py"
+EVE_CODER_SCRIPT="${SCRIPT_DIR}/eve-coder.py"
+if [ ! -f "$EVE_CODER_SCRIPT" ]; then
+    EVE_CODER_SCRIPT="$INSTALLED_EVE_CODER_SCRIPT"
+fi
 
 # デフォルト値
 MODEL=""
@@ -32,6 +39,9 @@ SIDECAR_MODEL=""
 OLLAMA_HOST="http://localhost:11434"
 EVE_CLI_DEBUG=0
 UI_THEME=""
+REVIEW_MODEL=""
+RUBBER_DUCK=0
+RUBBER_DUCK_CHECKPOINTS=""
 
 # [C1 fix] source ではなく grep + cut で既知キーのみ安全に読む
 # cut is safer than sed for values containing special characters
@@ -51,14 +61,17 @@ if [ -f "$CONFIG_FILE" ]; then
     unset _m _s _h _d _t
 fi
 
-# [SEC] Validate OLLAMA_HOST - only allow localhost (SSRF prevention)
+# [SEC] Validate OLLAMA_HOST - allow localhost or official Ollama Cloud only
 # Strict regex: reject @-credential injection (e.g. http://localhost:11434@attacker.com)
 _host_valid=0
 if [[ "$OLLAMA_HOST" =~ ^http://(localhost|127\.0\.0\.1|\[::1\]):[0-9]{1,5}(/.*)?$ ]]; then
     [[ "$OLLAMA_HOST" != *@* ]] && _host_valid=1
 fi
+if [[ "$OLLAMA_HOST" =~ ^https://(ollama\.com|www\.ollama\.com)(/api)?/?$ ]]; then
+    [[ "$OLLAMA_HOST" != *@* ]] && _host_valid=1
+fi
 if [ "$_host_valid" -eq 0 ]; then
-    echo "⚠️  OLLAMA_HOST='$OLLAMA_HOST' はlocalhostではありません。セキュリティのためlocalhostにリセットします。"
+    echo "⚠️  OLLAMA_HOST='$OLLAMA_HOST' は許可されていません。localhost にリセットします。"
     OLLAMA_HOST="http://localhost:11434"
 fi
 unset _host_valid
@@ -76,7 +89,6 @@ fi
 
 # --- eve-coder.py の探索 ---
 if [ ! -f "$EVE_CODER_SCRIPT" ]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
     if [ -n "$SCRIPT_DIR" ] && [ -f "${SCRIPT_DIR}/eve-coder.py" ]; then
         EVE_CODER_SCRIPT="${SCRIPT_DIR}/eve-coder.py"
     else
@@ -159,6 +171,26 @@ while [[ $# -gt 0 ]]; do
             UI_THEME="$2"
             shift 2
             ;;
+        --review-model)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --review-model requires an argument"
+                exit 1
+            fi
+            REVIEW_MODEL="$2"
+            shift 2
+            ;;
+        --rubber-duck)
+            RUBBER_DUCK=1
+            shift
+            ;;
+        --rubber-duck-checkpoints)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --rubber-duck-checkpoints requires an argument"
+                exit 1
+            fi
+            RUBBER_DUCK_CHECKPOINTS="$2"
+            shift 2
+            ;;
         -y|--yes|--dangerously-skip-permissions)
             YES_FLAG=1
             shift
@@ -172,6 +204,34 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
     esac
+done
+
+IS_CLOUD_HOST=0
+if [[ "$OLLAMA_HOST" =~ ^https://(ollama\.com|www\.ollama\.com)(/api)?/?$ ]]; then
+    IS_CLOUD_HOST=1
+fi
+
+ollama_tags_json() {
+    local _url="${OLLAMA_HOST}/api/tags"
+    local _api_key="${OLLAMA_API_KEY:-${EVE_CLI_OLLAMA_API_KEY:-}}"
+    if [ "$IS_CLOUD_HOST" -eq 1 ] && [ -n "$_api_key" ]; then
+        curl -s -H "Authorization: Bearer ${_api_key}" "$_url" 2>/dev/null
+    else
+        curl -s "$_url" 2>/dev/null
+    fi
+}
+
+for arg in "${EXTRA_ARGS[@]:-}"; do
+    if [[ "$arg" == "--version" ]]; then
+        OLLAMA_HOST="$OLLAMA_HOST" \
+        EVE_CLI_MODEL="${MODEL:-}" \
+        EVE_CLI_SIDECAR_MODEL="${SIDECAR_MODEL:-}" \
+        EVE_CLI_REVIEW_MODEL="${REVIEW_MODEL:-}" \
+        EVE_CLI_RUBBER_DUCK="${RUBBER_DUCK:-0}" \
+        EVE_CLI_RUBBER_DUCK_CHECKPOINTS="${RUBBER_DUCK_CHECKPOINTS:-}" \
+        EVE_CLI_DEBUG="${EVE_CLI_DEBUG:-0}" \
+        exec python3 "$EVE_CODER_SCRIPT" --version
+    fi
 done
 
 # --- 自動判定モード ---
@@ -191,15 +251,17 @@ if [ "$AUTO_MODE" -eq 1 ]; then
 fi
 
 # --- ローカルモードで起動 ---
-if ! ensure_ollama; then
-    echo ""
-    echo "ollama が起動できないため終了します。"
-    exit 1
+if [ "$IS_CLOUD_HOST" -eq 0 ]; then
+    if ! ensure_ollama; then
+        echo ""
+        echo "ollama が起動できないため終了します。"
+        exit 1
+    fi
 fi
 
 # モデル引数を組み立て
 MODEL_ARGS=()
-if [ -n "$MODEL" ]; then
+if [ -n "$MODEL" ] && [ "$IS_CLOUD_HOST" -eq 0 ]; then
     MODEL_ARGS+=(--model "$MODEL")
 fi
 
@@ -207,7 +269,7 @@ fi
 # Two-stage check: Python JSON first, grep -F fallback
 if [ -n "$MODEL" ]; then
     _model_found=0
-    _api_response="$(curl -s "$OLLAMA_HOST/api/tags" 2>/dev/null)"
+    _api_response="$(ollama_tags_json)"
     if [ -n "$_api_response" ]; then
         # Try Python JSON parsing for exact match
         # [SEC] Pass MODEL via env var, not interpolation (prevents injection)
@@ -230,6 +292,12 @@ except: sys.exit(1)
             _model_found=1
         fi
     fi
+    if [ "$IS_CLOUD_HOST" -eq 1 ] && [ "$_model_found" -eq 0 ]; then
+        echo "⚠️  Ollama Cloud ではローカルの download 済み判定を行いません。"
+        echo "   そのまま起動して、実際の API 呼び出し時にモデル可用性を確認します。"
+        echo ""
+        _model_found=1
+    fi
     if [ "$_model_found" -eq 0 ]; then
         echo "❌ AIモデル $MODEL がまだダウンロードされていません"
         echo ""
@@ -239,7 +307,7 @@ except: sys.exit(1)
         echo "(数分～数十分かかります。完了後に再度 eve-cli を実行してください)"
         echo ""
         echo "インストール済みモデル:"
-        curl -s "$OLLAMA_HOST/api/tags" 2>/dev/null | python3 -c "
+        ollama_tags_json | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -317,6 +385,9 @@ echo ""
 OLLAMA_HOST="$OLLAMA_HOST" \
 EVE_CLI_MODEL="${MODEL:-}" \
 EVE_CLI_SIDECAR_MODEL="${SIDECAR_MODEL:-}" \
+EVE_CLI_REVIEW_MODEL="${REVIEW_MODEL:-}" \
+EVE_CLI_RUBBER_DUCK="${RUBBER_DUCK:-0}" \
+EVE_CLI_RUBBER_DUCK_CHECKPOINTS="${RUBBER_DUCK_CHECKPOINTS:-}" \
 EVE_CLI_DEBUG="${EVE_CLI_DEBUG:-0}" \
 exec python3 "$EVE_CODER_SCRIPT" \
     ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} \

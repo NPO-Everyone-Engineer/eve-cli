@@ -84,11 +84,21 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 
 - 学習モード（やさしく解説）
 - ループモード（完了まで自動で繰り返す）
+- **KAIROS** — リポジトリ状態を定期観測して、通知・承認待ちプラン・低リスク自動実行を切り替える proactive supervisor
+- **自動 Lint/Test** — ファイル変更のたびに ruff/flake8/eslint + pytest を自動実行・自動修正
+- **Repo Map** — プロジェクト構造を AI に注入して大規模コードベースでも正確に編集
+- **Thinking モード** — Qwen3.5 の拡張推論で複雑な問題を深く思考
+- **Headless モード** — CI/CD パイプラインから非対話で実行（stdin パイプ、`--max-turns`、`--carry-session` 対応）
+- **プロジェクトコンテキスト自動学習** — 言語・FW・リンター・テストFW を自動検出してキャッシュ、初回から文脈を理解
+- **コードレビュー** — `/review` コマンドと Rubber Duck でセキュリティ・パフォーマンス・保守性の構造化レビュー
+- **Docker サンドボックス** — `--sandbox docker` で Bash コマンドをコンテナ内で安全に実行
+- **Extensions** — `eve-cli install <github-url>` でコミュニティ製スキル・MCP 設定を追加
 - GitHub 連携
 - Hooks / Skills / MCP
 - コードインテリジェンス
 - ブラウザ操作
 - RAG
+- **Channels** — Discord・Slack・Webhook から実行中のエージェントにメッセージを送受信
 - 日本語 UX（完全対応）
 
 ---
@@ -97,11 +107,15 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 
 | カテゴリ | 内容 |
 |---------|------|
-| **AI エージェント** | 複数の内蔵ツール、Plan/Act モード、Agent Teams、サブエージェント、ステップ数制限管理 |
-| **開発支援** | コミットメッセージ自動生成、テスト生成、ファイル監視、自動テスト、GitHub 連携 |
-| **使いやすさ** | 日本語 UX 完全対応（エラー・ヘルプ・スラッシュコマンド 153 件）、Tab 補完、画像添付、シンタックスハイライト、リッチ diff |
-| **カスタマイズ** | メモリ（長期記憶）、Skills、Hooks、MCP、プロファイル切替、テーマ変更 |
-| **安全性** | パーミッション管理、Git チェックポイント、`/undo`、ローカル優先設計 |
+| **AI エージェント** | 複数の内蔵ツール、Plan/Act モード、Agent Teams、サブエージェント、Thinking モード |
+| **開発支援** | コミット自動生成、テスト生成、自動 Lint/Test、Repo Map、コードレビュー（`/review` / Rubber Duck）、GitHub 連携 |
+| **CI/CD** | Headless モード（stdin パイプ対応）、JSON 出力、`--max-turns`、`--carry-session`、ループモード |
+| **コンテキスト** | プロジェクト自動解析（言語・FW・リンター・テストFW 検出）、キャッシュ、コードインテリジェンス |
+| **Proactive** | KAIROS supervisor。heartbeat ごとに状況を観測し、`observe` / `suggest` / `active` モードで通知・承認待ち・低リスク自動実行を制御 |
+| **使いやすさ** | 日本語 UX 完全対応、Tab 補完、画像添付、シンタックスハイライト、リッチ diff |
+| **カスタマイズ** | メモリ（長期記憶）、Skills、Hooks、MCP、Extensions（`eve-cli install`）、テーマ変更 |
+| **Channels** | Discord・Slack・Webhook から実行中のエージェントへ双方向通信。ペアリングコードで安全認証 |
+| **安全性** | パーミッション管理、Docker サンドボックス（`--sandbox`）、Git チェックポイント、`/undo` |
 
 > ツールの数や MCP 連携ツールは、設定やバージョンによって増減することがあります。詳しくは [コマンドリファレンス](docs/commands.md) を参照してください。
 
@@ -112,25 +126,36 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | やりたいこと | コマンド |
 |-------------|----------|
 | 普通に使う | `eve-cli` |
-| モデルを指定する | `eve-cli --model qwen3:8b` |
+| モデルを指定する | `eve-cli --model glm-5.1:cloud` |
 | 前回の続きから始める | `eve-cli --resume` |
 | 1回だけ実行する | `eve-cli -p "テストを書いて実行して"` |
+| 自動テスト付きで使う | `eve-cli --autotest` |
+| Thinking モードで使う | `eve-cli --think` |
+| Rubber Duck を有効にする | `eve-cli --review-model gemma4:31b-cloud --rubber-duck` |
+| Rubber Duck を plan だけで使う | `eve-cli --review-model gemma4:31b-cloud --rubber-duck --rubber-duck-checkpoints plan` |
+| Rubber Duck の blocker だけ採用する | レビュー後に `/accept-review blocking` |
 | 学習モードで使う | `eve-cli --learn --level 4` |
-| CI/CD 向けに JSON で受け取る | `eve-cli -p "状態を確認して" --output-format json` |
+| CI/CD で実行する | `eve-cli --headless -p "lint修正して" -y --output-format json` |
+| stdin パイプで実行する | `echo "テスト実行" \| eve-cli --headless --output-format json` |
+| ターン数制限付き実行 | `eve-cli --headless -p "修正して" --max-turns 5 -y` |
 | 完了まで自動で回す | `eve-cli -p "失敗テストを直して ALL_DONE と出して" --loop --done-string ALL_DONE -y` |
+| ループで履歴を維持 | `eve-cli -p "修正" --loop --carry-session -y` |
+| コードレビューする | 対話モードで `/review` または `/review 123`（PR番号） |
+| KAIROS を起動する | `eve-cli` 起動後に `/kairos on` |
+| サンドボックスで安全に | `eve-cli --sandbox docker --sandbox-no-network` |
+| 拡張機能を追加する | `eve-cli install https://github.com/user/eve-ext-name` |
+| Discord から操作する | `eve-cli --channels discord` |
 
 ---
 
 ## 推奨環境
 
-以下は **現行インストーラーが選ぶ目安** です。必要なら `--model` で手動指定できます。
+以下は **現行インストーラー / 既定 config の目安** です。必要なら `--model` で手動指定できます。
 
-| 環境 | メモリ | 既定の目安 |
-|------|-------|------------|
-| Apple Silicon Mac / Linux | 32GB+ | `qwen3-coder:30b` |
-| Apple Silicon Mac / Linux | 16GB+ | `qwen3.5:397b-cloud` |
-| 省メモリ環境 | 8GB+ | `qwen3.5:32b` |
-| 手動で軽いモデルを使いたい | 制限なし | `--model qwen3:8b` など |
+| 構成 | 条件 | 既定の目安 |
+|------|------|------------|
+| 標準構成 | ネットワーク接続あり | `MODEL=glm-5.1:cloud` + `SIDECAR_MODEL=gemma4:31b-cloud` + `VISION_MODEL=gemma4:31b-cloud` |
+| オフライン / ローカル重視 | ローカル Ollama を使う | `--model qwen3:8b` など |
 
 ```bash
 eve-cli --model qwen3:8b
@@ -147,15 +172,52 @@ eve-cli --model qwen3:8b
 毎回同じモデルや設定を使いたい場合は、このファイルを編集してください。
 
 ```ini
-MODEL=qwen3:8b
-SIDECAR_MODEL=qwen3:4b
-OLLAMA_HOST=http://localhost:11434
+MODEL=glm-5.1:cloud
+SIDECAR_MODEL=gemma4:31b-cloud
+VISION_MODEL=gemma4:31b-cloud
+UTILITY_MODEL=gemma4:31b-cloud
+COMPACTION_MODEL=gemma4:31b-cloud
+SUBAGENT_MODEL=glm-5.1:cloud
+REVIEW_MODEL=gemma4:31b-cloud
+OLLAMA_HOST=https://ollama.com/api
+CONTEXT_WINDOW=202752
 PROFILE=auto
 UI_THEME=normal
 ```
 
 `--model` のようなコマンドラインオプションは、その回の起動だけ上書きします。  
 長く使う設定は `config` に入れておくのがおすすめです。
+
+Ollama Cloud を使う場合は、`OLLAMA_HOST` を `https://ollama.com/api` にし、API キーを環境変数で渡します。
+
+```bash
+export OLLAMA_API_KEY=your-ollama-api-key
+eve-cli --ollama-host https://ollama.com/api --model glm-5.1:cloud
+```
+
+補足:
+- `eve-cli` は Ollama の native API を使うため、`OLLAMA_HOST` に `https://ollama.com` と `https://ollama.com/api` のどちらを入れても動くように正規化されます。
+- 最近の Ollama docs では `ollama launch pi --model ...` のような統合エージェント導線がありますが、`eve-cli` は引き続き Ollama API に直接つなぐ構成です。
+
+KAIROS を常用する場合は、`~/.config/eve-cli/kairos.json` またはプロジェクト単位の `.eve-cli/kairos.json` に設定を書けます。
+
+```json
+{
+  "enabled": true,
+  "mode": "observe",
+  "heartbeat_seconds": 300,
+  "active_hours": "workhours",
+  "pr_watch": {
+    "enabled": true
+  },
+  "dream": {
+    "enabled": true,
+    "schedule": "03:00"
+  }
+}
+```
+
+`observe` は通知のみ、`suggest` は承認待ちプランまで、`active` は allowlist にある低リスク操作のみ自動実行します。`/kairos` コマンド一覧は [コマンドリファレンス](docs/commands.md)、設定項目と保存先は [高度な機能](docs/advanced.md) を参照してください。
 
 高度な設定項目は [高度な機能](docs/advanced.md) にまとめています。
 
@@ -202,9 +264,9 @@ CLI の改善メモや追従状況は、内部ドキュメントとして `00_Do
 | `tests/` | ループ実行、セキュリティ、メモリ互換、並列編集などの回帰テストです。 |
 | `dev/` | 開発用スタンドアロンスクリプトです。セキュリティ診断、パフォーマンス検証、アドホックな動作確認に使います。 |
 | `scripts/` | リリースや保守に使う補助スクリプトです。現在は `install-manifest.json` 更新用スクリプトを含みます。 |
-| `00_Docs/` | 実装メモ、機能提案、作業記録などの内部ドキュメント置き場です。安定版の利用ガイドは `docs/` を参照してください。 |
+| `tests/fixtures/` | 回帰テスト用の fixture・placeholder ファイル置き場です。catchup 系の存在確認テストもここを参照します。 |
 
-補足: `.eve-cli/` のようなローカル設定や Skills / Hooks / MCP 連携の詳細は、[高度な機能](docs/advanced.md) にまとめています。
+補足: `.eve-cli/` 配下の `rules/`（パスSスコープルール）、`skills/`、`agents/`、`hooks.json`、`mcp.json` はチーム共有のため git 追跡されます。`channels/`（Bot トークン）や `context/`（キャッシュ）は gitignore されます。詳細は [高度な機能](docs/advanced.md) をご覧ください。
 
 ---
 

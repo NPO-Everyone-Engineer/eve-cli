@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location("eve_coder", os.path.join(SCRIPT_D
 eve_coder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(eve_coder)
 
-from tests import HookFixtureMixin
+from tests.hook_fixtures import HookFixtureMixin
 
 Config = eve_coder.Config
 HookManager = eve_coder.HookManager

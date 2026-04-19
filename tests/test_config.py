@@ -9,6 +9,7 @@ profile sections, and backward compatibility paths.
 import unittest
 import sys
 import os
+import io
 import tempfile
 import textwrap
 from unittest.mock import patch, MagicMock
@@ -34,11 +35,23 @@ class TestConfigDefaults(unittest.TestCase):
     def test_default_ollama_host(self):
         self.assertEqual(self.cfg.ollama_host, "http://localhost:11434")
 
-    def test_default_model_empty(self):
-        self.assertEqual(self.cfg.model, "")
+    def test_default_model(self):
+        self.assertEqual(self.cfg.model, "glm-5.1:cloud")
 
-    def test_default_sidecar_model_empty(self):
-        self.assertEqual(self.cfg.sidecar_model, "")
+    def test_default_sidecar_model(self):
+        self.assertEqual(self.cfg.sidecar_model, "gemma4:31b-cloud")
+
+    def test_default_vision_model(self):
+        self.assertEqual(self.cfg.vision_model, "gemma4:31b-cloud")
+
+    def test_default_review_model(self):
+        self.assertEqual(self.cfg.review_model, "")
+
+    def test_default_rubber_duck_disabled(self):
+        self.assertFalse(self.cfg.rubber_duck)
+
+    def test_default_rubber_duck_checkpoints(self):
+        self.assertEqual(self.cfg.rubber_duck_checkpoints, "plan,post-edit")
 
     def test_default_max_tokens(self):
         self.assertEqual(self.cfg.max_tokens, 8192)
@@ -47,7 +60,25 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertAlmostEqual(self.cfg.temperature, 0.7)
 
     def test_default_context_window(self):
-        self.assertEqual(self.cfg.context_window, 32768)
+        self.assertEqual(self.cfg.context_window, 65536)
+
+    def test_default_prompt_cost_per_mtok(self):
+        self.assertEqual(self.cfg.prompt_cost_per_mtok, 0.0)
+
+    def test_default_completion_cost_per_mtok(self):
+        self.assertEqual(self.cfg.completion_cost_per_mtok, 0.0)
+
+    def test_default_plan_mode_reasoning_effort(self):
+        self.assertEqual(self.cfg.plan_mode_reasoning_effort, "")
+
+    def test_default_shell_env_policy(self):
+        self.assertEqual(self.cfg.shell_env_policy, "default")
+
+    def test_default_hook_env_policy(self):
+        self.assertEqual(self.cfg.hook_env_policy, "default")
+
+    def test_default_notify_on(self):
+        self.assertEqual(self.cfg.notify_on, ["stop"])
 
     def test_default_max_agent_steps(self):
         self.assertEqual(self.cfg.max_agent_steps, 100)
@@ -107,7 +138,7 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(Config.DEFAULT_OLLAMA_HOST, "http://localhost:11434")
         self.assertEqual(Config.DEFAULT_MAX_TOKENS, 8192)
         self.assertAlmostEqual(Config.DEFAULT_TEMPERATURE, 0.7)
-        self.assertEqual(Config.DEFAULT_CONTEXT_WINDOW, 32768)
+        self.assertEqual(Config.DEFAULT_CONTEXT_WINDOW, 65536)
         self.assertEqual(Config.DEFAULT_MAX_AGENT_STEPS, 100)
         self.assertEqual(Config.HARD_MAX_AGENT_STEPS, 200)
 
@@ -210,11 +241,78 @@ class TestParseConfigFile(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_role_specific_models(self):
+        path = self._write_config("""
+            UTILITY_MODEL = qwen3:8b
+            COMPACTION_MODEL = gemma4:31b
+            SUBAGENT_MODEL = qwen3.5:32b
+            REVIEW_MODEL = gemma4:31b-cloud
+            VISION_MODEL = gemma4:27b-cloud
+            RUBBER_DUCK = true
+            RUBBER_DUCK_CHECKPOINTS = plan
+        """)
+        try:
+            self.cfg._parse_config_file(path)
+            self.assertEqual(self.cfg.utility_model, "qwen3:8b")
+            self.assertEqual(self.cfg.compaction_model, "gemma4:31b")
+            self.assertEqual(self.cfg.subagent_model, "qwen3.5:32b")
+            self.assertEqual(self.cfg.review_model, "gemma4:31b-cloud")
+            self.assertEqual(self.cfg.vision_model, "gemma4:27b-cloud")
+            self.assertTrue(self.cfg.rubber_duck)
+            self.assertEqual(self.cfg.rubber_duck_checkpoints, "plan")
+        finally:
+            os.unlink(path)
+
     def test_ollama_host(self):
         path = self._write_config("OLLAMA_HOST = http://192.168.1.100:11434\n")
         try:
             self.cfg._parse_config_file(path)
             self.assertEqual(self.cfg.ollama_host, "http://192.168.1.100:11434")
+        finally:
+            os.unlink(path)
+
+    def test_ollama_api_key(self):
+        path = self._write_config("OLLAMA_API_KEY = secret-token\n")
+        try:
+            self.cfg._parse_config_file(path)
+            self.assertEqual(self.cfg.ollama_api_key, "secret-token")
+        finally:
+            os.unlink(path)
+
+    def test_pricing_fields(self):
+        path = self._write_config("PROMPT_COST_PER_MTOK = 0.12\nCOMPLETION_COST_PER_MTOK = 0.34\n")
+        try:
+            self.cfg._parse_config_file(path)
+            self.assertEqual(self.cfg.prompt_cost_per_mtok, 0.12)
+            self.assertEqual(self.cfg.completion_cost_per_mtok, 0.34)
+        finally:
+            os.unlink(path)
+
+    def test_advanced_runtime_fields(self):
+        path = self._write_config(
+            "PLAN_MODE_REASONING_EFFORT = high\n"
+            "SHELL_ENV_POLICY = inherit\n"
+            "SHELL_ENV_INCLUDE = CI,HTTPS_PROXY\n"
+            "SHELL_ENV_EXCLUDE = PATH\n"
+            "SHELL_ENV_SET = FOO=bar,HELLO=world\n"
+            "HOOK_ENV_POLICY = inherit\n"
+            "NOTIFY_COMMAND = python3 notify.py\n"
+            "NOTIFY_ON = stop,error\n"
+            "SKILLS_ENABLE = design*,review\n"
+            "SKILLS_DISABLE = bugfix\n"
+        )
+        try:
+            self.cfg._parse_config_file(path)
+            self.assertEqual(self.cfg.plan_mode_reasoning_effort, "high")
+            self.assertEqual(self.cfg.shell_env_policy, "inherit")
+            self.assertEqual(self.cfg.shell_env_include, ["CI", "HTTPS_PROXY"])
+            self.assertEqual(self.cfg.shell_env_exclude, ["PATH"])
+            self.assertEqual(self.cfg.shell_env_set["FOO"], "bar")
+            self.assertEqual(self.cfg.hook_env_policy, "inherit")
+            self.assertEqual(self.cfg.notify_command, "python3 notify.py")
+            self.assertEqual(self.cfg.notify_on, ["stop", "error"])
+            self.assertEqual(self.cfg.skill_enable_patterns, ["design*", "review"])
+            self.assertEqual(self.cfg.skill_disable_patterns, ["bugfix"])
         finally:
             os.unlink(path)
 
@@ -455,6 +553,13 @@ class TestLoadEnv(unittest.TestCase):
         """Return a dict of env vars to remove for clean testing."""
         keys = [
             "OLLAMA_HOST", "EVE_CODER_MODEL", "EVE_CLI_MODEL",
+            "OLLAMA_API_KEY", "EVE_CLI_OLLAMA_API_KEY",
+            "EVE_CLI_PROMPT_COST_PER_MTOK", "EVE_CLI_COMPLETION_COST_PER_MTOK",
+            "EVE_CLI_PLAN_MODE_REASONING_EFFORT",
+            "EVE_CLI_SHELL_ENV_POLICY", "EVE_CLI_SHELL_ENV_INCLUDE", "EVE_CLI_SHELL_ENV_EXCLUDE", "EVE_CLI_SHELL_ENV_SET",
+            "EVE_CLI_HOOK_ENV_POLICY", "EVE_CLI_HOOK_ENV_INCLUDE", "EVE_CLI_HOOK_ENV_EXCLUDE", "EVE_CLI_HOOK_ENV_SET",
+            "EVE_CLI_NOTIFY_COMMAND", "EVE_CLI_NOTIFY_ON",
+            "EVE_CLI_SKILLS_ENABLE", "EVE_CLI_SKILLS_DISABLE",
             "EVE_CODER_SIDECAR", "EVE_CLI_SIDECAR_MODEL",
             "EVE_CODER_MAX_AGENT_STEPS", "EVE_CLI_MAX_AGENT_STEPS",
             "EVE_CLI_PROFILE", "EVE_CODER_DEBUG", "EVE_CLI_DEBUG",
@@ -485,6 +590,47 @@ class TestLoadEnv(unittest.TestCase):
             self.cfg._load_env()
         self.assertEqual(self.cfg.model, "legacy-model")
 
+    def test_ollama_api_key_from_env(self):
+        env = self._make_env(OLLAMA_API_KEY="env-secret")
+        with patch.dict(os.environ, env):
+            self.cfg._load_env()
+        self.assertEqual(self.cfg.ollama_api_key, "env-secret")
+
+    def test_eve_cli_ollama_api_key_overrides_env(self):
+        env = self._make_env(OLLAMA_API_KEY="env-secret", EVE_CLI_OLLAMA_API_KEY="cli-secret")
+        with patch.dict(os.environ, env):
+            self.cfg._load_env()
+        self.assertEqual(self.cfg.ollama_api_key, "cli-secret")
+
+    def test_pricing_from_env(self):
+        env = self._make_env(EVE_CLI_PROMPT_COST_PER_MTOK="0.25", EVE_CLI_COMPLETION_COST_PER_MTOK="0.75")
+        with patch.dict(os.environ, env):
+            self.cfg._load_env()
+        self.assertEqual(self.cfg.prompt_cost_per_mtok, 0.25)
+        self.assertEqual(self.cfg.completion_cost_per_mtok, 0.75)
+
+    def test_advanced_runtime_fields_from_env(self):
+        env = self._make_env(
+            EVE_CLI_PLAN_MODE_REASONING_EFFORT="medium",
+            EVE_CLI_SHELL_ENV_POLICY="inherit",
+            EVE_CLI_SHELL_ENV_INCLUDE="CI,HTTPS_PROXY",
+            EVE_CLI_HOOK_ENV_POLICY="inherit",
+            EVE_CLI_NOTIFY_COMMAND="python3 notify.py",
+            EVE_CLI_NOTIFY_ON="stop,error",
+            EVE_CLI_SKILLS_ENABLE="design*",
+            EVE_CLI_SKILLS_DISABLE="bugfix",
+        )
+        with patch.dict(os.environ, env):
+            self.cfg._load_env()
+        self.assertEqual(self.cfg.plan_mode_reasoning_effort, "medium")
+        self.assertEqual(self.cfg.shell_env_policy, "inherit")
+        self.assertEqual(self.cfg.shell_env_include, ["CI", "HTTPS_PROXY"])
+        self.assertEqual(self.cfg.hook_env_policy, "inherit")
+        self.assertEqual(self.cfg.notify_command, "python3 notify.py")
+        self.assertEqual(self.cfg.notify_on, ["stop", "error"])
+        self.assertEqual(self.cfg.skill_enable_patterns, ["design*"])
+        self.assertEqual(self.cfg.skill_disable_patterns, ["bugfix"])
+
     def test_eve_cli_model_overrides_legacy(self):
         env = self._make_env(EVE_CODER_MODEL="legacy-model", EVE_CLI_MODEL="new-model")
         with patch.dict(os.environ, env):
@@ -508,6 +654,26 @@ class TestLoadEnv(unittest.TestCase):
         with patch.dict(os.environ, env):
             self.cfg._load_env()
         self.assertEqual(self.cfg.sidecar_model, "old-sidecar")
+
+    def test_role_specific_models_from_env(self):
+        env = self._make_env(
+            EVE_CLI_UTILITY_MODEL="util-v1",
+            EVE_CLI_COMPACTION_MODEL="compact-v1",
+            EVE_CLI_SUBAGENT_MODEL="sub-v1",
+            EVE_CLI_REVIEW_MODEL="review-v1",
+            EVE_CLI_VISION_MODEL="vision-v1",
+            EVE_CLI_RUBBER_DUCK="1",
+            EVE_CLI_RUBBER_DUCK_CHECKPOINTS="post-edit",
+        )
+        with patch.dict(os.environ, env):
+            self.cfg._load_env()
+        self.assertEqual(self.cfg.utility_model, "util-v1")
+        self.assertEqual(self.cfg.compaction_model, "compact-v1")
+        self.assertEqual(self.cfg.subagent_model, "sub-v1")
+        self.assertEqual(self.cfg.review_model, "review-v1")
+        self.assertEqual(self.cfg.vision_model, "vision-v1")
+        self.assertTrue(self.cfg.rubber_duck)
+        self.assertEqual(self.cfg.rubber_duck_checkpoints, "post-edit")
 
     def test_max_agent_steps_from_env(self):
         env = self._make_env(EVE_CLI_MAX_AGENT_STEPS="150")
@@ -592,6 +758,19 @@ class TestLoadCliArgs(unittest.TestCase):
         self.cfg._load_cli_args(["-m", "qwen3:8b"])
         self.assertEqual(self.cfg.model, "qwen3:8b")
         self.assertTrue(self.cfg._cli_model_set)
+
+    def test_review_model_flag(self):
+        self.cfg._load_cli_args(["--review-model", "gemma4:31b"])
+        self.assertEqual(self.cfg.review_model, "gemma4:31b")
+        self.assertTrue(self.cfg._cli_review_model_set)
+
+    def test_rubber_duck_flag(self):
+        self.cfg._load_cli_args(["--rubber-duck"])
+        self.assertTrue(self.cfg.rubber_duck)
+
+    def test_rubber_duck_checkpoints_flag(self):
+        self.cfg._load_cli_args(["--rubber-duck-checkpoints", "plan"])
+        self.assertEqual(self.cfg.rubber_duck_checkpoints, "plan")
 
     def test_yes_flag(self):
         self.cfg._load_cli_args(["-y"])
@@ -743,6 +922,267 @@ class TestLoadCliArgs(unittest.TestCase):
         self.assertEqual(self.cfg.max_loop_iterations, 3)
 
 
+class TestOllamaHostValidation(unittest.TestCase):
+    def setUp(self):
+        self.cfg = Config()
+
+    def test_allows_localhost(self):
+        self.cfg.ollama_host = "http://localhost:11434"
+        self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.ollama_host, "http://localhost:11434")
+        self.assertTrue(self.cfg.uses_local_ollama())
+
+    def test_allows_ollama_cloud_and_strips_api_path(self):
+        self.cfg.ollama_host = "https://ollama.com/api"
+        self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.ollama_host, "https://ollama.com")
+        self.assertFalse(self.cfg.uses_local_ollama())
+
+    def test_allows_ollama_cloud_and_strips_v1_path(self):
+        self.cfg.ollama_host = "https://ollama.com/v1"
+        self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.ollama_host, "https://ollama.com")
+
+    def test_rejects_untrusted_remote_host(self):
+        self.cfg.ollama_host = "https://evil.example/api"
+        with patch("builtins.print"):
+            self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.ollama_host, Config.DEFAULT_OLLAMA_HOST)
+
+    def test_local_models_reuse_primary_when_helper_roles_not_explicit(self):
+        self.cfg.model = "qwen3:8b"
+        self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.sidecar_model, "qwen3:8b")
+        self.assertEqual(self.cfg.subagent_model, "qwen3:8b")
+        self.assertEqual(self.cfg.vision_model, "")
+
+    def test_invalid_vision_model_name_resets_to_default(self):
+        self.cfg.vision_model = "gemma4:31b-cloud;rm -rf /"
+        with patch("builtins.print"):
+            self.cfg._validate_ollama_host()
+        self.assertEqual(self.cfg.vision_model, Config.DEFAULT_VISION_MODEL)
+
+
+class TestOllamaClientHeaders(unittest.TestCase):
+    def test_check_connection_sends_auth_header(self):
+        cfg = Config()
+        cfg.ollama_host = "https://ollama.com"
+        cfg.ollama_api_key = "secret-token"
+        client = eve_coder.OllamaClient(cfg)
+
+        fake_resp = MagicMock()
+        fake_resp.read.return_value = b'{"models":[]}'
+
+        with patch("urllib.request.urlopen", return_value=fake_resp) as mock_urlopen:
+            ok, models = client.check_connection(retries=1)
+
+        self.assertTrue(ok)
+        self.assertEqual(models, [])
+        req = mock_urlopen.call_args[0][0]
+        self.assertEqual(req.get_header("Authorization"), "Bearer secret-token")
+
+    def test_query_installed_models_sends_auth_header(self):
+        cfg = Config()
+        cfg.ollama_host = "https://ollama.com/api"
+        cfg.ollama_api_key = "secret-token"
+
+        fake_resp = MagicMock()
+        fake_resp.read.return_value = b'{"models":[{"name":"glm-5.1:cloud"}]}'
+
+        with patch("urllib.request.urlopen", return_value=fake_resp) as mock_urlopen:
+            models = cfg._query_installed_models()
+
+        self.assertEqual(models, ["glm-5.1:cloud"])
+        req = mock_urlopen.call_args[0][0]
+        self.assertEqual(req.get_header("Authorization"), "Bearer secret-token")
+
+
+class TestGemma4CloudAndSampling(unittest.TestCase):
+    def test_gemma31b_alias_is_treated_as_cloud(self):
+        self.assertTrue(eve_coder._is_cloud_model("gemma4:31b"))
+        self.assertTrue(eve_coder._is_cloud_model("gemma4:31b-cloud"))
+
+    def test_glm5_cloud_is_treated_as_cloud(self):
+        self.assertTrue(eve_coder._is_cloud_model("glm-5.1:cloud"))
+
+    def test_qwen397_alias_is_treated_as_cloud(self):
+        self.assertTrue(eve_coder._is_cloud_model("qwen3.5:397b"))
+        self.assertTrue(eve_coder._is_cloud_model("qwen3.5:397b-cloud"))
+
+    def test_glm5_cloud_uses_explicit_context_window(self):
+        cfg = Config()
+        cfg._apply_context_window("glm-5.1:cloud")
+        self.assertEqual(cfg.context_window, 204800)
+
+    def test_gemma_defaults_to_google_temperature(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client._merge_chat_options("gemma4:31b", 0.7)
+
+        self.assertEqual(opts["temperature"], 1.0)
+        self.assertEqual(opts["top_p"], 0.95)
+        self.assertEqual(opts["top_k"], 64)
+
+    def test_gemma_preserves_lower_tool_temperature(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client._merge_chat_options("gemma4:31b", 0.3)
+
+        self.assertEqual(opts["temperature"], 0.3)
+
+    def test_gemma_preserves_explicit_temperature_override(self):
+        cfg = Config()
+        cfg.temperature = 0.9
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client._merge_chat_options("gemma4:31b", 0.9)
+
+        self.assertEqual(opts["temperature"], 0.9)
+
+    def test_request_temperature_prefers_explicit_option(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        temp = client._resolve_request_temperature(
+            "gemma4:31b",
+            tools=True,
+            options={"temperature": 0.2, "retry_temperature_boost": 0.3},
+        )
+
+        self.assertEqual(temp, 0.2)
+
+    def test_gemma_uses_stricter_tool_temperature(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        temp = client._resolve_request_temperature("gemma4:31b", tools=True)
+
+        self.assertEqual(temp, 0.25)
+
+    def test_glm5_uses_stricter_tool_temperature(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        temp = client._resolve_request_temperature("glm-5.1:cloud", tools=True)
+
+        self.assertEqual(temp, 0.25)
+
+    def test_request_temperature_applies_retry_boost_without_mutating_client(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        temp = client._resolve_request_temperature(
+            "test-model",
+            tools=True,
+            options={"retry_temperature_boost": 0.3},
+        )
+
+        self.assertEqual(temp, 0.6)
+        self.assertEqual(client.temperature, cfg.temperature)
+
+    def test_merge_chat_options_drops_retry_temperature_meta(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client._merge_chat_options(
+            "test-model",
+            0.6,
+            {"retry_temperature_boost": 0.3, "max_tokens": 512},
+        )
+
+        self.assertEqual(opts["temperature"], 0.6)
+        self.assertEqual(opts["num_predict"], 512)
+        self.assertNotIn("retry_temperature_boost", opts)
+
+    def test_build_utility_options_caps_context_and_tokens(self):
+        cfg = Config()
+        cfg.context_window = 262144
+        cfg.max_tokens = 32768
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client.build_utility_options("gemma4:31b", "classifier", 0.2)
+
+        self.assertEqual(opts["num_ctx"], 4096)
+        self.assertEqual(opts["num_predict"], 64)
+        self.assertEqual(opts["temperature"], 0.2)
+
+    def test_tool_mode_caps_large_model_num_predict(self):
+        cfg = Config()
+        cfg.context_window = 262144
+        cfg.max_tokens = 32768
+        client = eve_coder.OllamaClient(cfg)
+
+        opts = client._merge_chat_options("qwen3.5:397b", 0.4, {"tool_mode": True})
+
+        self.assertEqual(opts["num_predict"], 4096)
+        self.assertEqual(opts["num_ctx"], 262144)
+        self.assertNotIn("tool_mode", opts)
+
+    def test_temporary_reasoning_restores_client_settings(self):
+        cfg = Config()
+        cfg.think_mode = True
+        cfg.thinking_budget = 8000
+        client = eve_coder.OllamaClient(cfg)
+
+        with client.temporary_reasoning(False, None):
+            self.assertFalse(client.think_mode)
+            self.assertIsNone(client.thinking_budget)
+
+        self.assertTrue(client.think_mode)
+        self.assertEqual(client.thinking_budget, 8000)
+
+    def test_refresh_from_config_updates_runtime_settings(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+        cfg.ollama_host = "https://ollama.com"
+        cfg.max_tokens = 1234
+        cfg.temperature = 0.2
+        cfg.context_window = 262144
+        cfg.debug = True
+
+        client.refresh_from_config(cfg)
+
+        self.assertEqual(client.base_url, "https://ollama.com")
+        self.assertEqual(client.max_tokens, 1234)
+        self.assertEqual(client.temperature, 0.2)
+        self.assertEqual(client.context_window, 262144)
+        self.assertTrue(client.debug)
+
+
+class TestOllamaThinkingAdapters(unittest.TestCase):
+    def test_native_response_preserves_thinking_field(self):
+        adapted = eve_coder.OllamaClient._native_to_openai_response({
+            "message": {
+                "role": "assistant",
+                "thinking": "step 1\nstep 2",
+                "content": "final answer",
+            },
+            "prompt_eval_count": 11,
+            "eval_count": 5,
+        })
+
+        message = adapted["choices"][0]["message"]
+        self.assertEqual(message["thinking"], "step 1\nstep 2")
+        self.assertEqual(message["content"], "final answer")
+
+    def test_iter_ndjson_preserves_thinking_delta(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+        payload = (
+            b'{"message":{"thinking":"pondering"},"done":false}\n'
+            b'{"message":{"content":"answer"},"done":true,"prompt_eval_count":7,"eval_count":3}\n'
+        )
+
+        chunks = list(client._iter_ndjson(io.BytesIO(payload)))
+
+        self.assertEqual(chunks[0]["choices"][0]["delta"]["thinking"], "pondering")
+        self.assertEqual(chunks[1]["choices"][0]["delta"]["content"], "answer")
+        self.assertEqual(chunks[1]["usage"]["prompt_tokens"], 7)
+        self.assertEqual(chunks[1]["usage"]["completion_tokens"], 3)
+
+
 class TestFullWidthSpaceHandling(unittest.TestCase):
     """Test that full-width spaces (\u3000) in CLI args are handled correctly."""
 
@@ -852,6 +1292,138 @@ class TestLoadConfigFile(unittest.TestCase):
         # Should not raise
         cfg._load_config_file()
         self.assertEqual(cfg.model, Config.DEFAULT_MODEL)
+
+    def test_load_validates_ollama_host_before_auto_detect(self):
+        """Config.load must sanitize OLLAMA_HOST before model auto-detection runs."""
+        cfg = Config()
+        validation_hosts = []
+        auto_detect_hosts = []
+
+        def fake_load_env(self):
+            self.ollama_host = "http://evil.example:11434"
+
+        def fake_apply_profile(self):
+            self.ollama_host = "http://profile-evil.example:11434"
+
+        def fake_validate(self):
+            validation_hosts.append(self.ollama_host)
+            self.ollama_host = self.DEFAULT_OLLAMA_HOST
+
+        def fake_auto_detect(self):
+            auto_detect_hosts.append(self.ollama_host)
+
+        with patch.object(Config, "_load_config_file", autospec=True, return_value=None), \
+             patch.object(Config, "_load_env", autospec=True, side_effect=fake_load_env), \
+             patch.object(Config, "_load_cli_args", autospec=True, return_value=None), \
+             patch.object(Config, "_validate_ollama_host", autospec=True, side_effect=fake_validate), \
+             patch.object(Config, "_detect_network", autospec=True, return_value=None), \
+             patch.object(Config, "_apply_profile", autospec=True, side_effect=fake_apply_profile), \
+             patch.object(Config, "_auto_detect_model", autospec=True, side_effect=fake_auto_detect), \
+             patch.object(Config, "_ensure_dirs", autospec=True, return_value=None), \
+             patch.object(Config, "load_custom_commands", autospec=True, return_value=None):
+            cfg.load([])
+
+        self.assertEqual(
+            validation_hosts,
+            ["http://evil.example:11434", "http://profile-evil.example:11434"],
+        )
+        self.assertEqual(auto_detect_hosts, [Config.DEFAULT_OLLAMA_HOST])
+
+    def test_apply_profile_respects_cli_sidecar_override(self):
+        cfg = Config()
+        cfg.profile = "online"
+        cfg.network_status = "online"
+        cfg.sidecar_model = "cli-sidecar"
+        cfg._cli_sidecar_set = True
+        cfg._profiles = {"online": {"SIDECAR_MODEL": "profile-sidecar"}}
+
+        cfg._apply_profile()
+
+        self.assertEqual(cfg.sidecar_model, "cli-sidecar")
+
+    def test_apply_profile_respects_role_specific_overrides(self):
+        cfg = Config()
+        cfg.profile = "online"
+        cfg.network_status = "online"
+        cfg.utility_model = "cli-utility"
+        cfg.compaction_model = "cli-compaction"
+        cfg.subagent_model = "cli-subagent"
+        cfg.review_model = "cli-review"
+        cfg.vision_model = "cli-vision"
+        cfg._cli_utility_model_set = True
+        cfg._cli_compaction_model_set = True
+        cfg._cli_subagent_model_set = True
+        cfg._cli_review_model_set = True
+        cfg._cli_vision_model_set = True
+        cfg._profiles = {
+            "online": {
+                "UTILITY_MODEL": "profile-utility",
+                "COMPACTION_MODEL": "profile-compaction",
+                "SUBAGENT_MODEL": "profile-subagent",
+                "REVIEW_MODEL": "profile-review",
+                "VISION_MODEL": "profile-vision",
+                "RUBBER_DUCK": "true",
+                "RUBBER_DUCK_CHECKPOINTS": "post-edit",
+            }
+        }
+
+        cfg._apply_profile()
+
+        self.assertEqual(cfg.utility_model, "cli-utility")
+        self.assertEqual(cfg.compaction_model, "cli-compaction")
+        self.assertEqual(cfg.subagent_model, "cli-subagent")
+        self.assertEqual(cfg.review_model, "cli-review")
+        self.assertEqual(cfg.vision_model, "cli-vision")
+        self.assertTrue(cfg.rubber_duck)
+        self.assertEqual(cfg.rubber_duck_checkpoints, "post-edit")
+
+
+class TestModelRoleResolution(unittest.TestCase):
+    def test_utility_model_falls_back_to_sidecar(self):
+        cfg = Config()
+        cfg.sidecar_model = "gemma4:31b"
+        self.assertEqual(eve_coder._resolve_utility_model(cfg), "gemma4:31b")
+
+    def test_compaction_model_prefers_explicit_override(self):
+        cfg = Config()
+        cfg.sidecar_model = "gemma4:31b"
+        cfg.compaction_model = "gemma4:31b-cloud"
+        self.assertEqual(eve_coder._resolve_compaction_model(cfg), "gemma4:31b-cloud")
+
+    def test_subagent_model_prefers_specific_then_primary_model(self):
+        cfg = Config()
+        cfg.model = "glm-5.1:cloud"
+        cfg.sidecar_model = "gemma4:31b"
+        cfg.utility_model = "qwen3:8b"
+        self.assertEqual(eve_coder._resolve_subagent_model(cfg), "glm-5.1:cloud")
+        cfg.subagent_model = "qwen3.5:32b"
+        self.assertEqual(eve_coder._resolve_subagent_model(cfg), "qwen3.5:32b")
+
+    def test_review_model_prefers_explicit_then_utility(self):
+        cfg = Config()
+        cfg.sidecar_model = "gemma4:31b"
+        cfg.utility_model = "qwen3:8b"
+        self.assertEqual(eve_coder._resolve_review_model(cfg), "qwen3:8b")
+        cfg.review_model = "gemma4:31b-cloud"
+        self.assertEqual(eve_coder._resolve_review_model(cfg), "gemma4:31b-cloud")
+
+    def test_vision_model_prefers_explicit_override(self):
+        cfg = Config()
+        cfg.sidecar_model = "gemma4:31b"
+        self.assertEqual(eve_coder._resolve_vision_model(cfg), "gemma4:31b-cloud")
+        cfg.vision_model = "gemma4:27b-cloud"
+        self.assertEqual(eve_coder._resolve_vision_model(cfg), "gemma4:27b-cloud")
+
+    def test_pick_vision_route_model_uses_gemma_helper_for_non_vision_primary(self):
+        cfg = Config()
+        cfg.model = "glm-5.1:cloud"
+        cfg.sidecar_model = "glm-5.1:cloud"
+        client = MagicMock()
+        client.check_vision_support.side_effect = lambda model, assume_if_unknown=True: {
+            "glm-5.1:cloud": False,
+            "gemma4:31b-cloud": True,
+        }.get(model, False if not assume_if_unknown else True)
+        self.assertEqual(eve_coder._pick_vision_route_model(cfg, client), "gemma4:31b-cloud")
 
 
 if __name__ == "__main__":
