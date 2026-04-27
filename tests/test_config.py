@@ -1395,7 +1395,7 @@ class TestModelRoleResolution(unittest.TestCase):
         cfg.model = "glm-5.1:cloud"
         cfg.sidecar_model = "gemma4:31b"
         cfg.utility_model = "qwen3:8b"
-        self.assertEqual(eve_coder._resolve_subagent_model(cfg), "glm-5.1:cloud")
+        self.assertEqual(eve_coder._resolve_subagent_model(cfg), "gemma4:31b-cloud")
         cfg.subagent_model = "qwen3.5:32b"
         self.assertEqual(eve_coder._resolve_subagent_model(cfg), "qwen3.5:32b")
 

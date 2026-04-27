@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.33.0"
+__version__ = "2.33.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1189,7 +1189,7 @@ class Config:
     DEFAULT_SIDECAR = "gemma4:31b-cloud"
     DEFAULT_UTILITY_MODEL = ""
     DEFAULT_COMPACTION_MODEL = ""
-    DEFAULT_SUBAGENT_MODEL = "glm-5.1:cloud"
+    DEFAULT_SUBAGENT_MODEL = "gemma4:31b-cloud"
     DEFAULT_REVIEW_MODEL = ""
     DEFAULT_VISION_MODEL = "gemma4:31b-cloud"
     DEFAULT_RUBBER_DUCK_CHECKPOINTS = "plan,post-edit"
