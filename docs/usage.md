@@ -259,6 +259,59 @@ eve-cli --headless -p "lint エラーを修正して" -y --autotest
 | 終了コード | `0`=成功, `1`=エラー, `2`=タイムアウト, `3`=ループ上限到達 |
 | `-p` 必須 | 対話モードは不可（プロンプトが必要） |
 
+### 出力フォーマット
+
+| `--output-format` | 用途 | 形式 |
+|---|---|---|
+| `text` (default) | 人間が読む | プレーンテキスト |
+| `json` | CI 結果を 1 つの JSON にまとめる | 最後に 1 つのオブジェクト |
+| `stream-json` | リアルタイム監視・パイプ処理 | JSONL（イベント 1 行 = 1 JSON） |
+
+#### `stream-json` のイベントスキーマ
+
+各イベントは `type` フィールドで種類を判別します。`session_start` で始まり `done` で終わります。
+
+```json
+{"type":"session_start","model":"...","session_id":"...","prompt":"...","timestamp":...}
+{"type":"tool_call","tool":"Bash","params":{...},"timestamp":...}
+{"type":"tool_result","tool":"Bash","output":"...","is_error":false,"timestamp":...}
+{"type":"assistant","content":"...","timestamp":...}
+{"type":"done","stop_reason":"completed","stop_detail":"","exit_code":0,"duration_ms":1234,"token_usage":{"input":100,"output":50,"total":150},"timestamp":...}
+```
+
+**stop_reason** の値: `completed` / `assistant_final` / `max_iterations` / `tool_loop` / `interrupted` / `error`
+
+#### `json` モードの最終出力
+
+```json
+{
+  "role": "assistant",
+  "content": "...",
+  "model": "...",
+  "session_id": "...",
+  "tool_calls": 3,
+  "stop_reason": "completed",
+  "stop_detail": "",
+  "duration_ms": 1234,
+  "token_usage": {"input": 100, "output": 50, "total": 150},
+  "events": [...],
+  "exit_code": 0
+}
+```
+
+#### CI 連携例（GitHub Actions）
+
+```yaml
+- name: Run AI fix
+  run: |
+    eve-cli --headless -p "lint エラーを修正" -y \
+      --output-format stream-json \
+    | tee result.jsonl
+    # 最後の done イベントから exit_code を取得
+    EXIT=$(tail -1 result.jsonl | jq -r .exit_code)
+    exit "$EXIT"
+```
+
 ---
 
 ## 自動 Lint/Test

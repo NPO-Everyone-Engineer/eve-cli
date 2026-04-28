@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.36.0"
+__version__ = "2.37.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -6063,6 +6063,71 @@ class HeadlessOutputCollector:
         self._lock = threading.Lock()
         self._tool_call_count = 0
         self._last_text = ""
+        self._start_time = time.time()
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
+        self._stop_reason = None
+        self._stop_detail = ""
+        self._session_start_emitted = False
+
+    def session_start(self, prompt=""):
+        """Emit a session_start event once at the beginning of a headless run.
+
+        Idempotent: only the first call emits an event. Subsequent calls (e.g.
+        in loop mode) are no-ops so downstream parsers see exactly one
+        session_start event per run.
+        """
+        if self._session_start_emitted:
+            return
+        self._session_start_emitted = True
+        event = {
+            "type": "session_start",
+            "model": self._model,
+            "session_id": self._session_id,
+            "prompt": (str(prompt or ""))[:2000],
+            "timestamp": time.time(),
+        }
+        with self._lock:
+            self._events.append(event)
+        if self._output_format == "stream-json":
+            self._flush_line(event)
+
+    def record_usage(self, prompt_tokens, completion_tokens):
+        """Accumulate per-call token usage across the run."""
+        try:
+            pt = int(prompt_tokens or 0)
+            ct = int(completion_tokens or 0)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            self._prompt_tokens += pt
+            self._completion_tokens += ct
+
+    def done(self, stop_reason="completed", stop_detail="", exit_code=0):
+        """Emit a terminal done event (stream-json) and record final state.
+
+        Provides downstream parsers a clear end-of-stream marker with the
+        stop reason, total duration, and token usage.
+        """
+        self._stop_reason = stop_reason
+        self._stop_detail = stop_detail
+        event = {
+            "type": "done",
+            "stop_reason": stop_reason,
+            "stop_detail": stop_detail,
+            "exit_code": int(exit_code),
+            "duration_ms": int((time.time() - self._start_time) * 1000),
+            "token_usage": {
+                "input": self._prompt_tokens,
+                "output": self._completion_tokens,
+                "total": self._prompt_tokens + self._completion_tokens,
+            },
+            "timestamp": time.time(),
+        }
+        with self._lock:
+            self._events.append(event)
+        if self._output_format == "stream-json":
+            self._flush_line(event)
 
     def tool_call(self, tool_name, params):
         """Record a tool invocation."""
@@ -6127,6 +6192,14 @@ class HeadlessOutputCollector:
                 "model": self._model,
                 "session_id": self._session_id,
                 "tool_calls": self._tool_call_count,
+                "stop_reason": self._stop_reason or "completed",
+                "stop_detail": self._stop_detail,
+                "duration_ms": int((time.time() - self._start_time) * 1000),
+                "token_usage": {
+                    "input": self._prompt_tokens,
+                    "output": self._completion_tokens,
+                    "total": self._prompt_tokens + self._completion_tokens,
+                },
                 "events": self._events,
             }
 
@@ -21336,6 +21409,8 @@ class Agent:
                                 self.config.prompt_cost_per_mtok,
                                 self.config.completion_cost_per_mtok,
                             )
+                        if self.output_collector:
+                            self.output_collector.record_usage(prompt_t, completion_t)
                 self.session._just_compacted = False
 
                 # Handle empty response from local LLM (smart retry cascade)
@@ -22945,6 +23020,7 @@ def main():
                     session = Session(config, system_prompt)
                 if _output_collector:
                     _output_collector._session_id = session.session_id
+                    _output_collector.session_start(prompt=config.prompt)
                 agent = Agent(config, client, registry, permissions, session, tui,
                               output_collector=_output_collector)
                 try:
@@ -22983,6 +23059,7 @@ def main():
             session = Session(config, system_prompt)
             if _output_collector:
                 _output_collector._session_id = session.session_id
+                _output_collector.session_start(prompt=config.prompt)
             agent = Agent(config, client, registry, permissions, session, tui,
                           output_collector=_output_collector)
             try:
@@ -22991,6 +23068,12 @@ def main():
                 print(f"\n{C.RED}Execution failed: {e}{C.RESET}")
                 exit_code = 1
                 if config.output_format in ("json", "stream-json"):
+                    if _output_collector:
+                        _output_collector.done(
+                            stop_reason="error",
+                            stop_detail=str(e)[:200],
+                            exit_code=exit_code,
+                        )
                     _output = {
                         "role": "error",
                         "error": str(e),
@@ -23002,6 +23085,12 @@ def main():
         session.save()
         if config.output_format in ("json", "stream-json"):
             if _output_collector:
+                _stop = getattr(agent, "_last_stop_reason", None) or {}
+                _output_collector.done(
+                    stop_reason=_stop.get("reason", "completed"),
+                    stop_detail=_stop.get("detail", ""),
+                    exit_code=exit_code,
+                )
                 # Use headless collector's structured summary
                 _output = _output_collector.get_summary()
                 _output["exit_code"] = exit_code
