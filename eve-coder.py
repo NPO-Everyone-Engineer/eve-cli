@@ -208,6 +208,7 @@ _active_tui = None
 # Contains {"channel_manager": ChannelManager, "source_msg": ChannelMessage} or None
 _active_channel_context = None
 _active_notifier = None
+_active_hook_mgr = None  # set by main(), used by NotificationManager.notify to fire Notification hooks
 
 # Custom commands cache: command_name -> {"description": str, "path": str, "frontmatter": dict}
 _custom_commands = {}
@@ -313,7 +314,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.39.0"
+__version__ = "2.40.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -15103,7 +15104,20 @@ class HookManager:
         .eve-cli/hooks.json            (project-level, additive)
     """
 
-    VALID_EVENTS = frozenset({"SessionStart", "PreToolUse", "PostToolUse", "Stop"})
+    VALID_EVENTS = frozenset({
+        "SessionStart",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "UserPromptSubmit",
+        "SubagentStop",
+        "PreCompact",
+        "Notification",
+    })
+    # Events that can deny the underlying action by exiting non-zero (exit 1).
+    # PreToolUse / PreCompact: hook can veto the tool call or compaction.
+    # UserPromptSubmit: hook can veto the prompt before it reaches the agent.
+    DENY_CAPABLE_EVENTS = frozenset({"PreToolUse", "PreCompact", "UserPromptSubmit"})
     MAX_HOOKS = 50      # safety limit per config file
     DEFAULT_TIMEOUT = 10  # seconds
     MAX_TIMEOUT = 30     # hard cap
@@ -15305,10 +15319,32 @@ class HookManager:
         except (OSError, EOFError, KeyboardInterrupt):
             pass
 
+    @staticmethod
+    def _matcher_value_matches(pattern, actual):
+        """Compare a single matcher entry against the actual context value.
+
+        Patterns starting with `re:` or `~` are treated as Python regex
+        (anchored fullmatch). Plain strings use exact equality. Used for
+        e.g. `tool_name: "re:Bash|Read|Write"` so a single hook covers
+        multiple tools without duplication.
+        """
+        if pattern is None:
+            return False
+        pattern_str = str(pattern)
+        actual_str = str(actual)
+        if pattern_str.startswith("re:") or pattern_str.startswith("~"):
+            raw = pattern_str[3:] if pattern_str.startswith("re:") else pattern_str[1:]
+            try:
+                return re.fullmatch(raw, actual_str) is not None
+            except re.error:
+                return False
+        return pattern_str == actual_str
+
     def fire(self, event, context=None):
         """Fire hooks for the given event. Returns list of result dicts.
 
         Context is a dict passed as environment variables with EVE_HOOK_ prefix.
+        Matcher values starting with `re:` (or `~`) are interpreted as regex.
         """
         if not self._hooks:
             return []
@@ -15321,7 +15357,7 @@ class HookManager:
             if matcher and isinstance(matcher, dict) and context:
                 match = True
                 for key, val in matcher.items():
-                    if str(context.get(key, "")) != str(val):
+                    if not self._matcher_value_matches(val, context.get(key, "")):
                         match = False
                         break
                 if not match:
@@ -15421,6 +15457,57 @@ class HookManager:
         }
         self.fire("PostToolUse", ctx)
 
+    def fire_user_prompt(self, prompt):
+        """Fire UserPromptSubmit hooks. Returns 'deny' if any hook exits 1.
+
+        Allows users to filter / log / veto prompts before they reach the
+        agent. Hooks receive EVE_HOOK_PROMPT (capped at 4KB) and can refuse
+        the submission by exiting with code 1.
+        """
+        if not self._hooks:
+            return "allow"
+        ctx = {"prompt": str(prompt or "")[:4096]}
+        results = self.fire("UserPromptSubmit", ctx)
+        for r in results:
+            if r.get("exit_code") == 1:
+                return "deny"
+        return "allow"
+
+    def fire_subagent_stop(self, agent_name, stop_reason="completed", detail=""):
+        """Fire SubagentStop hooks (called when SubAgent / fleet teammate finishes)."""
+        ctx = {
+            "agent_name": str(agent_name or ""),
+            "stop_reason": str(stop_reason or "completed"),
+            "detail": str(detail or "")[:512],
+        }
+        self.fire("SubagentStop", ctx)
+
+    def fire_pre_compact(self, before_tokens, threshold_pct):
+        """Fire PreCompact hooks. Returns 'deny' if any hook exits 1.
+
+        Lets users skip auto-compaction (exit 1) — e.g. to checkpoint
+        important state before context is summarized.
+        """
+        if not self._hooks:
+            return "allow"
+        ctx = {
+            "before_tokens": str(int(before_tokens or 0)),
+            "threshold_pct": str(int(threshold_pct or 0)),
+        }
+        results = self.fire("PreCompact", ctx)
+        for r in results:
+            if r.get("exit_code") == 1:
+                return "deny"
+        return "allow"
+
+    def fire_notification(self, event_kind, message=""):
+        """Fire Notification hooks (called when a notification is posted)."""
+        ctx = {
+            "event_kind": str(event_kind or ""),
+            "message": str(message or "")[:1024],
+        }
+        self.fire("Notification", ctx)
+
     @property
     def has_hooks(self):
         """Return True if any hooks are loaded."""
@@ -15469,6 +15556,17 @@ class NotificationManager:
         return self.enabled and event_name in self.events
 
     def notify(self, event_name, payload):
+        # Fire Notification hooks regardless of whether the dedicated notifier
+        # command is configured — hooks are an independent extensibility point
+        # and may want to react to all notification events.
+        if _active_hook_mgr is not None and _active_hook_mgr.has_hooks:
+            try:
+                _active_hook_mgr.fire_notification(
+                    event_name,
+                    str(payload.get("message", "") if isinstance(payload, dict) else "")[:1024],
+                )
+            except Exception:
+                pass
         if not self.should_notify(event_name):
             return False
         try:
@@ -21373,6 +21471,16 @@ class Agent:
 
     def run(self, user_input):
         """Run the agent loop for a single user request."""
+        # UserPromptSubmit hook can veto the prompt before any work happens.
+        # We only fire when hooks are installed to avoid the dict / subprocess
+        # overhead on the hot path.
+        if self.hook_mgr and self.hook_mgr.has_hooks:
+            decision = self.hook_mgr.fire_user_prompt(user_input)
+            if decision == "deny":
+                self._set_stop_reason("hook_denied", "UserPromptSubmit hook returned deny")
+                _p = _scroll_aware_print
+                _p(f"\n  {_ansi(chr(27)+'[38;5;196m')}⛔ Prompt rejected by UserPromptSubmit hook.{C.RESET}")
+                return
         self._run_impl(user_input, skip_add=False)
 
     def _get_allowed_tool_names(self):
@@ -21752,9 +21860,17 @@ class Agent:
             # Auto-compact if context is getting full
             if iteration > 0 and iteration % 5 == 0:
                 _before_tokens = self.session.get_token_estimate()
-                if self.session.auto_compact(self.client, self.config):
+                _threshold_pct = int(self.session.context_policy_for(self.config)["compact_threshold"] * 100)
+                _can_compact = True
+                if self.hook_mgr and self.hook_mgr.has_hooks:
+                    _usage_pct_now = int((_before_tokens / self.config.context_window) * 100)
+                    if _usage_pct_now >= _threshold_pct:
+                        _decision = self.hook_mgr.fire_pre_compact(_before_tokens, _threshold_pct)
+                        if _decision == "deny":
+                            _can_compact = False
+                            _p(f"\n  {C.DIM}[PreCompact hook denied auto-compaction]{C.RESET}")
+                if _can_compact and self.session.auto_compact(self.client, self.config):
                     _after_tokens = self.session.get_token_estimate()
-                    _threshold_pct = int(self.session.context_policy_for(self.config)["compact_threshold"] * 100)
                     _p(
                         f"\n  {C.DIM}[auto-compacted at >{_threshold_pct}% full: "
                         f"~{_before_tokens:,} → ~{_after_tokens:,} tokens]{C.RESET}"
@@ -22178,6 +22294,12 @@ class Agent:
                         # PostToolUse hook (parallel path)
                         if self.hook_mgr and self.hook_mgr.has_hooks:
                             self.hook_mgr.fire_post_tool(tool_name, result.output, result.is_error)
+                            if tool_name in ("SubAgent", "ParallelAgents", "Task"):
+                                self.hook_mgr.fire_subagent_stop(
+                                    tool_name,
+                                    stop_reason="error" if result.is_error else "completed",
+                                    detail=str(result.output)[:200] if result.is_error else "",
+                                )
                 else:
                     # Sequential execution (preserves ordering for side-effecting tools)
                     for tc_id, tool_name, tool_params, tool in validated_calls:
@@ -22214,6 +22336,12 @@ class Agent:
                             # PostToolUse hook (sequential path)
                             if self.hook_mgr and self.hook_mgr.has_hooks:
                                 self.hook_mgr.fire_post_tool(tool_name, output, _is_err)
+                                if tool_name in ("SubAgent", "ParallelAgents", "Task"):
+                                    self.hook_mgr.fire_subagent_stop(
+                                        tool_name,
+                                        stop_reason="error" if _is_err else "completed",
+                                        detail=str(output)[:200] if _is_err else "",
+                                    )
 
                             if tracked_paths and not _is_err:
                                 for _tracked in tracked_paths:
@@ -23296,8 +23424,9 @@ def main():
     if hook_mgr.has_hooks and config.debug:
         print(f"{C.DIM}[debug] Loaded {len(hook_mgr._hooks)} hooks{C.RESET}", file=sys.stderr)
     notifier = NotificationManager(config)
-    global _active_notifier
+    global _active_notifier, _active_hook_mgr
     _active_notifier = notifier
+    _active_hook_mgr = hook_mgr
 
     agent = Agent(config, client, registry, permissions, session, tui,
                   rag_engine=_rag_engine, hook_mgr=hook_mgr, code_intel=_code_intel)

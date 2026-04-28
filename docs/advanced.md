@@ -155,8 +155,12 @@ SIDECAR_MODEL=qwen3:4b
 ```json
 {
   "hooks": [
-    {"event": "PreToolUse", "command": "echo 'tool check'", "timeout": 5},
+    {"event": "PreToolUse", "matcher": {"tool_name": "re:Bash|Edit|Write"},
+     "command": "python3 scripts/audit.py", "timeout": 5},
     {"event": "PostToolUse", "command": "python3 scripts/log.py"},
+    {"event": "UserPromptSubmit", "command": "python3 scripts/prompt_filter.py"},
+    {"event": "PreCompact", "command": "python3 scripts/checkpoint.py"},
+    {"event": "SubagentStop", "command": "echo 'subagent done'"},
     {"event": "Stop", "command": "echo 'done'"}
   ]
 }
@@ -164,14 +168,32 @@ SIDECAR_MODEL=qwen3:4b
 
 ### イベント一覧
 
-| イベント | タイミング | 用途例 |
-|---------|-----------|--------|
-| `SessionStart` | セッション開始時 | 環境チェック |
-| `PreToolUse` | ツール実行前 | カスタム承認、ログ |
-| `PostToolUse` | ツール実行後 | 結果のログ、通知 |
-| `Stop` | セッション終了時 | クリーンアップ |
+| イベント | タイミング | 用途例 | deny 可能 |
+|---------|-----------|--------|---------|
+| `SessionStart` | セッション開始時 | 環境チェック | – |
+| `UserPromptSubmit` | ユーザー入力直後・LLM 呼出前 | プロンプト検閲・ログ | ✅ |
+| `PreToolUse` | ツール実行前 | カスタム承認、ログ | ✅ |
+| `PostToolUse` | ツール実行後 | 結果のログ、通知 | – |
+| `SubagentStop` | SubAgent / ParallelAgents / Task 完了時 | サブエージェントの監査 | – |
+| `PreCompact` | 自動 compaction 直前 | チェックポイント保存 | ✅ |
+| `Notification` | 通知発火時（error/stop/question 等） | 外部システムへの転送 | – |
+| `Stop` | セッション終了時 | クリーンアップ | – |
 
-`PreToolUse` フックが非ゼロで終了すると、そのツール実行はブロックされます。
+deny 可能なイベントでフックが非ゼロ終了すると、そのアクション（ツール実行・プロンプト送信・compaction）は中止されます。
+
+### Matcher（条件付きフック）
+
+`matcher` フィールドでフックを発火条件で絞り込めます。値の先頭に `re:` または `~` を付けると **正規表現（fullmatch）** として評価されます。
+
+```json
+{
+  "event": "PreToolUse",
+  "matcher": {"tool_name": "re:Bash|Read|Write"},
+  "command": "python3 scripts/check.py"
+}
+```
+
+文字列のままだと完全一致です。同じ matcher を複数イベントに使う場合は `re:` で OR 条件にまとめると hook 定義が短くなります。
 
 ### Hook 環境変数ポリシー
 
