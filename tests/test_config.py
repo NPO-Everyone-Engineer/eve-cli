@@ -42,7 +42,7 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(self.cfg.sidecar_model, "qwen3-coder-next:cloud")
 
     def test_default_vision_model(self):
-        self.assertEqual(self.cfg.vision_model, "kimi-k2.6:cloud")
+        self.assertEqual(self.cfg.vision_model, "gemma4:31b-cloud")
 
     def test_default_review_model(self):
         self.assertEqual(self.cfg.review_model, "")
@@ -247,7 +247,7 @@ class TestParseConfigFile(unittest.TestCase):
             COMPACTION_MODEL = gemma4:31b
             SUBAGENT_MODEL = qwen3.5:32b
             REVIEW_MODEL = qwen3-coder-next:cloud
-            VISION_MODEL = kimi-k2.6:cloud
+            VISION_MODEL = gemma4:31b-cloud
             RUBBER_DUCK = true
             RUBBER_DUCK_CHECKPOINTS = plan
         """)
@@ -257,7 +257,7 @@ class TestParseConfigFile(unittest.TestCase):
             self.assertEqual(self.cfg.compaction_model, "gemma4:31b")
             self.assertEqual(self.cfg.subagent_model, "qwen3.5:32b")
             self.assertEqual(self.cfg.review_model, "qwen3-coder-next:cloud")
-            self.assertEqual(self.cfg.vision_model, "kimi-k2.6:cloud")
+            self.assertEqual(self.cfg.vision_model, "gemma4:31b-cloud")
             self.assertTrue(self.cfg.rubber_duck)
             self.assertEqual(self.cfg.rubber_duck_checkpoints, "plan")
         finally:
@@ -764,6 +764,11 @@ class TestLoadCliArgs(unittest.TestCase):
         self.assertEqual(self.cfg.review_model, "gemma4:31b")
         self.assertTrue(self.cfg._cli_review_model_set)
 
+    def test_vision_model_flag(self):
+        self.cfg._load_cli_args(["--vision-model", "gemma3"])
+        self.assertEqual(self.cfg.vision_model, "gemma3")
+        self.assertTrue(self.cfg._cli_vision_model_set)
+
     def test_rubber_duck_flag(self):
         self.cfg._load_cli_args(["--rubber-duck"])
         self.assertTrue(self.cfg.rubber_duck)
@@ -957,7 +962,7 @@ class TestOllamaHostValidation(unittest.TestCase):
         self.assertEqual(self.cfg.vision_model, "")
 
     def test_invalid_vision_model_name_resets_to_default(self):
-        self.cfg.vision_model = "kimi-k2.6:cloud;rm -rf /"
+        self.cfg.vision_model = "gemma4:31b-cloud;rm -rf /"
         with patch("builtins.print"):
             self.cfg._validate_ollama_host()
         self.assertEqual(self.cfg.vision_model, Config.DEFAULT_VISION_MODEL)
@@ -1410,7 +1415,7 @@ class TestModelRoleResolution(unittest.TestCase):
     def test_vision_model_prefers_explicit_override(self):
         cfg = Config()
         cfg.sidecar_model = "gemma4:31b"
-        self.assertEqual(eve_coder._resolve_vision_model(cfg), "kimi-k2.6:cloud")
+        self.assertEqual(eve_coder._resolve_vision_model(cfg), "gemma4:31b-cloud")
         cfg.vision_model = "gemma4:27b-cloud"
         self.assertEqual(eve_coder._resolve_vision_model(cfg), "gemma4:27b-cloud")
 
@@ -1421,9 +1426,9 @@ class TestModelRoleResolution(unittest.TestCase):
         client = MagicMock()
         client.check_vision_support.side_effect = lambda model, assume_if_unknown=True: {
             "deepseek-v4-pro:cloud": False,
-            "kimi-k2.6:cloud": True,
+            "gemma4:31b-cloud": True,
         }.get(model, False if not assume_if_unknown else True)
-        self.assertEqual(eve_coder._pick_vision_route_model(cfg, client), "kimi-k2.6:cloud")
+        self.assertEqual(eve_coder._pick_vision_route_model(cfg, client), "gemma4:31b-cloud")
 
 
 if __name__ == "__main__":

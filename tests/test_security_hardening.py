@@ -371,7 +371,7 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertIn('OLLAMA_HOST="${CONFIG_OLLAMA_HOST}"', shell_content)
 
         self.assertIn('$MODEL = "deepseek-v4-pro:cloud"', powershell_content)
-        self.assertIn('$script:VISION_MODEL = "kimi-k2.6:cloud"', powershell_content)
+        self.assertIn('$script:VISION_MODEL = "gemma4:31b-cloud"', powershell_content)
         self.assertIn('VISION_MODEL="$VISION_MODEL"', powershell_content)
         self.assertIn("Confirm-UnverifiedRemoteInstaller", powershell_content)
         self.assertIn("EVE_CLI_OLLAMA_SETUP_SHA256", powershell_content)

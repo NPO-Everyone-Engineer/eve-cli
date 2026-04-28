@@ -117,6 +117,7 @@
     "description": "EvE CLI — Everyone.Engineer コーディングエージェント（Ollama ローカル + クラウド）",
     "prompt": "ワンショットプロンプト（非インタラクティブ）",
     "model": "Ollama モデル名",
+    "vision_model": "画像入力ターン専用のビジョンモデル",
     "yes": "すべてのツール呼び出しを自動承認",
     "debug": "デバッグモード",
     "resume": "最後のセッションを再開",

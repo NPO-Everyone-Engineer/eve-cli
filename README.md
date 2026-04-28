@@ -127,6 +127,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 |-------------|----------|
 | 普通に使う | `eve-cli` |
 | モデルを指定する | `eve-cli --model deepseek-v4-pro:cloud` |
+| 画像モデルを別指定する | `eve-cli --model qwen3:8b --vision-model gemma3` |
 | 前回の続きから始める | `eve-cli --resume` |
 | 1回だけ実行する | `eve-cli -p "テストを書いて実行して"` |
 | 自動テスト付きで使う | `eve-cli --autotest` |
@@ -154,7 +155,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 
 | 構成 | 条件 | 既定の目安 |
 |------|------|------------|
-| 標準構成 | ネットワーク接続あり | `MODEL=deepseek-v4-pro:cloud` + `SIDECAR_MODEL=qwen3-coder-next:cloud` + `VISION_MODEL=kimi-k2.6:cloud` |
+| 標準構成 | ネットワーク接続あり | `MODEL=deepseek-v4-pro:cloud` + `SIDECAR_MODEL=qwen3-coder-next:cloud` + `VISION_MODEL=gemma4:31b-cloud` |
 | オフライン / ローカル重視 | ローカル Ollama を使う | `--model qwen3:8b` など |
 
 ```bash
@@ -174,7 +175,7 @@ eve-cli --model qwen3:8b
 ```ini
 MODEL=deepseek-v4-pro:cloud
 SIDECAR_MODEL=qwen3-coder-next:cloud
-VISION_MODEL=kimi-k2.6:cloud
+VISION_MODEL=gemma4:31b-cloud
 UTILITY_MODEL=qwen3-coder-next:cloud
 COMPACTION_MODEL=qwen3-coder-next:cloud
 SUBAGENT_MODEL=qwen3-coder-next:cloud

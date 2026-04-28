@@ -765,7 +765,7 @@ function Set-CloudRoleDefaults {
     $script:UTILITY_MODEL = $script:SIDECAR_MODEL
     $script:COMPACTION_MODEL = $script:SIDECAR_MODEL
     $script:REVIEW_MODEL = $script:SIDECAR_MODEL
-    $script:VISION_MODEL = "kimi-k2.6:cloud"
+    $script:VISION_MODEL = "gemma4:31b-cloud"
     $script:SUBAGENT_MODEL = $script:SIDECAR_MODEL
     $script:CONFIG_OLLAMA_HOST = "https://ollama.com/api"
 }

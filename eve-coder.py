@@ -1193,7 +1193,7 @@ class Config:
     DEFAULT_COMPACTION_MODEL = ""
     DEFAULT_SUBAGENT_MODEL = "qwen3-coder-next:cloud"
     DEFAULT_REVIEW_MODEL = ""
-    DEFAULT_VISION_MODEL = "kimi-k2.6:cloud"
+    DEFAULT_VISION_MODEL = "gemma4:31b-cloud"
     DEFAULT_RUBBER_DUCK_CHECKPOINTS = "plan,post-edit"
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
@@ -1655,6 +1655,7 @@ class Config:
         )
         parser.add_argument("-p", "--prompt", help=t('help.prompt', default="One-shot prompt (non-interactive)"))
         parser.add_argument("-m", "--model", help=t('help.model', default="Ollama model name"))
+        parser.add_argument("--vision-model", help=t('help.vision_model', default="Vision model for image input turns"))
         parser.add_argument("--review-model", help="Model to use for second-opinion reviews (/review, rubber-duck)")
         parser.add_argument("--rubber-duck-checkpoints", help="Automatic review checkpoints: plan, post-edit, or all")
         parser.add_argument("-y", "--yes", action="store_true", help=t('help.yes', default="Auto-approve all tool calls"))
@@ -1767,6 +1768,9 @@ class Config:
         if args.model:
             self.model = args.model
             self._cli_model_set = True
+        if args.vision_model:
+            self.vision_model = args.vision_model
+            self._cli_vision_model_set = True
         if args.review_model:
             self.review_model = args.review_model
             self._cli_review_model_set = True
@@ -1959,6 +1963,7 @@ class Config:
         "qwen3.5:397b": 262144,        # Cloud alias, 256K ctx
         "qwen3.5:397b-cloud": 262144,  # Cloud model, 256K ctx
         "deepseek-v4-pro:cloud":  1000000,  # DeepSeek V4 Pro Cloud, 1M ctx
+        "gemma4:31b-cloud":       262144,  # Gemma 4 31B Cloud, 256K ctx (vision)
         "kimi-k2.6:cloud":         256000,  # Moonshot Kimi K2.6 Cloud, 256K ctx (vision)
         "qwen3-coder-next:cloud":  256000,  # Qwen3 Coder Next Cloud, 256K ctx
         "gemma4:31b":              262144,  # 256K ctx
@@ -2011,6 +2016,7 @@ class Config:
         ("qwen3.5:397b",            256, "A"),  # Cloud alias
         ("qwen3.5:397b-cloud",      256, "A"),  # Cloud model
         ("deepseek-v4-pro:cloud",    32, "A"),  # DeepSeek V4 Pro Cloud, 1M ctx
+        ("gemma4:31b-cloud",         32, "A"),  # Gemma 4 31B Cloud, 256K ctx (vision)
         ("kimi-k2.6:cloud",          32, "A"),  # Moonshot Kimi K2.6 Cloud, 256K ctx (vision)
         ("qwen3-coder-next:cloud",   32, "A"),  # Qwen3 Coder Next Cloud, 256K ctx
         ("gemma4:31b",               32, "A"),  # 31B
@@ -16408,6 +16414,7 @@ def _vision_model_candidates(config):
         _resolve_vision_model(config),
         _config_value(config, "sidecar_model", ""),
         _config_value(config, "utility_model", ""),
+        "gemma4:31b-cloud",
         "kimi-k2.6:cloud",
         "gemma4:31b",
     ]

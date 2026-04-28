@@ -46,6 +46,7 @@ eve-cli -p "Hello Worldを作って"
 | オプション | 説明 | 例 |
 |-----------|------|-----|
 | `--model <名前>` | 使用モデルを指定 | `--model qwen3.5:14b` |
+| `--vision-model <名前>` | 画像入力ターン専用モデルを指定 | `--vision-model gemma3` |
 | `-p "<指示>"` | ワンショットモードで実行 | `-p "バグを直して"` |
 | `-y` | 自動許可モード（毎回の確認をスキップ） | |
 | `--resume` | セッションを再開（候補が複数あればピッカー表示） | |
@@ -91,6 +92,12 @@ EVE_CLI_SIDECAR_MODEL=qwen3-coder-next:cloud eve-cli
 > /image                          # クリップボードの画像を添付
 > /image ~/Desktop/screenshot.png  # ファイルパスで指定
 > (ターミナルに画像をドラッグ&ドロップ)
+```
+
+テキスト用と画像用でモデルを分けたい場合は、起動時に `--vision-model` を指定できます。
+
+```bash
+eve-cli --model qwen3:8b --vision-model gemma3
 ```
 
 ---

@@ -170,6 +170,7 @@
     "description": "EvE CLI — Everyone.Engineer coding agent (Ollama Local + Cloud)",
     "prompt": "One-shot prompt (non-interactive)",
     "model": "Ollama model name",
+    "vision_model": "Vision model for image input turns",
     "ollama_host": "Ollama host URL (for example: http://localhost:11434, https://ollama.com/api)",
     "max_agent_steps": "Max AI internal steps per request (default: {default}, max: {max})",
     "loop": "Loop mode: re-run prompt until --done-string appears",

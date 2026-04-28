@@ -113,7 +113,7 @@ PROFILE=auto
 [profile:online]
 MODEL=deepseek-v4-pro:cloud
 SIDECAR_MODEL=qwen3-coder-next:cloud
-VISION_MODEL=kimi-k2.6:cloud
+VISION_MODEL=gemma4:31b-cloud
 UTILITY_MODEL=qwen3-coder-next:cloud
 COMPACTION_MODEL=qwen3-coder-next:cloud
 SUBAGENT_MODEL=qwen3-coder-next:cloud
@@ -733,7 +733,7 @@ eve-cli --channels discord,slack,webhook
 |------|------|-----|
 | `EVE_CLI_MODEL` | デフォルトモデル | `deepseek-v4-pro:cloud` |
 | `EVE_CLI_SIDECAR_MODEL` | サイドカーモデル | `qwen3-coder-next:cloud` |
-| `EVE_CLI_VISION_MODEL` | 画像入力ターン専用のビジョンモデル | `kimi-k2.6:cloud` |
+| `EVE_CLI_VISION_MODEL` | 画像入力ターン専用のビジョンモデル | `gemma4:31b-cloud` |
 | `EVE_CLI_UTILITY_MODEL` | helper / utility モデル | `qwen3-coder-next:cloud` |
 | `EVE_CLI_COMPACTION_MODEL` | 会話圧縮モデル | `qwen3-coder-next:cloud` |
 | `EVE_CLI_SUBAGENT_MODEL` | サブエージェントモデル | `qwen3-coder-next:cloud` |
@@ -761,7 +761,7 @@ eve-cli --channels discord,slack,webhook
 ```ini
 MODEL=deepseek-v4-pro:cloud
 SIDECAR_MODEL=qwen3-coder-next:cloud
-VISION_MODEL=kimi-k2.6:cloud
+VISION_MODEL=gemma4:31b-cloud
 UTILITY_MODEL=qwen3-coder-next:cloud
 COMPACTION_MODEL=qwen3-coder-next:cloud
 SUBAGENT_MODEL=qwen3-coder-next:cloud
