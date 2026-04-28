@@ -7,7 +7,7 @@ Usage:
     python3 eve-coder.py                        # interactive mode
     python3 eve-coder.py -p "ls -la を実行して"  # one-shot
     python3 eve-coder.py --model qwen3:8b       # local model
-    python3 eve-coder.py --model glm-5.1:cloud  # cloud model via Ollama
+    python3 eve-coder.py --model deepseek-v4-pro:cloud  # cloud model via Ollama
     python3 eve-coder.py -y                     # auto-approve all tools
     python3 eve-coder.py --resume               # resume last session
 """
@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.33.1"
+__version__ = "2.34.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1185,13 +1185,13 @@ class Config:
     """Configuration from CLI args, config file, and environment variables."""
 
     DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-    DEFAULT_MODEL = "glm-5.1:cloud"
-    DEFAULT_SIDECAR = "gemma4:31b-cloud"
+    DEFAULT_MODEL = "deepseek-v4-pro:cloud"
+    DEFAULT_SIDECAR = "qwen3-coder-next:cloud"
     DEFAULT_UTILITY_MODEL = ""
     DEFAULT_COMPACTION_MODEL = ""
-    DEFAULT_SUBAGENT_MODEL = "gemma4:31b-cloud"
+    DEFAULT_SUBAGENT_MODEL = "qwen3-coder-next:cloud"
     DEFAULT_REVIEW_MODEL = ""
-    DEFAULT_VISION_MODEL = "gemma4:31b-cloud"
+    DEFAULT_VISION_MODEL = "kimi-k2.6:cloud"
     DEFAULT_RUBBER_DUCK_CHECKPOINTS = "plan,post-edit"
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
@@ -1943,9 +1943,10 @@ class Config:
         "qwen3:235b": 32768,
         "qwen3.5:397b": 262144,        # Cloud alias, 256K ctx
         "qwen3.5:397b-cloud": 262144,  # Cloud model, 256K ctx
-        "glm-5.1:cloud":     204800,   # Zhipu AI GLM-5.1 Cloud, 200K ctx
-        "gemma4:31b-cloud":  262144,   # Cloud model, 256K ctx
-        "gemma4:31b":        262144,   # 256K ctx
+        "deepseek-v4-pro:cloud":  1000000,  # DeepSeek V4 Pro Cloud, 1M ctx
+        "kimi-k2.6:cloud":         256000,  # Moonshot Kimi K2.6 Cloud, 256K ctx (vision)
+        "qwen3-coder-next:cloud":  256000,  # Qwen3 Coder Next Cloud, 256K ctx
+        "gemma4:31b":              262144,  # 256K ctx
         "qwen3.5:35b-a3b": 262144,     # MoE 35B (3B active), 256K ctx
         "deepseek-coder-v2:236b": 131072,
         # Tier B — Advanced (48GB+ RAM)
@@ -1994,8 +1995,9 @@ class Config:
         # Tier A — Expert: excellent coding + reasoning
         ("qwen3.5:397b",            256, "A"),  # Cloud alias
         ("qwen3.5:397b-cloud",      256, "A"),  # Cloud model
-        ("glm-5.1:cloud",             32, "A"),  # Zhipu AI GLM-5.1 Cloud, 200K ctx
-        ("gemma4:31b-cloud",         32, "A"),  # Cloud model, 31B
+        ("deepseek-v4-pro:cloud",    32, "A"),  # DeepSeek V4 Pro Cloud, 1M ctx
+        ("kimi-k2.6:cloud",          32, "A"),  # Moonshot Kimi K2.6 Cloud, 256K ctx (vision)
+        ("qwen3-coder-next:cloud",   32, "A"),  # Qwen3 Coder Next Cloud, 256K ctx
         ("gemma4:31b",               32, "A"),  # 31B
         ("qwen3.5:35b-a3b",         256, "A"),  # MoE 35B (3B active)
         ("qwen3:235b",              256, "A"),
@@ -15783,7 +15785,7 @@ def _vision_model_candidates(config):
         _resolve_vision_model(config),
         _config_value(config, "sidecar_model", ""),
         _config_value(config, "utility_model", ""),
-        "gemma4:31b-cloud",
+        "kimi-k2.6:cloud",
         "gemma4:31b",
     ]
     ordered = []
@@ -22612,7 +22614,7 @@ def main():
         if not ok:
             sys.exit(1)
 
-    # Cloud models (e.g. glm-5.1:cloud) may not appear in /api/tags from the
+    # Cloud models (e.g. deepseek-v4-pro:cloud) may not appear in /api/tags from the
     # cloud endpoint. Trust the configuration and verify at first request time.
     if _is_cloud_model(config.model) and not config.uses_local_ollama():
         model_ok = True

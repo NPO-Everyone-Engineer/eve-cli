@@ -126,13 +126,13 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | やりたいこと | コマンド |
 |-------------|----------|
 | 普通に使う | `eve-cli` |
-| モデルを指定する | `eve-cli --model glm-5.1:cloud` |
+| モデルを指定する | `eve-cli --model deepseek-v4-pro:cloud` |
 | 前回の続きから始める | `eve-cli --resume` |
 | 1回だけ実行する | `eve-cli -p "テストを書いて実行して"` |
 | 自動テスト付きで使う | `eve-cli --autotest` |
 | Thinking モードで使う | `eve-cli --think` |
-| Rubber Duck を有効にする | `eve-cli --review-model gemma4:31b-cloud --rubber-duck` |
-| Rubber Duck を plan だけで使う | `eve-cli --review-model gemma4:31b-cloud --rubber-duck --rubber-duck-checkpoints plan` |
+| Rubber Duck を有効にする | `eve-cli --review-model qwen3-coder-next:cloud --rubber-duck` |
+| Rubber Duck を plan だけで使う | `eve-cli --review-model qwen3-coder-next:cloud --rubber-duck --rubber-duck-checkpoints plan` |
 | Rubber Duck の blocker だけ採用する | レビュー後に `/accept-review blocking` |
 | 学習モードで使う | `eve-cli --learn --level 4` |
 | CI/CD で実行する | `eve-cli --headless -p "lint修正して" -y --output-format json` |
@@ -154,7 +154,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 
 | 構成 | 条件 | 既定の目安 |
 |------|------|------------|
-| 標準構成 | ネットワーク接続あり | `MODEL=glm-5.1:cloud` + `SIDECAR_MODEL=gemma4:31b-cloud` + `VISION_MODEL=gemma4:31b-cloud` |
+| 標準構成 | ネットワーク接続あり | `MODEL=deepseek-v4-pro:cloud` + `SIDECAR_MODEL=qwen3-coder-next:cloud` + `VISION_MODEL=kimi-k2.6:cloud` |
 | オフライン / ローカル重視 | ローカル Ollama を使う | `--model qwen3:8b` など |
 
 ```bash
@@ -172,15 +172,15 @@ eve-cli --model qwen3:8b
 毎回同じモデルや設定を使いたい場合は、このファイルを編集してください。
 
 ```ini
-MODEL=glm-5.1:cloud
-SIDECAR_MODEL=gemma4:31b-cloud
-VISION_MODEL=gemma4:31b-cloud
-UTILITY_MODEL=gemma4:31b-cloud
-COMPACTION_MODEL=gemma4:31b-cloud
-SUBAGENT_MODEL=glm-5.1:cloud
-REVIEW_MODEL=gemma4:31b-cloud
+MODEL=deepseek-v4-pro:cloud
+SIDECAR_MODEL=qwen3-coder-next:cloud
+VISION_MODEL=kimi-k2.6:cloud
+UTILITY_MODEL=qwen3-coder-next:cloud
+COMPACTION_MODEL=qwen3-coder-next:cloud
+SUBAGENT_MODEL=qwen3-coder-next:cloud
+REVIEW_MODEL=qwen3-coder-next:cloud
 OLLAMA_HOST=https://ollama.com/api
-CONTEXT_WINDOW=202752
+CONTEXT_WINDOW=1000000
 PROFILE=auto
 UI_THEME=normal
 ```
@@ -192,7 +192,7 @@ Ollama Cloud を使う場合は、`OLLAMA_HOST` を `https://ollama.com/api` に
 
 ```bash
 export OLLAMA_API_KEY=your-ollama-api-key
-eve-cli --ollama-host https://ollama.com/api --model glm-5.1:cloud
+eve-cli --ollama-host https://ollama.com/api --model deepseek-v4-pro:cloud
 ```
 
 補足:

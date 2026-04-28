@@ -873,12 +873,12 @@ is_cloud_model() {
 }
 
 set_cloud_role_defaults() {
-    SIDECAR_MODEL="gemma4:31b-cloud"
+    SIDECAR_MODEL="qwen3-coder-next:cloud"
     UTILITY_MODEL="$SIDECAR_MODEL"
     COMPACTION_MODEL="$SIDECAR_MODEL"
     REVIEW_MODEL="$SIDECAR_MODEL"
-    VISION_MODEL="$SIDECAR_MODEL"
-    SUBAGENT_MODEL="$MODEL"
+    VISION_MODEL="kimi-k2.6:cloud"
+    SUBAGENT_MODEL="$SIDECAR_MODEL"
     CONFIG_OLLAMA_HOST="https://ollama.com/api"
 }
 
@@ -899,7 +899,7 @@ if [ -n "$MANUAL_MODEL" ]; then
     fi
     vapor_info "$(msg manual_model): $MODEL"
 else
-    MODEL="glm-5.1:cloud"
+    MODEL="deepseek-v4-pro:cloud"
     set_cloud_role_defaults
     echo -e "  ${NEON_GREEN}┃${NC} ☁️ ${BOLD}${YELLOW}*** CLOUD DEFAULT ***${NC}"
     echo -e "  ${NEON_GREEN}┃${NC}    ${BOLD}${WHITE}$MODEL${NC} ${DIM}(Cloud, agentic coding default)${NC}"

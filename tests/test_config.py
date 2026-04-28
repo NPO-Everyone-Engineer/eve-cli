@@ -36,13 +36,13 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(self.cfg.ollama_host, "http://localhost:11434")
 
     def test_default_model(self):
-        self.assertEqual(self.cfg.model, "glm-5.1:cloud")
+        self.assertEqual(self.cfg.model, "deepseek-v4-pro:cloud")
 
     def test_default_sidecar_model(self):
-        self.assertEqual(self.cfg.sidecar_model, "gemma4:31b-cloud")
+        self.assertEqual(self.cfg.sidecar_model, "qwen3-coder-next:cloud")
 
     def test_default_vision_model(self):
-        self.assertEqual(self.cfg.vision_model, "gemma4:31b-cloud")
+        self.assertEqual(self.cfg.vision_model, "kimi-k2.6:cloud")
 
     def test_default_review_model(self):
         self.assertEqual(self.cfg.review_model, "")
@@ -246,8 +246,8 @@ class TestParseConfigFile(unittest.TestCase):
             UTILITY_MODEL = qwen3:8b
             COMPACTION_MODEL = gemma4:31b
             SUBAGENT_MODEL = qwen3.5:32b
-            REVIEW_MODEL = gemma4:31b-cloud
-            VISION_MODEL = gemma4:27b-cloud
+            REVIEW_MODEL = qwen3-coder-next:cloud
+            VISION_MODEL = kimi-k2.6:cloud
             RUBBER_DUCK = true
             RUBBER_DUCK_CHECKPOINTS = plan
         """)
@@ -256,8 +256,8 @@ class TestParseConfigFile(unittest.TestCase):
             self.assertEqual(self.cfg.utility_model, "qwen3:8b")
             self.assertEqual(self.cfg.compaction_model, "gemma4:31b")
             self.assertEqual(self.cfg.subagent_model, "qwen3.5:32b")
-            self.assertEqual(self.cfg.review_model, "gemma4:31b-cloud")
-            self.assertEqual(self.cfg.vision_model, "gemma4:27b-cloud")
+            self.assertEqual(self.cfg.review_model, "qwen3-coder-next:cloud")
+            self.assertEqual(self.cfg.vision_model, "kimi-k2.6:cloud")
             self.assertTrue(self.cfg.rubber_duck)
             self.assertEqual(self.cfg.rubber_duck_checkpoints, "plan")
         finally:
@@ -957,7 +957,7 @@ class TestOllamaHostValidation(unittest.TestCase):
         self.assertEqual(self.cfg.vision_model, "")
 
     def test_invalid_vision_model_name_resets_to_default(self):
-        self.cfg.vision_model = "gemma4:31b-cloud;rm -rf /"
+        self.cfg.vision_model = "kimi-k2.6:cloud;rm -rf /"
         with patch("builtins.print"):
             self.cfg._validate_ollama_host()
         self.assertEqual(self.cfg.vision_model, Config.DEFAULT_VISION_MODEL)
@@ -987,12 +987,12 @@ class TestOllamaClientHeaders(unittest.TestCase):
         cfg.ollama_api_key = "secret-token"
 
         fake_resp = MagicMock()
-        fake_resp.read.return_value = b'{"models":[{"name":"glm-5.1:cloud"}]}'
+        fake_resp.read.return_value = b'{"models":[{"name":"deepseek-v4-pro:cloud"}]}'
 
         with patch("urllib.request.urlopen", return_value=fake_resp) as mock_urlopen:
             models = cfg._query_installed_models()
 
-        self.assertEqual(models, ["glm-5.1:cloud"])
+        self.assertEqual(models, ["deepseek-v4-pro:cloud"])
         req = mock_urlopen.call_args[0][0]
         self.assertEqual(req.get_header("Authorization"), "Bearer secret-token")
 
@@ -1009,10 +1009,10 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
         self.assertTrue(eve_coder._is_cloud_model("qwen3.5:397b"))
         self.assertTrue(eve_coder._is_cloud_model("qwen3.5:397b-cloud"))
 
-    def test_glm5_cloud_uses_explicit_context_window(self):
+    def test_deepseek_v4_pro_cloud_uses_explicit_context_window(self):
         cfg = Config()
-        cfg._apply_context_window("glm-5.1:cloud")
-        self.assertEqual(cfg.context_window, 204800)
+        cfg._apply_context_window("deepseek-v4-pro:cloud")
+        self.assertEqual(cfg.context_window, 1000000)
 
     def test_gemma_defaults_to_google_temperature(self):
         cfg = Config()
@@ -1387,15 +1387,15 @@ class TestModelRoleResolution(unittest.TestCase):
     def test_compaction_model_prefers_explicit_override(self):
         cfg = Config()
         cfg.sidecar_model = "gemma4:31b"
-        cfg.compaction_model = "gemma4:31b-cloud"
-        self.assertEqual(eve_coder._resolve_compaction_model(cfg), "gemma4:31b-cloud")
+        cfg.compaction_model = "qwen3-coder-next:cloud"
+        self.assertEqual(eve_coder._resolve_compaction_model(cfg), "qwen3-coder-next:cloud")
 
     def test_subagent_model_prefers_specific_then_primary_model(self):
         cfg = Config()
-        cfg.model = "glm-5.1:cloud"
+        cfg.model = "deepseek-v4-pro:cloud"
         cfg.sidecar_model = "gemma4:31b"
         cfg.utility_model = "qwen3:8b"
-        self.assertEqual(eve_coder._resolve_subagent_model(cfg), "gemma4:31b-cloud")
+        self.assertEqual(eve_coder._resolve_subagent_model(cfg), "qwen3-coder-next:cloud")
         cfg.subagent_model = "qwen3.5:32b"
         self.assertEqual(eve_coder._resolve_subagent_model(cfg), "qwen3.5:32b")
 
@@ -1404,26 +1404,26 @@ class TestModelRoleResolution(unittest.TestCase):
         cfg.sidecar_model = "gemma4:31b"
         cfg.utility_model = "qwen3:8b"
         self.assertEqual(eve_coder._resolve_review_model(cfg), "qwen3:8b")
-        cfg.review_model = "gemma4:31b-cloud"
-        self.assertEqual(eve_coder._resolve_review_model(cfg), "gemma4:31b-cloud")
+        cfg.review_model = "qwen3-coder-next:cloud"
+        self.assertEqual(eve_coder._resolve_review_model(cfg), "qwen3-coder-next:cloud")
 
     def test_vision_model_prefers_explicit_override(self):
         cfg = Config()
         cfg.sidecar_model = "gemma4:31b"
-        self.assertEqual(eve_coder._resolve_vision_model(cfg), "gemma4:31b-cloud")
+        self.assertEqual(eve_coder._resolve_vision_model(cfg), "kimi-k2.6:cloud")
         cfg.vision_model = "gemma4:27b-cloud"
         self.assertEqual(eve_coder._resolve_vision_model(cfg), "gemma4:27b-cloud")
 
-    def test_pick_vision_route_model_uses_gemma_helper_for_non_vision_primary(self):
+    def test_pick_vision_route_model_falls_back_to_vision_capable_candidate(self):
         cfg = Config()
-        cfg.model = "glm-5.1:cloud"
-        cfg.sidecar_model = "glm-5.1:cloud"
+        cfg.model = "deepseek-v4-pro:cloud"
+        cfg.sidecar_model = "deepseek-v4-pro:cloud"
         client = MagicMock()
         client.check_vision_support.side_effect = lambda model, assume_if_unknown=True: {
-            "glm-5.1:cloud": False,
-            "gemma4:31b-cloud": True,
+            "deepseek-v4-pro:cloud": False,
+            "kimi-k2.6:cloud": True,
         }.get(model, False if not assume_if_unknown else True)
-        self.assertEqual(eve_coder._pick_vision_route_model(cfg, client), "gemma4:31b-cloud")
+        self.assertEqual(eve_coder._pick_vision_route_model(cfg, client), "kimi-k2.6:cloud")
 
 
 if __name__ == "__main__":

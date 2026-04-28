@@ -34,7 +34,7 @@ def _make_config(tmpdir, session_id=None, context_window=32768):
         session_id=session_id,
         sessions_dir=sessions_dir,
         cwd=tmpdir,
-        model="glm-5.1:cloud",
+        model="deepseek-v4-pro:cloud",
         sidecar_model="",
     )
 
@@ -618,7 +618,7 @@ class TestSessionRuntimeState(unittest.TestCase):
     def test_save_sanitizes_image_history_for_non_vision_primary(self):
         cfg = _make_config(self.tmpdir, session_id="vision_save")
         sess = Session(cfg, "prompt")
-        sess.set_client(_FakeVisionClient({"glm-5.1:cloud": False}))
+        sess.set_client(_FakeVisionClient({"deepseek-v4-pro:cloud": False}))
         sess.add_multimodal_user_message([
             {"type": "text", "text": "What is in this image?"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},

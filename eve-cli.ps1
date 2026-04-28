@@ -8,7 +8,7 @@
 #   .\eve-cli.ps1                      # インタラクティブモード
 #   .\eve-cli.ps1 -p "質問"            # ワンショット
 #   .\eve-cli.ps1 --auto               # ネットワーク状況で自動判定
-#   .\eve-cli.ps1 --model glm-5.1:cloud  # モデル手動指定
+#   .\eve-cli.ps1 --model deepseek-v4-pro:cloud  # モデル手動指定
 #   .\eve-cli.ps1 -y                   # パーミッション確認スキップ (自己責任)
 #   .\eve-cli.ps1 --debug              # デバッグモード
 

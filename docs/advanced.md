@@ -106,13 +106,13 @@ EvE CLI のカスタマイズや高度な設定について解説します。
 PROFILE=auto
 
 [profile:online]
-MODEL=glm-5.1:cloud
-SIDECAR_MODEL=gemma4:31b-cloud
-VISION_MODEL=gemma4:31b-cloud
-UTILITY_MODEL=gemma4:31b-cloud
-COMPACTION_MODEL=gemma4:31b-cloud
-SUBAGENT_MODEL=glm-5.1:cloud
-REVIEW_MODEL=gemma4:31b-cloud
+MODEL=deepseek-v4-pro:cloud
+SIDECAR_MODEL=qwen3-coder-next:cloud
+VISION_MODEL=kimi-k2.6:cloud
+UTILITY_MODEL=qwen3-coder-next:cloud
+COMPACTION_MODEL=qwen3-coder-next:cloud
+SUBAGENT_MODEL=qwen3-coder-next:cloud
+REVIEW_MODEL=qwen3-coder-next:cloud
 OLLAMA_HOST=https://ollama.com/api
 PLAN_MODE_REASONING_EFFORT=high
 
@@ -661,13 +661,13 @@ eve-cli --channels discord,slack,webhook
 
 | 変数 | 説明 | 例 |
 |------|------|-----|
-| `EVE_CLI_MODEL` | デフォルトモデル | `glm-5.1:cloud` |
-| `EVE_CLI_SIDECAR_MODEL` | サイドカーモデル | `gemma4:31b-cloud` |
-| `EVE_CLI_VISION_MODEL` | 画像入力ターン専用のビジョンモデル | `gemma4:31b-cloud` |
-| `EVE_CLI_UTILITY_MODEL` | helper / utility モデル | `gemma4:31b-cloud` |
-| `EVE_CLI_COMPACTION_MODEL` | 会話圧縮モデル | `gemma4:31b-cloud` |
-| `EVE_CLI_SUBAGENT_MODEL` | サブエージェントモデル | `glm-5.1:cloud` |
-| `EVE_CLI_REVIEW_MODEL` | Rubber Duck / review モデル | `gemma4:31b-cloud` |
+| `EVE_CLI_MODEL` | デフォルトモデル | `deepseek-v4-pro:cloud` |
+| `EVE_CLI_SIDECAR_MODEL` | サイドカーモデル | `qwen3-coder-next:cloud` |
+| `EVE_CLI_VISION_MODEL` | 画像入力ターン専用のビジョンモデル | `kimi-k2.6:cloud` |
+| `EVE_CLI_UTILITY_MODEL` | helper / utility モデル | `qwen3-coder-next:cloud` |
+| `EVE_CLI_COMPACTION_MODEL` | 会話圧縮モデル | `qwen3-coder-next:cloud` |
+| `EVE_CLI_SUBAGENT_MODEL` | サブエージェントモデル | `qwen3-coder-next:cloud` |
+| `EVE_CLI_REVIEW_MODEL` | Rubber Duck / review モデル | `qwen3-coder-next:cloud` |
 | `EVE_CLI_PROFILE` | 接続プロファイル | `auto` |
 | `EVE_CLI_DEBUG` | デバッグモード | `1` |
 | `EVE_CLI_MAX_AGENT_STEPS` | AI ステップ上限 | `80` |
@@ -689,15 +689,15 @@ eve-cli --channels discord,slack,webhook
 ### 設定ファイル（~/.config/eve-cli/config）
 
 ```ini
-MODEL=glm-5.1:cloud
-SIDECAR_MODEL=gemma4:31b-cloud
-VISION_MODEL=gemma4:31b-cloud
-UTILITY_MODEL=gemma4:31b-cloud
-COMPACTION_MODEL=gemma4:31b-cloud
-SUBAGENT_MODEL=glm-5.1:cloud
-REVIEW_MODEL=gemma4:31b-cloud
+MODEL=deepseek-v4-pro:cloud
+SIDECAR_MODEL=qwen3-coder-next:cloud
+VISION_MODEL=kimi-k2.6:cloud
+UTILITY_MODEL=qwen3-coder-next:cloud
+COMPACTION_MODEL=qwen3-coder-next:cloud
+SUBAGENT_MODEL=qwen3-coder-next:cloud
+REVIEW_MODEL=qwen3-coder-next:cloud
 OLLAMA_HOST=https://ollama.com/api
-CONTEXT_WINDOW=202752
+CONTEXT_WINDOW=1000000
 MAX_TOKENS=4096
 TEMPERATURE=0.25
 SUBAGENT_DEFAULT_MAX_TURNS=15
@@ -716,7 +716,7 @@ Ollama Cloud を使う場合の例：
 
 ```bash
 export OLLAMA_API_KEY=your-ollama-api-key
-eve-cli --ollama-host https://ollama.com/api --model glm-5.1:cloud
+eve-cli --ollama-host https://ollama.com/api --model deepseek-v4-pro:cloud
 ```
 
 補足:
