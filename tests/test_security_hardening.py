@@ -197,6 +197,37 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertNotIn('"name":"Bash"', prompt)
         self.assertIn("[BLOCKED]", prompt)
 
+    @patch("sys.stdin.isatty", return_value=False)
+    def test_global_agents_md_loads_alongside_claude_md(self, _mock_isatty):
+        config = self.make_config()
+        Path(self.config_dir, "CLAUDE.md").write_text(
+            "CLAUDE_GLOBAL_RULE_MARKER", encoding="utf-8",
+        )
+        Path(self.config_dir, "AGENTS.md").write_text(
+            "AGENTS_GLOBAL_RULE_MARKER", encoding="utf-8",
+        )
+
+        prompt = eve_coder._build_system_prompt(config)
+
+        self.assertIn("CLAUDE_GLOBAL_RULE_MARKER", prompt)
+        self.assertIn("AGENTS_GLOBAL_RULE_MARKER", prompt)
+        self.assertIn("# Global Instructions (AGENTS.md)", prompt)
+
+    def test_trusted_project_agents_md_is_loaded(self):
+        config = self.make_config()
+        agents_path = Path(self.project_dir, "AGENTS.md")
+        agents_path.write_text("PROJECT_AGENTS_MD_MARKER", encoding="utf-8")
+        eve_coder._remember_repo_scope_trust(
+            config,
+            "instructions",
+            eve_coder._compute_repo_hashes(config, [str(agents_path)]),
+        )
+
+        prompt = eve_coder._build_system_prompt(config)
+
+        self.assertIn("PROJECT_AGENTS_MD_MARKER", prompt)
+        self.assertIn("AGENTS.md", prompt)
+
     def test_system_prompt_uses_preflight_framework(self):
         config = self.make_config()
 

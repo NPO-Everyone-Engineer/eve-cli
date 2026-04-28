@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.34.0"
+__version__ = "2.35.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -4343,24 +4343,29 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
         truncated = file_size > max_bytes
         return content, truncated
 
-    # 1. Global instructions (~/.config/eve-cli/CLAUDE.md)
-    global_md = os.path.join(config.config_dir, "CLAUDE.md")
-    if os.path.isfile(global_md) and not os.path.islink(global_md):
-        try:
-            content, truncated = _load_instructions(global_md)
-            trunc_note = "\n[Note: file truncated, only first 4000 bytes loaded]" if truncated else ""
-            prompt_budget.add_optional_section("Global Instructions", _sanitize_instructions(content) + trunc_note)
-        except Exception:
-            pass
+    # 1. Global instructions (~/.config/eve-cli/CLAUDE.md, AGENTS.md)
+    for _global_name, _global_label in (("CLAUDE.md", "Global Instructions"),
+                                        ("AGENTS.md", "Global Instructions (AGENTS.md)")):
+        _global_path = os.path.join(config.config_dir, _global_name)
+        if os.path.isfile(_global_path) and not os.path.islink(_global_path):
+            try:
+                content, truncated = _load_instructions(_global_path)
+                trunc_note = "\n[Note: file truncated, only first 4000 bytes loaded]" if truncated else ""
+                prompt_budget.add_optional_section(_global_label, _sanitize_instructions(content) + trunc_note)
+            except Exception:
+                pass
 
-    # 2. Parent directory hierarchy → cwd (Claude Code compatible)
-    # Each level: .eve-cli/CLAUDE.md, CLAUDE.md, .eve-coder.json, CLAUDE.local.md
+    # 2. Parent directory hierarchy → cwd (Claude Code / Cursor / Copilot compatible)
+    # Each level scans for: .eve-cli/CLAUDE.md, CLAUDE.md, AGENTS.md,
+    #                       .eve-coder.json, CLAUDE.local.md, AGENTS.local.md
     # All matching files at each level are loaded (merged), total capped at 8000 bytes.
     _INST_PATTERNS = [
         (os.path.join(".eve-cli", "CLAUDE.md"), ".eve-cli/CLAUDE.md"),
         ("CLAUDE.md", "CLAUDE.md"),
+        ("AGENTS.md", "AGENTS.md"),
         (".eve-coder.json", ".eve-coder.json"),
         ("CLAUDE.local.md", "CLAUDE.local.md"),
+        ("AGENTS.local.md", "AGENTS.local.md"),
     ]
     instruction_files = []
     search_dir = cwd
@@ -4414,9 +4419,9 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
             print(f"{C.YELLOW}{t('warnings.file_read_failed', default=f'Warning: Could not read {fname}: {e}')}{C.RESET}",
                   file=sys.stderr)
 
-    # CLAUDE.md 200-line warning
+    # CLAUDE.md / AGENTS.md 200-line warning
     for _, fname, fpath in instruction_items_to_load:
-        if fname in ("CLAUDE.md", ".eve-cli/CLAUDE.md"):
+        if fname in ("CLAUDE.md", ".eve-cli/CLAUDE.md", "AGENTS.md"):
             try:
                 with open(fpath, encoding="utf-8", errors="replace") as _clf:
                     _cl_lines = sum(1 for _ in _clf)

@@ -56,10 +56,15 @@ EvE CLI のカスタマイズや高度な設定について解説します。
 | ファイル | 用途 | Git 管理 |
 |---------|------|---------|
 | `~/.config/eve-cli/CLAUDE.md` | グローバル（全プロジェクト共通） | ― |
+| `~/.config/eve-cli/AGENTS.md` | グローバル（AGENTS.md 形式、Cursor/Copilot 互換） | ― |
 | `.eve-cli/CLAUDE.md` | チーム共有設定 | する |
 | `CLAUDE.md` | プロジェクトルート | する |
+| `AGENTS.md` | プロジェクトルート（Cursor/Copilot/Claude Code 互換） | する |
 | `CLAUDE.local.md` | 個人設定（自分だけ） | しない |
+| `AGENTS.local.md` | 個人設定（AGENTS.md 形式） | しない |
 | `.eve-coder.json` | 旧形式（後方互換） | する |
+
+> **AGENTS.md について**: Cursor / GitHub Copilot CLI / Claude Code などのエコシステムで標準化されつつあるプロジェクト指示ファイルです。EvE CLI は CLAUDE.md と AGENTS.md の両方を読み込みます（両方ある場合はマージされます）。他のツールと設定を共有したい場合に便利です。
 
 ### 自動生成
 
@@ -90,7 +95,7 @@ EvE CLI のカスタマイズや高度な設定について解説します。
 
 ### セキュリティ
 
-プロジェクト内の設定ファイル（`CLAUDE.md` / `.eve-cli/CLAUDE.md` / `.eve-coder.json`）は、初回に信頼確認が必要です。ファイル内容が変わると再確認されます。
+プロジェクト内の設定ファイル（`CLAUDE.md` / `AGENTS.md` / `.eve-cli/CLAUDE.md` / `.eve-coder.json`）は、初回に信頼確認が必要です。ファイル内容が変わると再確認されます。
 
 ---
 
@@ -742,6 +747,7 @@ eve-cli --ollama-host https://ollama.com/api --model deepseek-v4-pro:cloud
 | `~/.config/eve-cli/hooks.json` | グローバルフック |
 | `~/.config/eve-cli/mcp.json` | MCP サーバー設定 |
 | `~/.config/eve-cli/CLAUDE.md` | グローバルプロジェクト指示 |
+| `~/.config/eve-cli/AGENTS.md` | グローバルプロジェクト指示（AGENTS.md 形式、他ツール互換） |
 | `~/.config/eve-cli/skills/*.md` | カスタムスキル |
 | `~/.config/eve-cli/trusted_repos.json` | 信頼済みリポジトリ |
 | `~/.config/eve-cli/trusted_hooks.json` | 信頼済みフック |
