@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.37.0"
+__version__ = "2.38.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -12920,6 +12920,362 @@ class AgentTeam:
         return "\n".join(output_parts)
 
 
+class FleetOrchestrator:
+    """Dependency-aware orchestrator with task graph + final synthesis.
+
+    Differences from AgentTeam:
+    - Decomposition asks the LLM for explicit `blockedBy` dependencies
+      (1-indexed references into the same task array)
+    - Workers respect `blockedBy` (topological dispatch)
+    - After all tasks complete, a synthesis step produces a unified answer
+      that addresses the original goal end-to-end
+    """
+
+    MAX_DURATION = 600  # 10 min hard cap (mirrors AgentTeam)
+    DEFAULT_NUM_TEAMMATES = 3
+
+    def __init__(self, config, client, registry, permissions):
+        self._config = config
+        self._client = client
+        self._registry = registry
+        self._permissions = permissions
+        self._stop_event = threading.Event()
+        self._results = {}
+        self.MAX_TEAMMATES = _get_team_max_agents()
+
+    @staticmethod
+    def _parse_decompose_response(content):
+        """Extract a list of {subject, description, blockedBy} dicts from LLM output.
+
+        Accepts JSON array directly or embedded inside text. Coerces blockedBy
+        entries to a list of ints. Returns [] on any parse failure so callers
+        can decide how to fall back.
+        """
+        if not content:
+            return []
+        text = content.strip()
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if match:
+            text = match.group()
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        cleaned = []
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            subject = str(entry.get("subject") or "").strip()
+            if not subject:
+                continue
+            description = str(entry.get("description") or subject).strip()
+            blocked_by_raw = entry.get("blockedBy") or entry.get("blocked_by") or []
+            blocked_by = []
+            if isinstance(blocked_by_raw, list):
+                for b in blocked_by_raw:
+                    try:
+                        blocked_by.append(int(b))
+                    except (TypeError, ValueError):
+                        continue
+            cleaned.append({
+                "subject": subject[:200],
+                "description": description[:1000],
+                "blockedBy": blocked_by,
+            })
+        return cleaned
+
+    @staticmethod
+    def _translate_blockedby_indices(tasks_data, task_ids):
+        """Translate 1-indexed blockedBy entries into actual task store IDs.
+
+        tasks_data: list returned by _parse_decompose_response (may contain
+                    indices that reference *intended* positions, including
+                    entries that were dropped by the caller)
+        task_ids:   list of registered task IDs in the same order as
+                    tasks_data (i.e. tasks_data[i] -> task_ids[i])
+
+        Returns a list parallel to task_ids of {id, blockedBy_ids}.
+        Out-of-range or self-referential indices are silently dropped.
+        """
+        out = []
+        n = len(task_ids)
+        for i, td in enumerate(tasks_data[:n]):
+            tid = task_ids[i]
+            ids = []
+            for raw_idx in td.get("blockedBy", []):
+                try:
+                    idx0 = int(raw_idx) - 1  # 1-indexed → 0-indexed
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx0 < n and idx0 != i:
+                    ids.append(task_ids[idx0])
+            out.append({"id": tid, "blockedBy_ids": ids})
+        return out
+
+    def _decompose(self, goal, num_teammates):
+        """Use the main model to break the goal into a dependency-aware task list."""
+        prompt = (
+            f"Decompose this goal into {num_teammates}-{num_teammates + 3} concrete sub-tasks "
+            f"that can be executed by parallel agents. Output ONLY a JSON array.\n\n"
+            f"Each task object has:\n"
+            f'  - "subject": short imperative title\n'
+            f'  - "description": what the agent should do (1-3 sentences)\n'
+            f'  - "blockedBy": array of 1-indexed task numbers that must finish first '
+            f'(empty array if independent)\n\n'
+            f"Example:\n"
+            f'[{{"subject": "Read main.py", "description": "Inspect main.py for the entry point.", "blockedBy": []}},\n'
+            f' {{"subject": "Write tests", "description": "Add pytest cases for entry point.", "blockedBy": [1]}}]\n\n'
+            f"Goal: {goal}"
+        )
+        try:
+            resp = self._client.chat_sync(
+                model=self._config.model,
+                messages=[
+                    {"role": "system", "content": "Output only valid JSON. No prose."},
+                    {"role": "user", "content": prompt},
+                ],
+                tools=None,
+            )
+        except Exception as e:
+            return [], f"decompose request failed: {e}"
+        content = resp.get("content", "") if isinstance(resp, dict) else ""
+        cleaned = self._parse_decompose_response(content)
+        if not cleaned:
+            return [], "decompose response could not be parsed as a task array"
+        return cleaned[:8], None  # cap at 8 tasks
+
+    def _register_tasks(self, tasks_data):
+        """Insert tasks into _task_store and wire up blockedBy with real task IDs."""
+        task_ids = []
+        with _task_store_lock:
+            for td in tasks_data:
+                tid = str(_task_store["next_id"])
+                _task_store["next_id"] += 1
+                _task_store["tasks"][tid] = {
+                    "id": tid,
+                    "subject": td["subject"],
+                    "description": td["description"],
+                    "activeForm": f"Working on: {td['subject']}",
+                    "status": "pending",
+                    "blocks": [],
+                    "blockedBy": [],
+                }
+                task_ids.append(tid)
+            # Resolve blockedBy indices to IDs
+            translations = self._translate_blockedby_indices(tasks_data, task_ids)
+            for tr in translations:
+                tid = tr["id"]
+                blocked_ids = tr["blockedBy_ids"]
+                _task_store["tasks"][tid]["blockedBy"] = list(blocked_ids)
+                # Maintain reverse pointers
+                for bid in blocked_ids:
+                    if bid in _task_store["tasks"]:
+                        _task_store["tasks"][bid].setdefault("blocks", []).append(tid)
+            snapshot = _snapshot_task_store_locked()
+        _persist_task_store(snapshot)
+        return task_ids
+
+    def _dispatch_teammates(self, task_ids, num_teammates, allow_writes):
+        """Spin up worker threads that respect blockedBy (topological dispatch)."""
+        self._stop_event.clear()
+        self._results.clear()
+
+        def _worker(name):
+            while not self._stop_event.is_set():
+                task_to_work = None
+                with _task_store_lock:
+                    for tid in task_ids:
+                        t = _task_store["tasks"].get(tid)
+                        if not t or t["status"] != "pending":
+                            continue
+                        open_blockers = [
+                            b for b in t.get("blockedBy", [])
+                            if b in _task_store["tasks"]
+                            and _task_store["tasks"][b]["status"] != "completed"
+                        ]
+                        if open_blockers:
+                            continue
+                        t["status"] = "in_progress"
+                        task_to_work = dict(t)
+                        snapshot = _snapshot_task_store_locked()
+                        break
+                    else:
+                        snapshot = None
+                if snapshot is not None:
+                    _persist_task_store(snapshot)
+
+                if not task_to_work:
+                    with _task_store_lock:
+                        all_done = all(
+                            _task_store["tasks"].get(tid, {}).get("status") in ("completed", "deleted")
+                            for tid in task_ids
+                        )
+                    if all_done:
+                        return
+                    time.sleep(1)
+                    continue
+
+                _tid = task_to_work["id"]
+                with _print_lock:
+                    _scroll_aware_print(
+                        f"  {_ansi(chr(27)+'[38;5;141m')}[{name}] "
+                        f"Starting task #{_tid}: {task_to_work['subject'][:60]}{C.RESET}")
+
+                sub = SubAgentTool(self._config, self._client, self._registry, self._permissions)
+                result = sub.execute({
+                    "prompt": (
+                        f"Complete this task:\n"
+                        f"Subject: {task_to_work['subject']}\n"
+                        f"Description: {task_to_work['description']}\n\n"
+                        f"Working directory: {self._config.cwd}"
+                    ),
+                    "max_turns": 15,
+                    "allow_writes": allow_writes,
+                    "_agent_label": name,
+                    "_structured_result": True,
+                })
+                ok = bool(isinstance(result, dict) and result.get("ok", False))
+                with _task_store_lock:
+                    t = _task_store["tasks"].get(_tid)
+                    if t:
+                        t["status"] = "completed" if ok else "pending"
+                    snapshot = _snapshot_task_store_locked()
+                _persist_task_store(snapshot)
+                self._results[f"{name}:#{_tid}"] = result
+                with _print_lock:
+                    _scroll_aware_print(
+                        f"  {_ansi(chr(27)+'[38;5;46m')}[{name}] "
+                        f"{'Completed' if ok else 'Needs retry'} task #{_tid}{C.RESET}")
+
+        threads = [
+            threading.Thread(target=_worker, args=(f"Agent-{i+1}",), daemon=True)
+            for i in range(num_teammates)
+        ]
+        for t in threads:
+            t.start()
+        team_start = time.time()
+        while time.time() - team_start < self.MAX_DURATION:
+            alive = [t for t in threads if t.is_alive()]
+            if not alive:
+                break
+            time.sleep(2)
+            with _task_store_lock:
+                completed = sum(
+                    1 for tid in task_ids
+                    if _task_store["tasks"].get(tid, {}).get("status") == "completed"
+                )
+            elapsed = time.time() - team_start
+            if int(elapsed) % 10 == 0 and int(elapsed) > 0:
+                with _print_lock:
+                    _scroll_aware_print(
+                        f"  {C.DIM}Fleet progress: {completed}/{len(task_ids)} tasks, "
+                        f"{elapsed:.0f}s elapsed{C.RESET}")
+        self._stop_event.set()
+        for t in threads:
+            t.join(timeout=5)
+
+    def _synthesize(self, goal, task_ids):
+        """Run a final synthesis pass that combines all per-task results into a unified answer."""
+        sections = [f"Goal: {goal}", "", "Sub-task results:"]
+        with _task_store_lock:
+            for tid in task_ids:
+                t = _task_store["tasks"].get(tid, {})
+                subject = t.get("subject", "?")
+                status = t.get("status", "?")
+                sections.append(f"- Task #{tid} ({status}): {subject}")
+        for key, result in self._results.items():
+            if isinstance(result, dict):
+                summary = result.get("summary") or result.get("result") or ""
+                if result.get("error"):
+                    sections.append(f"\n[{key}] FAILED: {result['error']}")
+                    continue
+            else:
+                summary = str(result)
+            summary = summary.strip()
+            if not summary:
+                continue
+            if len(summary) > 1500:
+                summary = summary[:1500] + "...(truncated)"
+            sections.append(f"\n[{key}]\n{summary}")
+        synth_prompt = (
+            "You are the fleet orchestrator. Combine the sub-task results below "
+            "into a single coherent response that addresses the original goal. "
+            "Resolve conflicts, deduplicate findings, and present actionable conclusions. "
+            "Reply in the user's language. Do not invent results that were not produced by sub-tasks.\n\n"
+            + "\n".join(sections)
+        )
+        try:
+            resp = self._client.chat_sync(
+                model=self._config.model,
+                messages=[
+                    {"role": "system", "content": "You synthesize multiple agent reports into one clear answer."},
+                    {"role": "user", "content": synth_prompt},
+                ],
+                tools=None,
+            )
+        except Exception as e:
+            return f"(synthesis failed: {e})"
+        if isinstance(resp, dict):
+            return (resp.get("content") or "").strip()
+        return ""
+
+    @staticmethod
+    def _format_output(goal, task_ids, results, synthesis, total_seconds):
+        """Render the final fleet report."""
+        lines = [f"Fleet Results — {len(task_ids)} tasks, {total_seconds:.1f}s\n"]
+        with _task_store_lock:
+            for tid in task_ids:
+                t = _task_store["tasks"].get(tid, {})
+                icon = "[done]" if t.get("status") == "completed" else "[open]"
+                blocked = t.get("blockedBy", [])
+                deps = f" (after {','.join('#' + b for b in blocked)})" if blocked else ""
+                lines.append(f"{icon} Task #{tid}: {t.get('subject', '?')}{deps} [{t.get('status', '?')}]")
+        if synthesis:
+            lines.append("")
+            lines.append("── Synthesis ────────────────────────────────")
+            lines.append(synthesis)
+            lines.append("─────────────────────────────────────────────")
+        else:
+            lines.append("")
+            lines.append("(synthesis skipped — see per-task output below)")
+            for key, result in results.items():
+                lines.append(f"\n[{key}]")
+                if isinstance(result, dict):
+                    body = result.get("summary") or result.get("result") or result.get("error", "")
+                else:
+                    body = str(result)
+                if len(body) > 1500:
+                    body = body[:1500] + "...(truncated)"
+                lines.append(body)
+        return "\n".join(lines)
+
+    def run(self, goal, num_teammates=None, allow_writes=False, skip_synthesis=False):
+        """End-to-end fleet run: decompose → topo dispatch → synthesize."""
+        num_teammates = max(1, min(num_teammates or self.DEFAULT_NUM_TEAMMATES, self.MAX_TEAMMATES))
+        with _print_lock:
+            _scroll_aware_print(
+                f"\n  {_ansi(chr(27)+'[38;5;198m')}Fleet Mode: {num_teammates} agents{C.RESET}")
+            _scroll_aware_print(
+                f"  {C.DIM}Goal: {goal[:100]}{'...' if len(goal) > 100 else ''}{C.RESET}")
+        tasks_data, err = self._decompose(goal, num_teammates)
+        if not tasks_data:
+            return f"Failed to decompose goal: {err or 'unknown error'}"
+        task_ids = self._register_tasks(tasks_data)
+        if not task_ids:
+            return "No tasks created from goal decomposition."
+        with _print_lock:
+            _scroll_aware_print(
+                f"  {C.DIM}Created {len(task_ids)} tasks: "
+                f"{', '.join(f'#{t}' for t in task_ids)}{C.RESET}")
+        team_start = time.time()
+        self._dispatch_teammates(task_ids, num_teammates, allow_writes)
+        total = time.time() - team_start
+        synthesis = "" if skip_synthesis else self._synthesize(goal, task_ids)
+        return self._format_output(goal, task_ids, self._results, synthesis, total)
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # Channels — external message ingestion (webhook / Discord / Slack)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -18868,7 +19224,7 @@ class TUI:
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/gentest", "/watch", "/skills",
                     "/browser", "/fork", "/index", "/pr", "/gh",
-                    "/team", "/memory", "/custom", "/cmd",
+                    "/team", "/fleet", "/memory", "/custom", "/cmd",
                     "/jobs", "/errors",
                 ]
                 def _completer(text, state):
@@ -20448,6 +20804,7 @@ class TUI:
   {_c198}/errors{C.RESET}            Aggregated error summary from failed jobs
   {_c51}━━ Teams {sep[8:]}{C.RESET}
   {_c198}/team{C.RESET} <goal>       Launch agent team to work on goal collaboratively
+  {_c198}/fleet{C.RESET} <goal>      Decompose goal w/ deps, run in parallel, synthesize unified answer
   {_c51}━━ Channels {sep[11:]}{C.RESET}
   {_c198}/discord:configure{C.RESET} Setup Discord bot connection
   {_c198}/discord:pair{C.RESET} <code> Pair a Discord user
@@ -25595,6 +25952,67 @@ Review this code for:
                     _scroll_aware_print()
                     continue
 
+                elif cmd == "/fleet":
+                    parts = user_input.split(None, 1)
+                    fleet_args = parts[1].strip() if len(parts) > 1 else ""
+
+                    if not fleet_args:
+                        max_agents = _get_team_max_agents()
+                        print(f"  {C.CYAN}Usage: /fleet <goal>{C.RESET}")
+                        print(f"  {C.DIM}Decomposes a goal into a dependency graph and runs agents in parallel,{C.RESET}")
+                        print(f"  {C.DIM}then synthesizes a unified answer at the end.{C.RESET}")
+                        print(f"  {C.DIM}Options: /fleet -n <N> <goal>     (number of agents, default 3, max {max_agents}){C.RESET}")
+                        print(f"  {C.DIM}         /fleet -w <goal>          (allow write operations){C.RESET}")
+                        print(f"  {C.DIM}         /fleet --no-synth <goal>  (skip final synthesis pass){C.RESET}")
+                        continue
+
+                    # Parse options
+                    _fleet_n = None
+                    _fleet_writes = False
+                    _fleet_skip_synth = False
+                    _fleet_parts = fleet_args.split()
+                    _fleet_goal_start = 0
+                    i = 0
+                    while i < len(_fleet_parts):
+                        if _fleet_parts[i] == "-n" and i + 1 < len(_fleet_parts):
+                            try:
+                                _fleet_n = int(_fleet_parts[i + 1])
+                            except ValueError:
+                                pass
+                            i += 2
+                            _fleet_goal_start = i
+                        elif _fleet_parts[i] == "-w":
+                            _fleet_writes = True
+                            i += 1
+                            _fleet_goal_start = i
+                        elif _fleet_parts[i] in ("--no-synth", "--no-synthesis"):
+                            _fleet_skip_synth = True
+                            i += 1
+                            _fleet_goal_start = i
+                        else:
+                            break
+
+                    _fleet_goal = " ".join(_fleet_parts[_fleet_goal_start:])
+                    if not _fleet_goal:
+                        print(f"{C.YELLOW}Please provide a goal for the fleet.{C.RESET}")
+                        continue
+
+                    fleet = FleetOrchestrator(config, client, registry, permissions)
+                    fleet_result = fleet.run(
+                        _fleet_goal,
+                        num_teammates=_fleet_n,
+                        allow_writes=_fleet_writes,
+                        skip_synthesis=_fleet_skip_synth,
+                    )
+
+                    session.add_user_message(f"/fleet {fleet_args}")
+                    session.add_assistant_message(fleet_result)
+
+                    _scroll_aware_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="")
+                    tui._render_markdown(fleet_result)
+                    _scroll_aware_print()
+                    continue
+
                 else:
                     # Check if it's a skill invocation: /skill-name args
                     _skill_name = _first_word[1:]  # remove leading /
@@ -25629,7 +26047,7 @@ Review this code for:
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",
                                      "/rollback", "/autotest", "/gentest", "/skills", "/hooks",
                                      "/image", "/browser", "/fork", "/index",
-                                     "/pr", "/gh", "/team", "/memory",
+                                     "/pr", "/gh", "/team", "/fleet", "/memory",
                                      "/jobs", "/errors",
                                      "/channels", "/webhook:configure", "/webhook:allow",
                                      "/webhook:open", "/webhook:allowlist",
