@@ -48,7 +48,10 @@ eve-cli -p "Hello Worldを作って"
 | `--model <名前>` | 使用モデルを指定 | `--model qwen3.5:14b` |
 | `-p "<指示>"` | ワンショットモードで実行 | `-p "バグを直して"` |
 | `-y` | 自動許可モード（毎回の確認をスキップ） | |
-| `--resume` | 前回のセッションを再開 | |
+| `--resume` | セッションを再開（候補が複数あればピッカー表示） | |
+| `--continue` | 最新セッションを即時再開（ピッカーをスキップ） | |
+| `--session-id <id>` | 特定セッションを ID で指定再開 | |
+| `--list-sessions` | 保存済みセッション一覧（cwd / preview 付き） | |
 | `--profile <名前>` | 接続プロファイルを指定 | `--profile offline` |
 | `--output-format json` | 出力を JSON 形式に | |
 | `--learn` | 学習モードで起動 | |

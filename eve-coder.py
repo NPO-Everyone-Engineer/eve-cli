@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.38.0"
+__version__ = "2.39.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1226,6 +1226,8 @@ class Config:
         self.yes_mode = False       # -y auto-approve
         self.debug = False
         self.resume = False
+        self.continue_latest = False  # --continue: resume most recent without picker
+        self.no_resume_picker = False  # --no-picker: bypass interactive picker on --resume
         self.session_id = None
         self.list_sessions = False
         self.cwd = os.getcwd()
@@ -1655,8 +1657,12 @@ class Config:
         parser.add_argument("--rubber-duck-checkpoints", help="Automatic review checkpoints: plan, post-edit, or all")
         parser.add_argument("-y", "--yes", action="store_true", help=t('help.yes', default="Auto-approve all tool calls"))
         parser.add_argument("--debug", action="store_true", help=t('help.debug', default="Debug mode"))
-        parser.add_argument("--resume", action="store_true", help=t('help.resume', default="Resume last session"))
-        parser.add_argument("--session-id", help=t('help.session_id', default="Resume specific session"))
+        parser.add_argument("--resume", action="store_true", help=t('help.resume', default="Resume a session (interactive picker if multiple candidates)"))
+        parser.add_argument("--continue", dest="continue_latest", action="store_true",
+                            help=t('help.continue', default="Resume the most recent session (skip picker)"))
+        parser.add_argument("--no-picker", action="store_true", default=False,
+                            help=t('help.no_picker', default="Skip the interactive picker on --resume"))
+        parser.add_argument("--session-id", help=t('help.session_id', default="Resume specific session by ID"))
         parser.add_argument("--list-sessions", action="store_true", help=t('help.list_sessions', default="List saved sessions"))
         parser.add_argument("--ollama-host", help=t('help.ollama_host', default="Ollama host URL"))
         parser.add_argument("--max-tokens", type=int, help=t('help.max_tokens', default="Max output tokens"))
@@ -1768,9 +1774,16 @@ class Config:
             self.debug = True
         if args.resume:
             self.resume = True
+        if getattr(args, "continue_latest", False):
+            self.resume = True
+            self.continue_latest = True
+            self.no_resume_picker = True
+        if getattr(args, "no_picker", False):
+            self.no_resume_picker = True
         if args.session_id:
             self.session_id = args.session_id
             self.resume = True
+            self.no_resume_picker = True  # explicit ID skips picker
         if args.list_sessions:
             self.list_sessions = True
         if args.ollama_host:
@@ -19067,30 +19080,121 @@ class Session:
         return self.runtime_state.get_resume_summary() if self.runtime_state else {}
 
     @staticmethod
-    def list_sessions(config):
-        """List available sessions."""
+    def list_sessions(config, enrich=False, limit=50):
+        """List available sessions.
+
+        enrich=True reads up to ~32KB from the head of each session file to
+        extract: real message count (capped at scanned lines), cwd from the
+        first system/runtime hint, and a short preview of the first user
+        message. Reading the head only keeps the picker fast even with large
+        sessions, while still returning useful metadata for the UI.
+        """
         sessions = []
         sessions_dir = config.sessions_dir
         if not os.path.isdir(sessions_dir):
             return sessions
         jsonl_files = [f for f in os.listdir(sessions_dir) if f.endswith(".jsonl")]
-        for f in sorted(jsonl_files, reverse=True)[:50]:
-                sid = f[:-6]
-                path = os.path.join(sessions_dir, f)
+        for f in sorted(jsonl_files, reverse=True)[:limit]:
+            sid = f[:-6]
+            path = os.path.join(sessions_dir, f)
+            try:
+                mtime = os.path.getmtime(path)
+                size = os.path.getsize(path)
+            except OSError:
+                continue  # file may have been deleted between listdir and stat
+            entry = {
+                "id": sid,
+                "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)),
+                "modified_ts": mtime,
+                "size": size,
+                "messages": max(1, size // 200),  # rough estimate fallback
+                "cwd": "",
+                "preview": "",
+            }
+            if enrich:
                 try:
-                    mtime = os.path.getmtime(path)
-                    size = os.path.getsize(path)
+                    with open(path, encoding="utf-8", errors="replace") as fp:
+                        head = fp.read(32_768)
                 except OSError:
-                    continue  # file may have been deleted between listdir and stat
-                # Estimate message count from file size instead of reading the whole file
-                messages_est = max(1, size // 200)  # rough estimate: ~200 bytes per message
-                sessions.append({
-                    "id": sid,
-                    "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)),
-                    "size": size,
-                    "messages": messages_est,
-                })
+                    sessions.append(entry)
+                    continue
+                lines = head.splitlines()
+                first_user_text = ""
+                cwd_hint = ""
+                line_count = 0
+                for raw in lines:
+                    if not raw.strip():
+                        continue
+                    line_count += 1
+                    try:
+                        msg = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    if not cwd_hint:
+                        cwd_hint = str(msg.get("_cwd") or msg.get("cwd") or "")
+                    if msg.get("role") == "user" and not first_user_text:
+                        content = msg.get("content")
+                        if isinstance(content, str):
+                            first_user_text = content
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    first_user_text = part.get("text", "")
+                                    break
+                    if first_user_text and cwd_hint:
+                        break
+                entry["messages"] = max(line_count, 1) if line_count else entry["messages"]
+                entry["cwd"] = cwd_hint
+                entry["preview"] = (first_user_text or "").strip().replace("\n", " ")[:80]
+            sessions.append(entry)
         return sessions
+
+    @staticmethod
+    def pick_session_interactive(config, sessions, default_idx=0):
+        """Show a numbered picker over `sessions` and return the chosen entry's id.
+
+        Returns "" when the user aborts (q / Ctrl+C / EOF) so callers can fall
+        back to starting a new session. Uses plain input() so it works under
+        libedit (macOS), TTYs without ANSI cursor support, and stdin pipes
+        from a controlling terminal. Headless / non-TTY callers should not
+        invoke this — they should resolve via list ordering directly.
+        """
+        if not sessions:
+            return ""
+        max_show = min(len(sessions), 20)
+        cwd_self = os.path.abspath(getattr(config, "cwd", "") or "")
+        print()
+        print(f"  {C.BOLD}Resume which session?{C.RESET}")
+        print(f"  {C.DIM}{'#':<3} {'Modified':<17} {'Msgs':<5} {'CWD':<40} Preview{C.RESET}")
+        for i, s in enumerate(sessions[:max_show], start=1):
+            cwd = s.get("cwd") or ""
+            cwd_label = "(this dir)" if cwd and os.path.abspath(cwd) == cwd_self else (
+                os.path.basename(cwd) if cwd else "-"
+            )
+            preview = s.get("preview") or ""
+            row = f"  {i:<3} {s['modified']:<17} {s['messages']:<5} {cwd_label[:39]:<40} {preview[:60]}"
+            print(row)
+        print(f"  {C.DIM}q to abort, Enter for #{default_idx + 1}{C.RESET}")
+        try:
+            choice = input(f"  Select [1-{max_show}]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
+        if choice in ("q", "quit", "exit", "n"):
+            return ""
+        if not choice:
+            choice = str(default_idx + 1)
+        try:
+            idx = int(choice) - 1
+        except ValueError:
+            print(f"  {C.YELLOW}Invalid selection.{C.RESET}")
+            return ""
+        if idx < 0 or idx >= max_show:
+            print(f"  {C.YELLOW}Out of range.{C.RESET}")
+            return ""
+        return sessions[idx]["id"]
 
 
 
@@ -20829,7 +20933,8 @@ class TUI:
   {_c51}━━ Startup Flags {sep[16:]}{C.RESET}
   {_c198}-y{C.RESET}                 Auto-approve all
   {_c198}--debug{C.RESET}            Enable debug output
-  {_c198}--resume{C.RESET}           Resume last session
+  {_c198}--resume{C.RESET}           Resume a session (interactive picker if multiple)
+  {_c198}--continue{C.RESET}         Resume the most recent session (skip picker)
   {_c198}--model NAME{C.RESET}       Use specific model
   {_c198}--session-id ID{C.RESET}    Resume specific session
   {_c198}--list-sessions{C.RESET}    List saved sessions
@@ -23005,14 +23110,20 @@ def main():
 
     # Handle --list-sessions
     if config.list_sessions:
-        sessions = Session.list_sessions(config)
+        sessions = Session.list_sessions(config, enrich=True, limit=50)
         if not sessions:
             print("No saved sessions.")
             return
-        print(f"\n{'ID':<20} {'Modified':<18} {'Messages':<10} {'Size':<10}")
-        print("─" * 60)
+        print(f"\n{'ID':<20} {'Modified':<18} {'Msgs':<5} {'CWD':<30} Preview")
+        print("─" * 100)
+        cwd_self = os.path.abspath(getattr(config, "cwd", "") or "")
         for s in sessions:
-            print(f"{s['id']:<20} {s['modified']:<18} {s['messages']:<10} {s['size']:<10}")
+            cwd = s.get("cwd") or ""
+            cwd_label = "(this dir)" if cwd and os.path.abspath(cwd) == cwd_self else (
+                os.path.basename(cwd) if cwd else "-"
+            )
+            preview = s.get("preview") or ""
+            print(f"{s['id']:<20} {s['modified']:<18} {s['messages']:<5} {cwd_label[:29]:<30} {preview[:50]}")
         return
 
     # Handle --rag-index (index files and exit)
@@ -23273,40 +23384,59 @@ def main():
 
     # Resume session if requested
     if config.resume:
+        # Decide resume target. Priority order:
+        #   1. Explicit --session-id
+        #   2. Interactive picker (TTY only, unless --no-picker / --continue)
+        #   3. Project session for current cwd
+        #   4. Most recent session
+        target_sid = ""
+        target_label = ""
         if config.session_id:
-            if session.load(config.session_id):
+            target_sid = config.session_id
+            target_label = f"session: {config.session_id}"
+        else:
+            picker_eligible = (
+                not config.no_resume_picker
+                and not config.headless
+                and not config.prompt
+                and sys.stdin.isatty()
+                and sys.stdout.isatty()
+            )
+            if picker_eligible:
+                sessions_list = Session.list_sessions(config, enrich=True, limit=20)
+                if len(sessions_list) >= 2:
+                    chosen = Session.pick_session_interactive(config, sessions_list)
+                    if chosen:
+                        target_sid = chosen
+                        target_label = chosen
+                elif len(sessions_list) == 1:
+                    target_sid = sessions_list[0]["id"]
+                    target_label = target_sid
+            if not target_sid:
+                # Non-interactive or picker aborted/skipped — use existing fallbacks
+                project_sid = Session.get_project_session(config)
+                if project_sid:
+                    target_sid = project_sid
+                    target_label = f"project session: {project_sid}"
+                else:
+                    sessions_list = Session.list_sessions(config, limit=1)
+                    if sessions_list:
+                        target_sid = sessions_list[0]["id"]
+                        target_label = target_sid
+
+        if target_sid:
+            if session.load(target_sid):
                 msgs = len(session.messages)
                 pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
                 _show_resume_info(
-                    f"session: {config.session_id}", msgs, pct, session.messages, session.get_resume_summary()
+                    target_label, msgs, pct, session.messages, session.get_resume_summary()
                 )
             else:
-                print(f"{C.RED}No saved session found with ID '{config.session_id}'.{C.RESET}")
-                print(f"{C.DIM}List sessions: python3 eve-coder.py --list-sessions{C.RESET}")
-                return
-        else:
-            # First try to find a session for the current working directory
-            project_sid = Session.get_project_session(config)
-            resumed = False
-            if project_sid:
-                if session.load(project_sid):
-                    msgs = len(session.messages)
-                    pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
-                    _show_resume_info(
-                        f"project session: {project_sid}", msgs, pct, session.messages, session.get_resume_summary()
-                    )
-                    resumed = True
-            if not resumed:
-                # Fall back to latest session
-                sessions = Session.list_sessions(config)
-                if sessions:
-                    latest = sessions[0]["id"]
-                    if session.load(latest):
-                        msgs = len(session.messages)
-                        pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
-                        _show_resume_info(latest, msgs, pct, session.messages, session.get_resume_summary())
-                    else:
-                        print(f"{C.YELLOW}Could not resume. Starting new session.{C.RESET}")
+                if config.session_id:
+                    print(f"{C.RED}No saved session found with ID '{config.session_id}'.{C.RESET}")
+                    print(f"{C.DIM}List sessions: python3 eve-coder.py --list-sessions{C.RESET}")
+                    return
+                print(f"{C.YELLOW}Could not resume {target_sid}. Starting new session.{C.RESET}")
 
     # First-run onboarding hint for new users
     if not config.resume and not config.prompt:

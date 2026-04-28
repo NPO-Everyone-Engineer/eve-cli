@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -677,6 +678,97 @@ class TestSessionRuntimeState(unittest.TestCase):
         sess.save()
 
         self.assertIsInstance(sess.messages[0]["content"], list)
+
+
+class TestSessionListAndPicker(unittest.TestCase):
+    """Tests for Session.list_sessions(enrich=True) and pick_session_interactive."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _seed_session(self, sid, content_lines):
+        cfg = _make_config(self.tmpdir, session_id=sid)
+        path = os.path.join(cfg.sessions_dir, f"{sid}.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for line in content_lines:
+                f.write(json.dumps(line, ensure_ascii=False) + "\n")
+        return cfg
+
+    def test_list_sessions_enrich_extracts_preview_and_count(self):
+        cfg = self._seed_session("seed_a", [
+            {"role": "user", "content": "fix the typo in README"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "second user line"},
+        ])
+        out = Session.list_sessions(cfg, enrich=True)
+        self.assertEqual(len(out), 1)
+        entry = out[0]
+        self.assertEqual(entry["id"], "seed_a")
+        self.assertEqual(entry["messages"], 3)
+        self.assertIn("README", entry["preview"])
+
+    def test_list_sessions_enrich_handles_corrupt_lines(self):
+        cfg = _make_config(self.tmpdir, session_id="seed_b")
+        path = os.path.join(cfg.sessions_dir, "seed_b.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("not-json\n")
+            f.write(json.dumps({"role": "user", "content": "valid"}) + "\n")
+        out = Session.list_sessions(cfg, enrich=True)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["preview"], "valid")
+
+    def test_list_sessions_legacy_mode_omits_preview(self):
+        self._seed_session("seed_c", [{"role": "user", "content": "anything"}])
+        cfg = _make_config(self.tmpdir, session_id="seed_c")
+        out = Session.list_sessions(cfg, enrich=False)
+        self.assertEqual(len(out), 1)
+        # Without enrich, preview/cwd are empty defaults — still callable safely
+        self.assertEqual(out[0].get("preview", ""), "")
+
+    def test_pick_session_interactive_default_picks_first(self):
+        sessions = [
+            {"id": "a", "modified": "2026-04-29 10:00", "messages": 5, "cwd": "", "preview": "hi"},
+            {"id": "b", "modified": "2026-04-28 22:30", "messages": 3, "cwd": "", "preview": "yo"},
+        ]
+        cfg = _make_config(self.tmpdir)
+        with unittest.mock.patch("builtins.input", return_value=""):
+            chosen = Session.pick_session_interactive(cfg, sessions)
+        self.assertEqual(chosen, "a")
+
+    def test_pick_session_interactive_explicit_index(self):
+        sessions = [
+            {"id": "a", "modified": "x", "messages": 1, "cwd": "", "preview": ""},
+            {"id": "b", "modified": "x", "messages": 1, "cwd": "", "preview": ""},
+            {"id": "c", "modified": "x", "messages": 1, "cwd": "", "preview": ""},
+        ]
+        cfg = _make_config(self.tmpdir)
+        with unittest.mock.patch("builtins.input", return_value="3"):
+            chosen = Session.pick_session_interactive(cfg, sessions)
+        self.assertEqual(chosen, "c")
+
+    def test_pick_session_interactive_quit_returns_empty(self):
+        sessions = [{"id": "a", "modified": "x", "messages": 1, "cwd": "", "preview": ""}]
+        cfg = _make_config(self.tmpdir)
+        with unittest.mock.patch("builtins.input", return_value="q"):
+            chosen = Session.pick_session_interactive(cfg, sessions)
+        self.assertEqual(chosen, "")
+
+    def test_pick_session_interactive_handles_eof(self):
+        sessions = [{"id": "a", "modified": "x", "messages": 1, "cwd": "", "preview": ""}]
+        cfg = _make_config(self.tmpdir)
+        with unittest.mock.patch("builtins.input", side_effect=EOFError):
+            chosen = Session.pick_session_interactive(cfg, sessions)
+        self.assertEqual(chosen, "")
+
+    def test_pick_session_interactive_out_of_range(self):
+        sessions = [{"id": "a", "modified": "x", "messages": 1, "cwd": "", "preview": ""}]
+        cfg = _make_config(self.tmpdir)
+        with unittest.mock.patch("builtins.input", return_value="99"):
+            chosen = Session.pick_session_interactive(cfg, sessions)
+        self.assertEqual(chosen, "")
 
 
 if __name__ == "__main__":
