@@ -230,6 +230,49 @@ HOOK_ENV_SET=TEAM=backend
 
 ---
 
+## URL allowlist / denylist
+
+`WebFetch` が到達できる URL をホスト単位で制御できます。SSRF 対策（プライベート IP / ループバック ブロック）に加えて、**業務外ドメインへの流出を防ぐ**ガードとして使えます。
+
+### 設定ファイル
+
+`~/.config/eve-cli/permissions.json` または `.eve-cli/permissions.json`（プロジェクト固有）に書きます。両方読み込まれてマージされます。
+
+```json
+{
+  "allowed_urls": [
+    "github.com",
+    "*.github.com",
+    "raw.githubusercontent.com",
+    "docs.python.org"
+  ],
+  "denied_urls": [
+    "*.internal.example.com"
+  ]
+}
+```
+
+### 評価ルール
+
+1. `denied_urls` にマッチ → **deny**（最優先、`allowed_urls` も上書き）
+2. `allowed_urls` が空でなく、どれにもマッチしない → **deny**（whitelist mode）
+3. それ以外 → **allow**（既定動作 / 互換）
+
+### パターン構文
+
+| パターン | マッチ |
+|---|---|
+| `github.com` | `github.com` のみ（サブドメイン不可） |
+| `*.github.com` | `api.github.com`, `a.b.github.com`（apex は不可） |
+
+サブドメインも許可したい場合は `github.com` と `*.github.com` を両方書いてください。比較はケースインセンシティブで、末尾の `.`（FQDN ドット）は無視されます。
+
+### Bash / curl は対象外
+
+このリストは **`WebFetch` ツールに対してのみ強制**されます。`Bash` 経由の `curl` / `wget` などはシェル経由の任意実行であり、現状は対象外です。シェル経由の通信を制限したい場合は、`Bash` ツール自体を `permissions.json` の `tools` で deny にしてください。
+
+---
+
 ## Skills（カスタムスキル）
 
 特定のタスクに特化した AI への指示セットを再利用可能な形で定義できます。

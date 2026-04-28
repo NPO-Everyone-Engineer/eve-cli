@@ -209,6 +209,7 @@ _active_tui = None
 _active_channel_context = None
 _active_notifier = None
 _active_hook_mgr = None  # set by main(), used by NotificationManager.notify to fire Notification hooks
+_active_permissions = None  # set by main(), used by WebFetchTool to check URL allow/deny lists
 
 # Custom commands cache: command_name -> {"description": str, "path": str, "frontmatter": dict}
 _custom_commands = {}
@@ -314,7 +315,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.40.0"
+__version__ = "2.41.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -8606,6 +8607,15 @@ class WebFetchTool(Tool):
         if self._is_private_ip(hostname):
             return f"Error: request to private/internal IP blocked (SSRF protection): {hostname}"
 
+        # Apply URL allowlist/denylist (P2-4) if permissions are loaded.
+        if _active_permissions is not None:
+            try:
+                allowed, reason = _active_permissions.check_url_allowed(url)
+            except Exception:
+                allowed, reason = True, ""
+            if not allowed:
+                return f"Error: URL blocked by permissions ({reason})"
+
         try:
             content_type, raw = self._fetch_pinned(url, timeout=30)
 
@@ -14611,6 +14621,9 @@ class PermissionMgr:
         self._project_category_rules = {}
         self._global_path_rules = []
         self._project_path_rules = []
+        # URL allow/deny lists (P2-4): merged across global + project, lower-cased
+        self._allowed_urls = []  # whitelist patterns; if non-empty → only these allowed
+        self._denied_urls = []   # blacklist patterns; takes precedence
         self._permissions_path = config.permissions_file
         self._project_permissions_path = os.path.join(
             os.path.abspath(getattr(config, "cwd", os.getcwd())),
@@ -14723,7 +14736,7 @@ class PermissionMgr:
                 data = json.load(f)
             if not isinstance(data, dict):
                 return
-            if any(key in data for key in ("tools", "categories", "paths", "path_rules")):
+            if any(key in data for key in ("tools", "categories", "paths", "path_rules", "allowed_urls", "denied_urls")):
                 tools = data.get("tools", {})
                 if isinstance(tools, dict):
                     for k, v in tools.items():
@@ -14738,6 +14751,19 @@ class PermissionMgr:
                 if isinstance(path_rules, list):
                     for rule in path_rules:
                         self._store_path_rule(scope, rule)
+                # URL allow/deny lists merge across scopes; project entries
+                # are appended after globals (no precedence between scopes —
+                # deny wins regardless of where it was declared).
+                allowed = data.get("allowed_urls", [])
+                if isinstance(allowed, list):
+                    for pat in allowed:
+                        if isinstance(pat, str) and pat.strip():
+                            self._allowed_urls.append(pat.strip().lower())
+                denied = data.get("denied_urls", [])
+                if isinstance(denied, list):
+                    for pat in denied:
+                        if isinstance(pat, str) and pat.strip():
+                            self._denied_urls.append(pat.strip().lower())
             else:
                 for k, v in data.items():
                     if isinstance(k, str):
@@ -14745,6 +14771,58 @@ class PermissionMgr:
             self._merge_visible_rules()
         except (OSError, json.JSONDecodeError) as e:
             print(f"Warning: Could not load permissions: {e}", file=sys.stderr)
+
+    @staticmethod
+    def _host_matches_pattern(host, pattern):
+        """Match host against a URL allowlist pattern.
+
+        Supported forms:
+          - exact match:      "github.com"
+          - wildcard subdomain: "*.example.com" matches any sub.example.com
+            but NOT example.com itself (mirrors Copilot CLI semantics)
+          - bare top match:   "example.com" matches "example.com" only;
+            use "*.example.com" if you want subdomains too.
+        Patterns and host are compared case-insensitively.
+        """
+        host = (host or "").lower().strip().rstrip(".")
+        pattern = (pattern or "").lower().strip().rstrip(".")
+        if not host or not pattern:
+            return False
+        if pattern == host:
+            return True
+        if pattern.startswith("*."):
+            suffix = pattern[2:]
+            if not suffix:
+                return False
+            return host.endswith("." + suffix)
+        return False
+
+    def check_url_allowed(self, url):
+        """Return (allowed: bool, reason: str) for the given URL.
+
+        Decision order:
+          1. denied_urls match → deny (wins regardless of allow rules)
+          2. allowed_urls non-empty → must match, else deny (whitelist mode)
+          3. allowed_urls empty + no deny match → allow (default permissive)
+        """
+        if not url:
+            return False, "empty URL"
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except (ValueError, TypeError):
+            return False, "could not parse URL"
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return False, "URL has no hostname"
+        for pattern in self._denied_urls:
+            if self._host_matches_pattern(host, pattern):
+                return False, f"denied by URL rule: {pattern}"
+        if self._allowed_urls:
+            for pattern in self._allowed_urls:
+                if self._host_matches_pattern(host, pattern):
+                    return True, ""
+            return False, f"host '{host}' not in allowed_urls"
+        return True, ""
 
     def _extract_candidate_path(self, params):
         if not isinstance(params, dict):
@@ -23424,9 +23502,10 @@ def main():
     if hook_mgr.has_hooks and config.debug:
         print(f"{C.DIM}[debug] Loaded {len(hook_mgr._hooks)} hooks{C.RESET}", file=sys.stderr)
     notifier = NotificationManager(config)
-    global _active_notifier, _active_hook_mgr
+    global _active_notifier, _active_hook_mgr, _active_permissions
     _active_notifier = notifier
     _active_hook_mgr = hook_mgr
+    _active_permissions = permissions
 
     agent = Agent(config, client, registry, permissions, session, tui,
                   rag_engine=_rag_engine, hook_mgr=hook_mgr, code_intel=_code_intel)
