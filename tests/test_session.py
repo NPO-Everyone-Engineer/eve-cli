@@ -215,6 +215,35 @@ class TestSessionTokenEstimation(unittest.TestCase):
         after = self.sess.get_token_estimate()
         self.assertGreater(after, before)
 
+    def test_get_token_breakdown_segregates_roles(self):
+        self.sess.add_user_message("hello world how are you today")
+        self.sess.add_assistant_message("I am fine, thanks for asking!")
+        tool_calls = [{"id": "tc1", "function": {"name": "Bash", "arguments": '{"command": "ls"}'}}]
+        self.sess.add_assistant_message("", tool_calls=tool_calls)
+
+        breakdown = self.sess.get_token_breakdown()
+
+        self.assertGreater(breakdown["system_prompt"], 0)
+        self.assertGreater(breakdown["user"], 0)
+        self.assertGreater(breakdown["assistant"], 0)
+        self.assertGreater(breakdown["tool_calls"], 0)
+        self.assertEqual(breakdown["counts"]["user"], 1)
+        self.assertEqual(breakdown["counts"]["assistant"], 2)
+        # total should roughly equal sum of components
+        components = (
+            breakdown["system_prompt"] + breakdown["system"] + breakdown["user"]
+            + breakdown["assistant"] + breakdown["tool"] + breakdown["images"]
+            + breakdown["tool_calls"]
+        )
+        self.assertEqual(breakdown["total"], components)
+
+    def test_get_token_breakdown_empty_session(self):
+        breakdown = self.sess.get_token_breakdown()
+        self.assertEqual(breakdown["user"], 0)
+        self.assertEqual(breakdown["assistant"], 0)
+        self.assertEqual(breakdown["counts"]["user"], 0)
+        self.assertGreater(breakdown["system_prompt"], 0)
+
 
 class TestSessionEnforceMaxMessages(unittest.TestCase):
     """Tests for _enforce_max_messages."""

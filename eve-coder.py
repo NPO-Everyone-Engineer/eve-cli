@@ -313,7 +313,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.35.0"
+__version__ = "2.36.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -18293,6 +18293,44 @@ class Session:
     def get_token_estimate(self):
         return self._token_estimate + self._estimate_tokens(self.system_prompt)
 
+    def get_token_breakdown(self):
+        """Return per-role token breakdown for /context command.
+
+        Returns a dict with keys: system_prompt, user, assistant, tool, images,
+        tool_calls, total, counts (per-role message counts).
+        """
+        breakdown = {
+            "system_prompt": self._estimate_tokens(self.system_prompt),
+            "system": 0,
+            "user": 0,
+            "assistant": 0,
+            "tool": 0,
+            "images": 0,
+            "tool_calls": 0,
+            "counts": {"system": 0, "user": 0, "assistant": 0, "tool": 0},
+        }
+        for m in self.messages:
+            role = m.get("role") or "user"
+            content_tokens = self._estimate_message_content_tokens(m.get("content"))
+            bucket = role if role in ("system", "user", "assistant", "tool") else "user"
+            breakdown[bucket] += content_tokens
+            if bucket in breakdown["counts"]:
+                breakdown["counts"][bucket] += 1
+            if isinstance(m.get("images"), list):
+                breakdown["images"] += len(m["images"]) * 800
+            if m.get("tool_calls"):
+                breakdown["tool_calls"] += len(json.dumps(m["tool_calls"], ensure_ascii=False)) // 4
+        breakdown["total"] = (
+            breakdown["system_prompt"]
+            + breakdown["system"]
+            + breakdown["user"]
+            + breakdown["assistant"]
+            + breakdown["tool"]
+            + breakdown["images"]
+            + breakdown["tool_calls"]
+        )
+        return breakdown
+
     def _summarize_old_messages(self, old_messages):
         """Use sidecar model to generate a summary of old conversation messages.
         Returns summary text or None if sidecar is unavailable/fails."""
@@ -18751,7 +18789,7 @@ class TUI:
                 _slash_commands = [
                     "/help", "/exit", "/quit", "/q", "/clear", "/model", "/models",
                     "/status", "/doctor", "/tool-pool", "/command-graph", "/bootstrap-graph",
-                    "/save", "/compact", "/yes", "/no", "/tokens", "/usage",
+                    "/save", "/compact", "/yes", "/no", "/tokens", "/context", "/usage",
                     "/think", "/no-think", "/map", "/review", "/rubber-duck", "/accept-review",
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
@@ -20282,7 +20320,8 @@ class TUI:
   {_c198}/compact{C.RESET}           Compress context to save memory
   {_c198}/undo{C.RESET}              Undo last file change
   {_c198}/config{C.RESET}            Show configuration
-  {_c198}/tokens{C.RESET}            Show token usage
+  {_c198}/tokens{C.RESET}            Show context usage with per-role breakdown
+  {_c198}/context{C.RESET}           Alias of /tokens (Claude Code / Copilot CLI compatible)
   {_c198}/usage{C.RESET}             Show persistent token/cost usage report
   {_c198}/init{C.RESET}              Create CLAUDE.md template
   {_c198}/yes{C.RESET}               Auto-approve ON
@@ -21177,9 +21216,14 @@ class Agent:
 
             # Auto-compact if context is getting full
             if iteration > 0 and iteration % 5 == 0:
+                _before_tokens = self.session.get_token_estimate()
                 if self.session.auto_compact(self.client, self.config):
+                    _after_tokens = self.session.get_token_estimate()
                     _threshold_pct = int(self.session.context_policy_for(self.config)["compact_threshold"] * 100)
-                    _p(f"\n  {C.DIM}[auto-compacted: context was >{_threshold_pct}% full]{C.RESET}")
+                    _p(
+                        f"\n  {C.DIM}[auto-compacted at >{_threshold_pct}% full: "
+                        f"~{_before_tokens:,} → ~{_after_tokens:,} tokens]{C.RESET}"
+                    )
 
             text = ""
             try:
@@ -23589,7 +23633,7 @@ def main():
                     color = C.GREEN if ok else C.YELLOW
                     print(f"  {color}{message}{C.RESET}")
                     continue
-                elif cmd == "/tokens":
+                elif cmd in ("/tokens", "/context"):
                     tokens = session.get_token_estimate()
                     msgs = len(session.messages)
                     pct = min(int((tokens / config.context_window) * 100), 100)
@@ -23600,10 +23644,28 @@ def main():
                     _c240 = _ansi("\033[38;5;240m")
                     bar_color = _ansi("\033[38;5;46m") if pct < 50 else _ansi("\033[38;5;226m") if pct < 80 else _ansi("\033[38;5;196m")
                     bar = bar_color + "█" * filled + _c240 + "░" * (bar_len - filled) + C.RESET
-                    print(f"\n  {_c51}━━ トークン使用量 ━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+                    print(f"\n  {_c51}━━ Context Usage ━━━━━━━━━━━━━━━━━━━━{C.RESET}")
                     print(f"  [{bar}] {pct}%")
                     print(f"  {_c87}~{tokens:,}{C.RESET} / {_c240}{config.context_window:,} tokens{C.RESET}")
                     print(f"  {_c87}{msgs}{C.RESET} {_c240}{t('slash.tokens_messages', default='messages in session')}{C.RESET}")
+                    breakdown = session.get_token_breakdown()
+                    counts = breakdown["counts"]
+                    print(f"  {_c51}─ breakdown ─────────────────────────{C.RESET}")
+                    _bd_rows = [
+                        ("system prompt", breakdown["system_prompt"], None),
+                        ("system msgs", breakdown["system"], counts["system"]),
+                        ("user msgs", breakdown["user"], counts["user"]),
+                        ("assistant msgs", breakdown["assistant"], counts["assistant"]),
+                        ("tool results", breakdown["tool"], counts["tool"]),
+                        ("tool calls", breakdown["tool_calls"], None),
+                        ("images", breakdown["images"], None),
+                    ]
+                    for _label, _val, _count in _bd_rows:
+                        if _val <= 0 and _count in (0, None):
+                            continue
+                        _share = (_val / tokens * 100) if tokens else 0
+                        _count_part = f" ({_count} msgs)" if _count is not None else ""
+                        print(f"    {_c240}{_label:<16}{C.RESET} {_c87}~{_val:>7,}{C.RESET} {_c240}({_share:4.1f}%){_count_part}{C.RESET}")
                     if pct >= 80:
                         print(f"  {_ansi(chr(27)+'[38;5;196m')}⚠ {t('slash.tokens_warning', default='Context almost full! Use /compact or /clear')}{C.RESET}")
                     print(f"  {_c51}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
@@ -25472,7 +25534,7 @@ Review this code for:
                         _all_cmds = ["/help", "/exit", "/quit", "/clear", "/model", "/models",
                                      "/status", "/doctor", "/tool-pool", "/command-graph", "/bootstrap-graph",
                                      "/save", "/compact", "/yes", "/no",
-                                     "/tokens", "/usage", "/think", "/no-think", "/map", "/review", "/rubber-duck", "/accept-review",
+                                     "/tokens", "/context", "/usage", "/think", "/no-think", "/map", "/review", "/rubber-duck", "/accept-review",
                                      "/commit", "/diff", "/git", "/plan",
                                      "/approve", "/act", "/execute", "/undo", "/init",
                                      "/config", "/debug", "/debug-scroll", "/checkpoint",
