@@ -6,6 +6,7 @@ import unittest
 import sys
 import os
 import json
+import subprocess
 import tempfile
 import shutil
 from types import SimpleNamespace
@@ -165,6 +166,17 @@ class TestSubAgentScaling(unittest.TestCase):
         self.assertEqual(result, "done")
         self.assertEqual(client.calls, 12)
 
+    def test_git_worktree_detects_nested_repo_cwd(self):
+        repo_dir = os.path.join(self.test_dir, "repo")
+        nested_dir = os.path.join(repo_dir, "src", "pkg")
+        os.makedirs(nested_dir, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True, text=True)
+
+        worktree = eve_coder.GitWorktree(nested_dir)
+
+        self.assertTrue(worktree._is_git_repo)
+        self.assertEqual(os.path.realpath(worktree.repo_root), os.path.realpath(repo_dir))
+
     def test_parse_subagent_default_max_turns_is_capped(self):
         """Config parsing should clamp configured default max turns to the hard cap."""
         cfg_path = os.path.join(self.test_dir, "config")
@@ -287,6 +299,133 @@ class TestParallelAgents(unittest.TestCase):
             [task["max_turns"] for task in parallel_tool.payload["tasks"]],
             [17, 17],
         )
+
+    def test_parallel_write_tasks_default_to_worktree_isolation(self):
+        class _RecordingSubAgentTool:
+            calls = []
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def execute(self, params):
+                self.calls.append(params)
+                return {
+                    "ok": True,
+                    "result": "done",
+                    "summary": "done",
+                    "duration": 0.1,
+                    "isolation": "worktree",
+                    "worktree_path": "/tmp/eve-wt-123",
+                    "worktree_branch": "eve-parallel-agent-1-1-edit-file-abcd1234",
+                    "worktree_preserved": True,
+                    "merge_hint": "git merge eve-parallel-agent-1-1-edit-file-abcd1234",
+                }
+
+        cfg = SimpleNamespace(
+            cwd=self.test_dir,
+            model="test-model",
+            sidecar_model="",
+            default_subagent_max_turns=15,
+        )
+        coordinator = eve_coder.MultiAgentCoordinator(cfg, object(), MagicMock(), None)
+
+        with patch.object(eve_coder, "SubAgentTool", _RecordingSubAgentTool):
+            results = coordinator.run_parallel([
+                {"prompt": "edit file", "allow_writes": True},
+            ])
+
+        self.assertEqual(len(_RecordingSubAgentTool.calls), 1)
+        call = _RecordingSubAgentTool.calls[0]
+        self.assertEqual(call["isolation"], "worktree")
+        self.assertTrue(call["_structured_result"])
+        self.assertTrue(call["_worktree_branch_prefix"].startswith("eve-parallel-"))
+        self.assertTrue(results[0]["worktree_preserved"])
+        self.assertIn("git merge", results[0]["merge_hint"])
+
+    def test_parallel_readonly_tasks_do_not_force_worktree_isolation(self):
+        class _RecordingSubAgentTool:
+            calls = []
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def execute(self, params):
+                self.calls.append(params)
+                return {"ok": True, "result": "done", "summary": "done", "duration": 0.1}
+
+        cfg = SimpleNamespace(
+            cwd=self.test_dir,
+            model="test-model",
+            sidecar_model="",
+            default_subagent_max_turns=15,
+        )
+        coordinator = eve_coder.MultiAgentCoordinator(cfg, object(), MagicMock(), None)
+
+        with patch.object(eve_coder, "SubAgentTool", _RecordingSubAgentTool):
+            coordinator.run_parallel([
+                {"prompt": "research only", "allow_writes": False},
+            ])
+
+        self.assertEqual(len(_RecordingSubAgentTool.calls), 1)
+        self.assertNotIn("isolation", _RecordingSubAgentTool.calls[0])
+
+
+class TestAgentTeamIsolation(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        with eve_coder._task_store_lock:
+            eve_coder._task_store["next_id"] = 1
+            eve_coder._task_store["tasks"] = {}
+
+    def tearDown(self):
+        with eve_coder._task_store_lock:
+            eve_coder._task_store["next_id"] = 1
+            eve_coder._task_store["tasks"] = {}
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_team_write_mode_defaults_subagents_to_worktree_isolation(self):
+        class _FakeClient:
+            def chat_sync(self, **kwargs):
+                return {
+                    "content": json.dumps([
+                        {"subject": "task-alpha", "description": "do alpha"},
+                    ])
+                }
+
+        class _RecordingSubAgentTool:
+            calls = []
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def execute(self, params):
+                self.calls.append(params)
+                return {
+                    "ok": True,
+                    "result": "done",
+                    "summary": "done",
+                    "isolation": params.get("isolation", "none"),
+                    "worktree_path": "/tmp/eve-wt-team",
+                    "worktree_branch": "eve-team-agent-1-task-alpha-abcd1234",
+                    "worktree_preserved": True,
+                    "merge_hint": "git merge eve-team-agent-1-task-alpha-abcd1234",
+                }
+
+        cfg = SimpleNamespace(
+            cwd=self.test_dir,
+            model="test-model",
+            sidecar_model="",
+        )
+        team = eve_coder.AgentTeam(cfg, _FakeClient(), registry=None, permissions=None)
+
+        with patch.object(eve_coder, "SubAgentTool", _RecordingSubAgentTool):
+            output = team.run("team goal", num_teammates=1, allow_writes=True)
+
+        self.assertTrue(_RecordingSubAgentTool.calls)
+        self.assertEqual(_RecordingSubAgentTool.calls[0]["isolation"], "worktree")
+        self.assertTrue(_RecordingSubAgentTool.calls[0]["_worktree_branch_prefix"].startswith("eve-team-"))
+        self.assertIn("Worktree branch: eve-team-agent-1-task-alpha-abcd1234", output)
+        self.assertIn("git merge eve-team-agent-1-task-alpha-abcd1234", output)
 
 
 class TestAutoParallelHookGate(unittest.TestCase):

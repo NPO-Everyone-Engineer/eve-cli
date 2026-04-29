@@ -10172,15 +10172,19 @@ class SubAgentTool(Tool):
 
     @staticmethod
     def _format_result_payload(result_text, *, ok, duration, error=None,
-                               worktree_path=None, worktree_branch=None):
+                               isolation="none", worktree_path=None, worktree_branch=None,
+                               worktree_preserved=False, merge_hint=None):
         return {
             "ok": bool(ok),
             "result": result_text,
             "summary": _summarize_output_text(result_text, 240),
             "error": error,
             "duration": duration,
+            "isolation": isolation,
             "worktree_path": worktree_path,
             "worktree_branch": worktree_branch,
+            "worktree_preserved": bool(worktree_preserved),
+            "merge_hint": merge_hint,
         }
 
     def execute(self, params):
@@ -10207,14 +10211,21 @@ class SubAgentTool(Tool):
 
         # Worktree isolation setup
         isolation = params.get("isolation", "none")
+        worktree_branch_prefix = params.get("_worktree_branch_prefix", "")
         worktree_path = None
         worktree_branch = None
+        worktree_preserved = False
+        merge_hint = None
+        actual_isolation = "none"
         wt_manager = None
 
         if isolation == "worktree" and allow_writes:
             wt_manager = GitWorktree(self._config.cwd)
-            worktree_path, worktree_branch = wt_manager.create()
+            worktree_path, worktree_branch = wt_manager.create(
+                branch_prefix=worktree_branch_prefix or "eve-worktree"
+            )
             if worktree_path:
+                actual_isolation = "worktree"
                 sub_config = copy.copy(self._config)
                 sub_config.cwd = worktree_path
                 with _print_lock:
@@ -10409,7 +10420,9 @@ class SubAgentTool(Tool):
                     result_text += f"\n\n[Worktree changes on branch: {worktree_branch}]\n"
                     if diff_preview:
                         result_text += f"```diff\n{diff_preview[:3000]}\n```\n"
-                    result_text += f"To apply: git merge {worktree_branch}"
+                    merge_hint = f"git merge {worktree_branch}"
+                    worktree_preserved = True
+                    result_text += f"To apply: {merge_hint}"
                     # Don't remove worktree if it has changes
                     with _print_lock:
                         _scroll_aware_print(
@@ -10442,8 +10455,11 @@ class SubAgentTool(Tool):
                 ok=error_text is None,
                 duration=_sub_elapsed,
                 error=error_text,
+                isolation=actual_isolation,
                 worktree_path=worktree_path,
                 worktree_branch=worktree_branch,
+                worktree_preserved=worktree_preserved,
+                merge_hint=merge_hint,
             )
         return result_text
 
@@ -12257,19 +12273,43 @@ class GitWorktree:
 
     def __init__(self, cwd):
         self.cwd = cwd
-        self._is_git_repo = os.path.isdir(os.path.join(cwd, ".git"))
+        self.repo_root = self._resolve_repo_root()
+        self._git_cwd = self.repo_root or cwd
+        self._is_git_repo = bool(self.repo_root)
+
+    def _resolve_repo_root(self):
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=5, cwd=self.cwd,
+            )
+            if proc.returncode != 0:
+                return None
+            root = proc.stdout.strip()
+            return root or None
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+
+    @staticmethod
+    def _sanitize_branch_prefix(branch_prefix):
+        clean = _slugify(branch_prefix or "eve-worktree", max_len=40)
+        return clean or "eve-worktree"
 
     def create(self, branch_prefix="eve-worktree"):
         """Create a temporary worktree. Returns (worktree_path, branch_name) or (None, None)."""
         if not self._is_git_repo:
             return None, None
+        branch_prefix = self._sanitize_branch_prefix(branch_prefix)
         branch_name = f"{branch_prefix}-{uuid.uuid4().hex[:8]}"
-        worktree_path = os.path.join(tempfile.gettempdir(), f"eve-wt-{uuid.uuid4().hex[:8]}")
+        worktree_path = os.path.join(
+            tempfile.gettempdir(),
+            f"eve-wt-{branch_prefix[:18]}-{uuid.uuid4().hex[:8]}",
+        )
         try:
             # Create worktree with new branch from current HEAD
             proc = subprocess.run(
                 ["git", "worktree", "add", "-b", branch_name, worktree_path],
-                capture_output=True, text=True, timeout=30, cwd=self.cwd,
+                capture_output=True, text=True, timeout=30, cwd=self._git_cwd,
             )
             if proc.returncode != 0:
                 return None, None
@@ -12284,7 +12324,7 @@ class GitWorktree:
         try:
             subprocess.run(
                 ["git", "worktree", "remove", "--force", worktree_path],
-                capture_output=True, text=True, timeout=15, cwd=self.cwd,
+                capture_output=True, text=True, timeout=15, cwd=self._git_cwd,
             )
         except (subprocess.TimeoutExpired, OSError):
             # Fallback: try to remove directory
@@ -12292,7 +12332,7 @@ class GitWorktree:
                 shutil.rmtree(worktree_path, ignore_errors=True)
                 subprocess.run(
                     ["git", "worktree", "prune"],
-                    capture_output=True, text=True, timeout=10, cwd=self.cwd,
+                    capture_output=True, text=True, timeout=10, cwd=self._git_cwd,
                 )
             except Exception:
                 pass
@@ -12301,7 +12341,7 @@ class GitWorktree:
             try:
                 subprocess.run(
                     ["git", "branch", "-D", branch_name],
-                    capture_output=True, text=True, timeout=10, cwd=self.cwd,
+                    capture_output=True, text=True, timeout=10, cwd=self._git_cwd,
                 )
             except Exception:
                 pass
@@ -12755,12 +12795,21 @@ class MultiAgentCoordinator:
         def _run_one(idx, task):
             start = time.time()
             try:
-                # Inject agent label for UI display
-                labeled_task = dict(task)
-                labeled_task["_agent_label"] = f"Agent {idx + 1}/{total}"
-                labeled_task["_structured_result"] = True
-                sub = SubAgentTool(self._config, self._client, self._registry, self._permissions, self._tui)
-                result = sub.execute(labeled_task)
+                agent_label = f"Agent {idx + 1}/{total}"
+                result = _run_parallel_subagent(
+                    self._config,
+                    self._client,
+                    self._registry,
+                    self._permissions,
+                    prompt=task.get("prompt", ""),
+                    max_turns=task.get("max_turns", _get_default_subagent_max_turns(self._config)),
+                    allow_writes=bool(task.get("allow_writes", False)),
+                    agent_label=agent_label,
+                    isolation=task.get("isolation", ""),
+                    worktree_scope="parallel",
+                    worktree_hint=task.get("prompt", ""),
+                    tui=self._tui,
+                )
                 if isinstance(result, dict):
                     result_text = result.get("result", "")
                     error_text = result.get("error")
@@ -12773,6 +12822,11 @@ class MultiAgentCoordinator:
                     "duration": time.time() - start,
                     "error": error_text,
                     "structured": result if isinstance(result, dict) else None,
+                    "isolation": result.get("isolation") if isinstance(result, dict) else "none",
+                    "worktree_path": result.get("worktree_path") if isinstance(result, dict) else None,
+                    "worktree_branch": result.get("worktree_branch") if isinstance(result, dict) else None,
+                    "worktree_preserved": bool(result.get("worktree_preserved")) if isinstance(result, dict) else False,
+                    "merge_hint": result.get("merge_hint") if isinstance(result, dict) else None,
                 }
             except Exception as e:
                 results[idx] = {
@@ -12833,6 +12887,96 @@ class MultiAgentCoordinator:
         return results
 
 
+def _resolve_parallel_subagent_isolation(allow_writes, isolation=""):
+    normalized = str(isolation or "").strip().lower()
+    if normalized in {"none", "worktree"}:
+        return normalized
+    return "worktree" if allow_writes else "none"
+
+
+def _parallel_worktree_branch_prefix(scope, agent_label="", task_hint=""):
+    parts = ["eve", _slugify(scope or "subagent", max_len=12) or "subagent"]
+    label_slug = _slugify(agent_label or "", max_len=14)
+    if label_slug:
+        parts.append(label_slug)
+    hint_slug = _slugify(task_hint or "", max_len=18)
+    if hint_slug:
+        parts.append(hint_slug)
+    prefix = "-".join(parts)
+    return prefix[:52].rstrip("-") or "eve-worktree"
+
+
+def _build_parallel_subagent_payload(prompt, *, max_turns, allow_writes,
+                                     agent_label="", isolation="",
+                                     worktree_scope="subagent", worktree_hint=""):
+    payload = {
+        "prompt": prompt,
+        "max_turns": max_turns,
+        "allow_writes": allow_writes,
+        "_agent_label": agent_label,
+        "_structured_result": True,
+    }
+    resolved_isolation = _resolve_parallel_subagent_isolation(allow_writes, isolation)
+    if resolved_isolation == "worktree":
+        payload["isolation"] = "worktree"
+        payload["_worktree_branch_prefix"] = _parallel_worktree_branch_prefix(
+            worktree_scope,
+            agent_label=agent_label,
+            task_hint=worktree_hint or prompt,
+        )
+    return payload
+
+
+def _run_parallel_subagent(config, client, registry, permissions, *, prompt,
+                           max_turns, allow_writes, agent_label="",
+                           isolation="", worktree_scope="subagent",
+                           worktree_hint="", tui=None):
+    sub = SubAgentTool(config, client, registry, permissions, tui)
+    payload = _build_parallel_subagent_payload(
+        prompt,
+        max_turns=max_turns,
+        allow_writes=allow_writes,
+        agent_label=agent_label,
+        isolation=isolation,
+        worktree_scope=worktree_scope,
+        worktree_hint=worktree_hint,
+    )
+    return sub.execute(payload)
+
+
+def _result_worktree_metadata(result):
+    if not isinstance(result, dict):
+        return None
+    branch = str(result.get("worktree_branch") or "").strip()
+    path = str(result.get("worktree_path") or "").strip()
+    preserved = bool(result.get("worktree_preserved"))
+    merge_hint = str(result.get("merge_hint") or "").strip()
+    if not (branch or path or preserved or merge_hint):
+        return None
+    if preserved and branch and not merge_hint:
+        merge_hint = f"git merge {branch}"
+    return {
+        "branch": branch,
+        "path": path,
+        "preserved": preserved,
+        "merge_hint": merge_hint,
+    }
+
+
+def _format_worktree_note_lines(result, prefix=""):
+    meta = _result_worktree_metadata(result)
+    if not meta or not meta["preserved"]:
+        return []
+    lines = []
+    if meta["branch"]:
+        lines.append(f"{prefix}Worktree branch: {meta['branch']}")
+    if meta["path"]:
+        lines.append(f"{prefix}Worktree path: {meta['path']}")
+    if meta["merge_hint"]:
+        lines.append(f"{prefix}Apply with: {meta['merge_hint']}")
+    return lines
+
+
 class ParallelAgentTool(Tool):
     """Launch multiple sub-agents in parallel to handle independent tasks."""
     name = "ParallelAgents"
@@ -12868,6 +13012,11 @@ class ParallelAgentTool(Tool):
                                 ),
                             },
                             "allow_writes": {"type": "boolean", "description": "Allow write tools"},
+                            "isolation": {
+                                "type": "string",
+                                "enum": ["none", "worktree"],
+                                "description": "Isolation mode per agent (default: worktree for write-capable tasks, none otherwise)",
+                            },
                         },
                         "required": ["prompt"],
                     },
@@ -12911,6 +13060,7 @@ class ParallelAgentTool(Tool):
             if r["error"]:
                 output_parts.append(f"│ Error: {r['error']}")
             else:
+                output_parts.extend(_format_worktree_note_lines(r, prefix="│ "))
                 # Indent result lines for readability, truncate very long results
                 result_text = r["result"]
                 if len(result_text) > 3000:
@@ -13081,19 +13231,23 @@ class AgentTeam:
                         f"  {_ansi(chr(27)+'[38;5;141m')}[{name}] "
                         f"Starting task #{_tid}: {task_to_work['subject'][:60]}{C.RESET}")
 
-                sub = SubAgentTool(self._config, self._client, self._registry, self._permissions)
-                result = sub.execute({
-                    "prompt": (
+                result = _run_parallel_subagent(
+                    self._config,
+                    self._client,
+                    self._registry,
+                    self._permissions,
+                    prompt=(
                         f"Complete this task:\n"
                         f"Subject: {task_to_work['subject']}\n"
                         f"Description: {task_to_work['description']}\n\n"
-                        f"Working directory: {self._config.cwd}"
+                        f"Repository root: {self._config.cwd}"
                     ),
-                    "max_turns": 15,
-                    "allow_writes": allow_writes,
-                    "_agent_label": name,
-                    "_structured_result": True,
-                })
+                    max_turns=15,
+                    allow_writes=allow_writes,
+                    agent_label=name,
+                    worktree_scope="team",
+                    worktree_hint=task_to_work["subject"],
+                )
 
                 # Mark task complete
                 with _task_store_lock:
@@ -13159,6 +13313,7 @@ class AgentTeam:
                 else:
                     output_parts.append(f"| status: OK")
                     output_parts.append(f"| summary: {result.get('summary', '')}")
+                output_parts.extend(_format_worktree_note_lines(result, prefix="| "))
             else:
                 result_text = str(result)
             if len(result_text) > 2000:
@@ -13373,19 +13528,23 @@ class FleetOrchestrator:
                         f"  {_ansi(chr(27)+'[38;5;141m')}[{name}] "
                         f"Starting task #{_tid}: {task_to_work['subject'][:60]}{C.RESET}")
 
-                sub = SubAgentTool(self._config, self._client, self._registry, self._permissions)
-                result = sub.execute({
-                    "prompt": (
+                result = _run_parallel_subagent(
+                    self._config,
+                    self._client,
+                    self._registry,
+                    self._permissions,
+                    prompt=(
                         f"Complete this task:\n"
                         f"Subject: {task_to_work['subject']}\n"
                         f"Description: {task_to_work['description']}\n\n"
-                        f"Working directory: {self._config.cwd}"
+                        f"Repository root: {self._config.cwd}"
                     ),
-                    "max_turns": 15,
-                    "allow_writes": allow_writes,
-                    "_agent_label": name,
-                    "_structured_result": True,
-                })
+                    max_turns=15,
+                    allow_writes=allow_writes,
+                    agent_label=name,
+                    worktree_scope="fleet",
+                    worktree_hint=task_to_work["subject"],
+                )
                 ok = bool(isinstance(result, dict) and result.get("ok", False))
                 with _task_store_lock:
                     t = _task_store["tasks"].get(_tid)
@@ -13482,10 +13641,22 @@ class FleetOrchestrator:
                 blocked = t.get("blockedBy", [])
                 deps = f" (after {','.join('#' + b for b in blocked)})" if blocked else ""
                 lines.append(f"{icon} Task #{tid}: {t.get('subject', '?')}{deps} [{t.get('status', '?')}]")
+        preserved_worktrees = []
+        for key, result in results.items():
+            meta_lines = _format_worktree_note_lines(result)
+            if meta_lines:
+                preserved_worktrees.append((key, meta_lines))
         if synthesis:
             lines.append("")
             lines.append("── Synthesis ────────────────────────────────")
             lines.append(synthesis)
+            lines.append("─────────────────────────────────────────────")
+        if preserved_worktrees:
+            lines.append("")
+            lines.append("── Preserved worktrees ─────────────────────")
+            for key, meta_lines in preserved_worktrees:
+                lines.append(f"[{key}]")
+                lines.extend(meta_lines)
             lines.append("─────────────────────────────────────────────")
         else:
             lines.append("")
@@ -13494,6 +13665,7 @@ class FleetOrchestrator:
                 lines.append(f"\n[{key}]")
                 if isinstance(result, dict):
                     body = result.get("summary") or result.get("result") or result.get("error", "")
+                    lines.extend(_format_worktree_note_lines(result))
                 else:
                     body = str(result)
                 if len(body) > 1500:

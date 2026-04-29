@@ -175,6 +175,38 @@ class TestFleetRunEndToEnd(unittest.TestCase):
         output = fleet.run("test goal", num_teammates=2)
         self.assertIn("Failed to decompose goal", output)
 
+    def test_fleet_write_mode_defaults_subagents_to_worktree_isolation(self):
+        client = _FakeClient([self._build_decompose_response()])
+
+        class _RecordingSubAgentTool:
+            calls = []
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def execute(self, params):
+                self.calls.append(params)
+                return {
+                    "ok": True,
+                    "result": "done",
+                    "summary": "done",
+                    "isolation": params.get("isolation", "none"),
+                    "worktree_path": "/tmp/eve-wt-fleet",
+                    "worktree_branch": "eve-fleet-agent-1-task-alpha-abcd1234",
+                    "worktree_preserved": True,
+                    "merge_hint": "git merge eve-fleet-agent-1-task-alpha-abcd1234",
+                }
+
+        fleet = FleetOrchestrator(self.config, client, registry=None, permissions=None)
+        with patch.object(eve_coder, "SubAgentTool", _RecordingSubAgentTool):
+            output = fleet.run("test goal", num_teammates=1, allow_writes=True, skip_synthesis=True)
+
+        self.assertTrue(_RecordingSubAgentTool.calls)
+        self.assertEqual(_RecordingSubAgentTool.calls[0]["isolation"], "worktree")
+        self.assertTrue(_RecordingSubAgentTool.calls[0]["_worktree_branch_prefix"].startswith("eve-fleet-"))
+        self.assertIn("Preserved worktrees", output)
+        self.assertIn("git merge eve-fleet-agent-1-task-alpha-abcd1234", output)
+
 
 if __name__ == "__main__":
     unittest.main()
