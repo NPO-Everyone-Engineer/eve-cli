@@ -315,7 +315,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.41.3"
+__version__ = "2.41.4"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -2790,6 +2790,26 @@ def _is_glm5_model(model_name):
     return bool(model_name) and model_name.lower().startswith("glm-5")
 
 
+def _model_name_implies_vision_support(model_name):
+    if not model_name:
+        return False
+    lower = model_name.strip().lower()
+    known_prefixes = (
+        "gemma3:",
+        "gemma4:",
+        "llava",
+        "llama3.2-vision",
+        "moondream",
+        "minicpm-v",
+        "qwen2.5-vl",
+        "internvl",
+        "kimi-k2.6:",
+    )
+    if lower.startswith(known_prefixes):
+        return True
+    return "vision" in lower
+
+
 def _strip_thinking_tags(content):
     """Strip thinking traces from model output.
 
@@ -4963,10 +4983,7 @@ class OllamaClient:
             if any(f in families for f in ["clip", "mllama"]):
                 self._vision_support_cache[model] = True
                 return True
-            if "vision" in model.lower() or "llava" in model.lower():
-                self._vision_support_cache[model] = True
-                return True
-            if model.lower().startswith("gemma4:"):
+            if _model_name_implies_vision_support(model):
                 self._vision_support_cache[model] = True
                 return True
             # Check parameters/template for image token
@@ -4977,6 +4994,10 @@ class OllamaClient:
             self._vision_support_cache[model] = False
             return False
         except Exception:
+            implied = _model_name_implies_vision_support(model)
+            if implied:
+                self._vision_support_cache[model] = True
+                return True
             return assume_if_unknown
 
     def check_model(self, model_name, available_models=None):

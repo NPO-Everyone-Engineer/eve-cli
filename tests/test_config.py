@@ -1180,6 +1180,24 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
         self.assertEqual(client.context_window, 262144)
         self.assertTrue(client.debug)
 
+    def test_check_vision_support_uses_name_heuristics_when_show_unavailable(self):
+        cfg = Config()
+        client = eve_coder.OllamaClient(cfg)
+
+        with patch("urllib.request.urlopen", side_effect=RuntimeError("show unavailable")):
+            self.assertTrue(client.check_vision_support("gemma4:31b-cloud", assume_if_unknown=False))
+            self.assertTrue(client.check_vision_support("kimi-k2.6:cloud", assume_if_unknown=False))
+            self.assertFalse(client.check_vision_support("deepseek-v4-pro:cloud", assume_if_unknown=False))
+
+    def test_pick_vision_route_model_uses_known_cloud_vision_candidate_when_show_unavailable(self):
+        cfg = Config()
+        cfg.model = "deepseek-v4-pro:cloud"
+        cfg.vision_model = "kimi-k2.6:cloud"
+        client = eve_coder.OllamaClient(cfg)
+
+        with patch("urllib.request.urlopen", side_effect=RuntimeError("show unavailable")):
+            self.assertEqual(eve_coder._pick_vision_route_model(cfg, client), "kimi-k2.6:cloud")
+
 
 class TestOllamaThinkingAdapters(unittest.TestCase):
     def test_native_response_preserves_thinking_field(self):
