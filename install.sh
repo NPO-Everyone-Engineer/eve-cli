@@ -877,7 +877,7 @@ set_cloud_role_defaults() {
     UTILITY_MODEL="$SIDECAR_MODEL"
     COMPACTION_MODEL="$SIDECAR_MODEL"
     REVIEW_MODEL="$SIDECAR_MODEL"
-    VISION_MODEL="gemma4:31b-cloud"
+    VISION_MODEL="kimi-k2.6:cloud"
     SUBAGENT_MODEL="$SIDECAR_MODEL"
     CONFIG_OLLAMA_HOST="https://ollama.com/api"
 }
@@ -899,11 +899,12 @@ if [ -n "$MANUAL_MODEL" ]; then
     fi
     vapor_info "$(msg manual_model): $MODEL"
 else
-    MODEL="deepseek-v4-pro:cloud"
+    MODEL="glm-5.1:cloud"
     set_cloud_role_defaults
     echo -e "  ${NEON_GREEN}┃${NC} ☁️ ${BOLD}${YELLOW}*** CLOUD DEFAULT ***${NC}"
     echo -e "  ${NEON_GREEN}┃${NC}    ${BOLD}${WHITE}$MODEL${NC} ${DIM}(Cloud, agentic coding default)${NC}"
-    echo -e "  ${NEON_GREEN}┃${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (Cloud helper / review / vision)${NC}"
+    echo -e "  ${NEON_GREEN}┃${NC}    ${DIM}+ sidecar: ${SIDECAR_MODEL} (Cloud helper / review / subagent)${NC}"
+    echo -e "  ${NEON_GREEN}┃${NC}    ${DIM}+ vision: ${VISION_MODEL} (Cloud image input)${NC}"
 fi
 
 # =============================================

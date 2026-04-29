@@ -36,13 +36,13 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(self.cfg.ollama_host, "http://localhost:11434")
 
     def test_default_model(self):
-        self.assertEqual(self.cfg.model, "deepseek-v4-pro:cloud")
+        self.assertEqual(self.cfg.model, "glm-5.1:cloud")
 
     def test_default_sidecar_model(self):
         self.assertEqual(self.cfg.sidecar_model, "qwen3-coder-next:cloud")
 
     def test_default_vision_model(self):
-        self.assertEqual(self.cfg.vision_model, "gemma4:31b-cloud")
+        self.assertEqual(self.cfg.vision_model, "kimi-k2.6:cloud")
 
     def test_default_review_model(self):
         self.assertEqual(self.cfg.review_model, "")
@@ -1039,10 +1039,10 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
         self.assertTrue(eve_coder._is_cloud_model("qwen3.5:397b"))
         self.assertTrue(eve_coder._is_cloud_model("qwen3.5:397b-cloud"))
 
-    def test_deepseek_v4_pro_cloud_uses_explicit_context_window(self):
+    def test_glm_5_1_cloud_uses_explicit_context_window(self):
         cfg = Config()
-        cfg._apply_context_window("deepseek-v4-pro:cloud")
-        self.assertEqual(cfg.context_window, 1000000)
+        cfg._apply_context_window("glm-5.1:cloud")
+        self.assertEqual(cfg.context_window, 198000)
 
     def test_gemma_defaults_to_google_temperature(self):
         cfg = Config()
@@ -1187,11 +1187,12 @@ class TestGemma4CloudAndSampling(unittest.TestCase):
         with patch("urllib.request.urlopen", side_effect=RuntimeError("show unavailable")):
             self.assertTrue(client.check_vision_support("gemma4:31b-cloud", assume_if_unknown=False))
             self.assertTrue(client.check_vision_support("kimi-k2.6:cloud", assume_if_unknown=False))
+            self.assertFalse(client.check_vision_support("glm-5.1:cloud", assume_if_unknown=False))
             self.assertFalse(client.check_vision_support("deepseek-v4-pro:cloud", assume_if_unknown=False))
 
     def test_pick_vision_route_model_uses_known_cloud_vision_candidate_when_show_unavailable(self):
         cfg = Config()
-        cfg.model = "deepseek-v4-pro:cloud"
+        cfg.model = "glm-5.1:cloud"
         cfg.vision_model = "kimi-k2.6:cloud"
         client = eve_coder.OllamaClient(cfg)
 
@@ -1453,7 +1454,7 @@ class TestModelRoleResolution(unittest.TestCase):
 
     def test_subagent_model_prefers_specific_then_primary_model(self):
         cfg = Config()
-        cfg.model = "deepseek-v4-pro:cloud"
+        cfg.model = "glm-5.1:cloud"
         cfg.sidecar_model = "gemma4:31b"
         cfg.utility_model = "qwen3:8b"
         self.assertEqual(eve_coder._resolve_subagent_model(cfg), "qwen3-coder-next:cloud")
@@ -1471,20 +1472,20 @@ class TestModelRoleResolution(unittest.TestCase):
     def test_vision_model_prefers_explicit_override(self):
         cfg = Config()
         cfg.sidecar_model = "gemma4:31b"
-        self.assertEqual(eve_coder._resolve_vision_model(cfg), "gemma4:31b-cloud")
+        self.assertEqual(eve_coder._resolve_vision_model(cfg), Config.DEFAULT_VISION_MODEL)
         cfg.vision_model = "gemma4:27b-cloud"
         self.assertEqual(eve_coder._resolve_vision_model(cfg), "gemma4:27b-cloud")
 
     def test_pick_vision_route_model_falls_back_to_vision_capable_candidate(self):
         cfg = Config()
-        cfg.model = "deepseek-v4-pro:cloud"
-        cfg.sidecar_model = "deepseek-v4-pro:cloud"
+        cfg.model = "glm-5.1:cloud"
+        cfg.sidecar_model = "glm-5.1:cloud"
         client = MagicMock()
         client.check_vision_support.side_effect = lambda model, assume_if_unknown=True: {
-            "deepseek-v4-pro:cloud": False,
-            "gemma4:31b-cloud": True,
+            "glm-5.1:cloud": False,
+            "kimi-k2.6:cloud": True,
         }.get(model, False if not assume_if_unknown else True)
-        self.assertEqual(eve_coder._pick_vision_route_model(cfg, client), "gemma4:31b-cloud")
+        self.assertEqual(eve_coder._pick_vision_route_model(cfg, client), "kimi-k2.6:cloud")
 
 
 if __name__ == "__main__":

@@ -366,12 +366,12 @@ class TestSecurityHardening(unittest.TestCase):
         shell_content = Path(SCRIPT_DIR, "install.sh").read_text(encoding="utf-8")
         powershell_content = Path(SCRIPT_DIR, "install.ps1").read_text(encoding="utf-8")
 
-        self.assertIn('MODEL="deepseek-v4-pro:cloud"', shell_content)
+        self.assertIn('MODEL="glm-5.1:cloud"', shell_content)
         self.assertIn('VISION_MODEL="${VISION_MODEL}"', shell_content)
         self.assertIn('OLLAMA_HOST="${CONFIG_OLLAMA_HOST}"', shell_content)
 
-        self.assertIn('$MODEL = "deepseek-v4-pro:cloud"', powershell_content)
-        self.assertIn('$script:VISION_MODEL = "gemma4:31b-cloud"', powershell_content)
+        self.assertIn('$MODEL = "glm-5.1:cloud"', powershell_content)
+        self.assertIn('$script:VISION_MODEL = "kimi-k2.6:cloud"', powershell_content)
         self.assertIn('VISION_MODEL="$VISION_MODEL"', powershell_content)
         self.assertIn("Confirm-UnverifiedRemoteInstaller", powershell_content)
         self.assertIn("EVE_CLI_OLLAMA_SETUP_SHA256", powershell_content)
