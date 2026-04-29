@@ -107,7 +107,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 
 | カテゴリ | 内容 |
 |---------|------|
-| **AI エージェント** | 複数の内蔵ツール、Plan/Act モード、Agent Teams、サブエージェント、Thinking モード |
+| **AI エージェント** | 複数の内蔵ツール、Plan/Act モード、Agent Teams、サブエージェント、Thinking モード、`/fleet`（依存グラフ付き並列オーケストレーター + 統合 synthesis） |
 | **開発支援** | コミット自動生成、テスト生成、自動 Lint/Test、Repo Map、コードレビュー（`/review` / Rubber Duck）、GitHub 連携 |
 | **CI/CD** | Headless モード（stdin パイプ対応）、JSON 出力、`--max-turns`、`--carry-session`、ループモード |
 | **コンテキスト** | プロジェクト自動解析（言語・FW・リンター・テストFW 検出）、キャッシュ、コードインテリジェンス |
@@ -147,6 +147,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | サンドボックスで安全に | `eve-cli --sandbox docker --sandbox-no-network` |
 | 拡張機能を追加する | `eve-cli install https://github.com/user/eve-ext-name` |
 | Discord から操作する | `eve-cli --channels discord` |
+| 並列で複数タスクを回す | 対話モードで `/fleet "ゴール"`（依存関係を自動分解 → 並列実行 → 統合回答） |
 
 ---
 

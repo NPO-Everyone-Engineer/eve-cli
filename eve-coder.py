@@ -315,7 +315,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.41.5"
+__version__ = "2.41.6"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -13465,6 +13465,51 @@ class FleetOrchestrator:
         return cleaned
 
     @staticmethod
+    def _detect_cycles(tasks_data):
+        """Return True if the 1-indexed blockedBy graph contains a cycle.
+
+        Operates on the parsed decompose payload (1-indexed references into the
+        same array). Out-of-range and self-referential edges are ignored — they
+        are dropped later by `_translate_blockedby_indices` and cannot form a
+        cycle on their own. Iterative DFS to avoid recursion limits on the
+        cap-of-8 task arrays we work with.
+        """
+        n = len(tasks_data)
+        if n <= 1:
+            return False
+        adj = [[] for _ in range(n)]
+        for i, td in enumerate(tasks_data):
+            for raw in td.get("blockedBy", []):
+                try:
+                    idx0 = int(raw) - 1
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx0 < n and idx0 != i:
+                    adj[i].append(idx0)
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = [WHITE] * n
+        for start in range(n):
+            if color[start] != WHITE:
+                continue
+            stack = [(start, iter(adj[start]))]
+            color[start] = GRAY
+            while stack:
+                node, it = stack[-1]
+                advanced = False
+                for nxt in it:
+                    if color[nxt] == GRAY:
+                        return True
+                    if color[nxt] == WHITE:
+                        color[nxt] = GRAY
+                        stack.append((nxt, iter(adj[nxt])))
+                        advanced = True
+                        break
+                if not advanced:
+                    color[node] = BLACK
+                    stack.pop()
+        return False
+
+    @staticmethod
     def _translate_blockedby_indices(tasks_data, task_ids):
         """Translate 1-indexed blockedBy entries into actual task store IDs.
 
@@ -13522,7 +13567,10 @@ class FleetOrchestrator:
         cleaned = self._parse_decompose_response(content)
         if not cleaned:
             return [], "decompose response could not be parsed as a task array"
-        return cleaned[:8], None  # cap at 8 tasks
+        cleaned = cleaned[:8]  # cap at 8 tasks
+        if self._detect_cycles(cleaned):
+            return [], "decompose response contains cyclic blockedBy dependencies"
+        return cleaned, None
 
     def _register_tasks(self, tasks_data):
         """Insert tasks into _task_store and wire up blockedBy with real task IDs."""
@@ -15704,8 +15752,14 @@ class PermissionMgr:
         except OSError as e:
             print(f"警告: 許可ルールの保存に失敗しました: {e}", file=sys.stderr)
 
+    _SIDECAR_CLASSIFY_ATTEMPTS = 2  # one retry on transient failure / ambiguous output
+
     def _classify_with_sidecar(self, tool_name, params):
-        """Use sidecar model to classify a tool call into risk bands."""
+        """Use sidecar model to classify a tool call into risk bands.
+
+        Retries once when the sidecar raises or returns an unparseable verdict so
+        a single transient failure does not silently fall back to the heuristic.
+        """
         if not self._sidecar_client or not self._sidecar_model:
             return None
         # Build compact param summary (truncate for speed)
@@ -15724,50 +15778,56 @@ class PermissionMgr:
             )},
             {"role": "user", "content": f"Tool: {tool_name}\nArguments: {param_str}"},
         ]
-        try:
-            # Build model-aware options (low temp for deterministic classification)
-            _sc_opts = (
-                self._sidecar_client.build_utility_options(self._sidecar_model, "classifier", 0.2)
-                if hasattr(self._sidecar_client, "build_utility_options")
-                else {"temperature": 0.2, "max_tokens": 64}
-            )
-            _sc_ctx = (
-                self._sidecar_client.temporary_reasoning(False, None)
-                if hasattr(self._sidecar_client, "temporary_reasoning")
-                else contextlib.nullcontext()
-            )
-            with _sc_ctx:
-                resp = self._sidecar_client.chat(
-                    model=self._sidecar_model,
-                    messages=classify_prompt,
-                    tools=None,
-                    stream=False,
-                    options=_sc_opts,
+        for _attempt in range(self._SIDECAR_CLASSIFY_ATTEMPTS):
+            try:
+                # Build model-aware options (low temp for deterministic classification)
+                _sc_opts = (
+                    self._sidecar_client.build_utility_options(self._sidecar_model, "classifier", 0.2)
+                    if hasattr(self._sidecar_client, "build_utility_options")
+                    else {"temperature": 0.2, "max_tokens": 64}
                 )
-            # Extract content from response
-            content = ""
-            choices = resp.get("choices", [])
-            if choices:
-                content = choices[0].get("message", {}).get("content", "")
-            if not content:
-                content = resp.get("message", {}).get("content", "")
-            if not content:
-                return None
-            # Strip thinking traces (Qwen <think> and Gemma 4 <|channel>thought)
-            content = _strip_thinking_tags(content)
-            lines = content.strip().split("\n", 1)
-            decision_word = lines[0].strip().upper()
-            reason = lines[1].strip() if len(lines) > 1 else ""
-            if "LOW" in decision_word:
-                return self._record_risk("low", 0.2, reason or "Sidecar marked the tool call as low risk.", "guardian")
-            if "MEDIUM" in decision_word:
-                return self._record_risk("medium", 0.55, reason or "Sidecar marked the tool call as medium risk.", "guardian")
-            if "HIGH" in decision_word:
-                return self._record_risk("high", 0.9, reason or "Sidecar marked the tool call as high risk.", "guardian")
-            # Ambiguous response — treat as unavailable
-            return None
-        except Exception:
-            return None
+                _sc_ctx = (
+                    self._sidecar_client.temporary_reasoning(False, None)
+                    if hasattr(self._sidecar_client, "temporary_reasoning")
+                    else contextlib.nullcontext()
+                )
+                with _sc_ctx:
+                    resp = self._sidecar_client.chat(
+                        model=self._sidecar_model,
+                        messages=classify_prompt,
+                        tools=None,
+                        stream=False,
+                        options=_sc_opts,
+                    )
+                # Extract content from response
+                content = ""
+                choices = resp.get("choices", [])
+                if choices:
+                    content = choices[0].get("message", {}).get("content", "")
+                if not content:
+                    content = resp.get("message", {}).get("content", "")
+                if not content:
+                    continue
+                # Strip thinking traces (Qwen <think> and Gemma 4 <|channel>thought)
+                content = _strip_thinking_tags(content)
+                lines = content.strip().split("\n", 1)
+                decision_word = lines[0].strip().upper()
+                reason = lines[1].strip() if len(lines) > 1 else ""
+                # Validate: the first line must contain exactly one of LOW/MEDIUM/HIGH.
+                # Accept "MEDIUM" but not e.g. "LOW or HIGH" which would be an ambiguous verdict.
+                hits = [w for w in ("LOW", "MEDIUM", "HIGH") if w in decision_word]
+                if len(hits) != 1:
+                    continue
+                verdict = hits[0]
+                if verdict == "LOW":
+                    return self._record_risk("low", 0.2, reason or "Sidecar marked the tool call as low risk.", "guardian")
+                if verdict == "MEDIUM":
+                    return self._record_risk("medium", 0.55, reason or "Sidecar marked the tool call as medium risk.", "guardian")
+                if verdict == "HIGH":
+                    return self._record_risk("high", 0.9, reason or "Sidecar marked the tool call as high risk.", "guardian")
+            except Exception:
+                continue
+        return None
 
     def session_allow(self, tool_name):
         """Allow a tool for the rest of this session, and persist if safe."""
@@ -17046,9 +17106,12 @@ def _pick_vision_route_model(config, client):
         primary_has_vision = False
     if primary_has_vision:
         return ""
-    for candidate in _vision_model_candidates(config):
+    candidates = _vision_model_candidates(config)
+    tried = []
+    for candidate in candidates:
         if candidate == primary_model:
             continue
+        tried.append(candidate)
         try:
             if client.check_vision_support(candidate, assume_if_unknown=False):
                 return candidate
@@ -17057,6 +17120,16 @@ def _pick_vision_route_model(config, client):
                 return candidate
         except Exception:
             continue
+    # All candidates exhausted. Surface the dead-end (debug-only) so users
+    # debugging silent vision routing failures can see which models were tried.
+    if os.environ.get("EVE_CLI_DEBUG") and tried:
+        try:
+            sys.stderr.write(
+                f"  {C.DIM}[debug] vision routing: no candidate supports vision "
+                f"(tried: {', '.join(tried[:5])}){C.RESET}\n"
+            )
+        except Exception:
+            pass
     return ""
 
 

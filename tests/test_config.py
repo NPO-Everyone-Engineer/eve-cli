@@ -1487,6 +1487,32 @@ class TestModelRoleResolution(unittest.TestCase):
         }.get(model, False if not assume_if_unknown else True)
         self.assertEqual(eve_coder._pick_vision_route_model(cfg, client), "kimi-k2.6:cloud")
 
+    def test_pick_vision_route_model_no_match_returns_empty(self):
+        # Every candidate reports no vision support → return "" so the call site
+        # falls back to its existing user-facing warning instead of forcing an
+        # invalid model.
+        cfg = Config()
+        cfg.model = "glm-5.1:cloud"
+        cfg.vision_model = "some-non-vision-model"
+        cfg.sidecar_model = ""
+        client = MagicMock()
+        client.check_vision_support.side_effect = lambda model, assume_if_unknown=True: False
+        self.assertEqual(eve_coder._pick_vision_route_model(cfg, client), "")
+
+    def test_pick_vision_route_model_emits_debug_log_when_exhausted(self):
+        cfg = Config()
+        cfg.model = "glm-5.1:cloud"
+        cfg.vision_model = "some-non-vision-model"
+        cfg.sidecar_model = ""
+        client = MagicMock()
+        client.check_vision_support.side_effect = lambda model, assume_if_unknown=True: False
+        captured = io.StringIO()
+        with patch.dict(os.environ, {"EVE_CLI_DEBUG": "1"}), patch("sys.stderr", captured):
+            result = eve_coder._pick_vision_route_model(cfg, client)
+        self.assertEqual(result, "")
+        self.assertIn("vision routing", captured.getvalue())
+        self.assertIn("some-non-vision-model", captured.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -492,5 +492,95 @@ class TestPermissionMgrGuardian(unittest.TestCase):
         self.assertEqual(prompted_modes, ["auto-run"])
 
 
+class _ScriptedSidecarClient:
+    """Sidecar client stub that returns successive scripted chat() responses."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    def chat(self, *, model, messages, tools, stream, options):
+        self.calls += 1
+        nxt = self._responses.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+    def build_utility_options(self, model, role, temperature):
+        return {"temperature": temperature, "max_tokens": 64}
+
+
+class TestSidecarClassifierRetry(unittest.TestCase):
+    """Sidecar classifier should validate verdicts and retry once on transient failure."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        cfg = _make_config(self.tmpdir, auto_mode=True)
+        self.mgr = PermissionMgr(cfg)
+        self.mgr._sidecar_model = "sidecar"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    @staticmethod
+    def _resp(text):
+        return {"choices": [{"message": {"content": text}}]}
+
+    def test_clean_low_verdict_returns_low(self):
+        self.mgr._sidecar_client = _ScriptedSidecarClient([self._resp("LOW\nread-only")])
+        risk = self.mgr._classify_with_sidecar("Read", {"file_path": "/tmp/x"})
+        self.assertIsNotNone(risk)
+        self.assertEqual(risk["level"], "low")
+        self.assertEqual(self.mgr._sidecar_client.calls, 1)
+
+    def test_exception_then_success_uses_retry(self):
+        self.mgr._sidecar_client = _ScriptedSidecarClient([
+            RuntimeError("transient network error"),
+            self._resp("HIGH\ndelete repo"),
+        ])
+        risk = self.mgr._classify_with_sidecar("Bash", {"command": "rm -rf ~"})
+        self.assertIsNotNone(risk)
+        self.assertEqual(risk["level"], "high")
+        self.assertEqual(self.mgr._sidecar_client.calls, 2)
+
+    def test_two_exceptions_returns_none(self):
+        self.mgr._sidecar_client = _ScriptedSidecarClient([
+            RuntimeError("err 1"),
+            RuntimeError("err 2"),
+        ])
+        risk = self.mgr._classify_with_sidecar("Bash", {"command": "ls"})
+        self.assertIsNone(risk)
+        self.assertEqual(self.mgr._sidecar_client.calls, 2)
+
+    def test_ambiguous_then_clean_uses_retry(self):
+        self.mgr._sidecar_client = _ScriptedSidecarClient([
+            self._resp("LOW or HIGH\nunclear"),
+            self._resp("MEDIUM\nfile edit"),
+        ])
+        risk = self.mgr._classify_with_sidecar("Edit", {"file_path": "x.py"})
+        self.assertIsNotNone(risk)
+        self.assertEqual(risk["level"], "medium")
+        self.assertEqual(self.mgr._sidecar_client.calls, 2)
+
+    def test_two_ambiguous_returns_none(self):
+        self.mgr._sidecar_client = _ScriptedSidecarClient([
+            self._resp("MAYBE\nnot sure"),
+            self._resp("LOW or HIGH\nunclear"),
+        ])
+        risk = self.mgr._classify_with_sidecar("Bash", {"command": "ls"})
+        self.assertIsNone(risk)
+        self.assertEqual(self.mgr._sidecar_client.calls, 2)
+
+    def test_empty_content_then_success_uses_retry(self):
+        self.mgr._sidecar_client = _ScriptedSidecarClient([
+            self._resp(""),
+            self._resp("LOW\nclean"),
+        ])
+        risk = self.mgr._classify_with_sidecar("Read", {"file_path": "x"})
+        self.assertIsNotNone(risk)
+        self.assertEqual(risk["level"], "low")
+        self.assertEqual(self.mgr._sidecar_client.calls, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

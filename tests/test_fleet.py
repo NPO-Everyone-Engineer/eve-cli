@@ -87,6 +87,91 @@ class TestTranslateBlockedByIndices(unittest.TestCase):
         self.assertEqual(out[1]["blockedBy_ids"], ["1"])
 
 
+class TestDetectCycles(unittest.TestCase):
+    """Cycle detection on the 1-indexed parsed decompose payload."""
+
+    def test_empty_input(self):
+        self.assertFalse(FleetOrchestrator._detect_cycles([]))
+
+    def test_single_task_no_self_cycle(self):
+        # self-references are dropped by the translator and don't count as cycles
+        self.assertFalse(FleetOrchestrator._detect_cycles([
+            {"subject": "a", "blockedBy": [1]},
+        ]))
+
+    def test_linear_chain_no_cycle(self):
+        # 1 ← 2 ← 3 (each blocks the next)
+        self.assertFalse(FleetOrchestrator._detect_cycles([
+            {"subject": "a", "blockedBy": []},
+            {"subject": "b", "blockedBy": [1]},
+            {"subject": "c", "blockedBy": [2]},
+        ]))
+
+    def test_diamond_no_cycle(self):
+        # 1 ← {2,3} ← 4
+        self.assertFalse(FleetOrchestrator._detect_cycles([
+            {"subject": "a", "blockedBy": []},
+            {"subject": "b", "blockedBy": [1]},
+            {"subject": "c", "blockedBy": [1]},
+            {"subject": "d", "blockedBy": [2, 3]},
+        ]))
+
+    def test_two_node_cycle(self):
+        # 1 ← 2, 2 ← 1
+        self.assertTrue(FleetOrchestrator._detect_cycles([
+            {"subject": "a", "blockedBy": [2]},
+            {"subject": "b", "blockedBy": [1]},
+        ]))
+
+    def test_three_node_cycle(self):
+        # 1 ← 2 ← 3 ← 1
+        self.assertTrue(FleetOrchestrator._detect_cycles([
+            {"subject": "a", "blockedBy": [3]},
+            {"subject": "b", "blockedBy": [1]},
+            {"subject": "c", "blockedBy": [2]},
+        ]))
+
+    def test_cycle_among_subset(self):
+        # tasks 2,3,4 form a cycle while task 1 is independent
+        self.assertTrue(FleetOrchestrator._detect_cycles([
+            {"subject": "a", "blockedBy": []},
+            {"subject": "b", "blockedBy": [4]},
+            {"subject": "c", "blockedBy": [2]},
+            {"subject": "d", "blockedBy": [3]},
+        ]))
+
+    def test_out_of_range_indices_ignored(self):
+        # 99 is out-of-range and never forms an edge, so no cycle even though
+        # task 1 references itself indirectly via a non-existent node
+        self.assertFalse(FleetOrchestrator._detect_cycles([
+            {"subject": "a", "blockedBy": [99]},
+            {"subject": "b", "blockedBy": [1]},
+        ]))
+
+
+class TestDecomposeRejectsCycles(unittest.TestCase):
+    """_decompose() should bail with an error message when the parsed graph cycles."""
+
+    def setUp(self):
+        self.config = SimpleNamespace(model="test-model:cloud", cwd="/tmp/fake_cwd")
+
+    def test_decompose_rejects_cyclic_payload(self):
+        cyclic_payload = json.dumps([
+            {"subject": "a", "description": "do a", "blockedBy": [2]},
+            {"subject": "b", "description": "do b", "blockedBy": [1]},
+        ])
+
+        class _ClientReturningCycle:
+            def chat_sync(self, model, messages, tools=None):
+                return {"content": cyclic_payload}
+
+        fleet = FleetOrchestrator(self.config, _ClientReturningCycle(), registry=None, permissions=None)
+        tasks, error = fleet._decompose("goal", num_teammates=2)
+        self.assertEqual(tasks, [])
+        self.assertIsNotNone(error)
+        self.assertIn("cyclic", error.lower())
+
+
 class _FakeClient:
     """Captures chat_sync calls and returns canned responses by call order."""
 
