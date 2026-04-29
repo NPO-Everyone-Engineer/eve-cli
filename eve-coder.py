@@ -315,7 +315,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.41.1"
+__version__ = "2.41.2"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1238,6 +1238,9 @@ class Config:
         self.resume = False
         self.continue_latest = False  # --continue: resume most recent without picker
         self.no_resume_picker = False  # --no-picker: bypass interactive picker on --resume
+        # MCP server mode (Security Finding #1): explicit allowlist + permission routing
+        self.mcp_server_allow_tools = []  # --mcp-server-allow: extra tools to expose
+        self.mcp_server_yes = False       # --mcp-server-yes: bypass PermissionMgr in MCP mode
         self.session_id = None
         self.list_sessions = False
         self.cwd = os.getcwd()
@@ -1769,6 +1772,15 @@ class Config:
         # MCP server mode
         parser.add_argument("--mcp-server", action="store_true", default=False,
                             help="Run as MCP server (JSON-RPC 2.0 over stdio)")
+        parser.add_argument("--mcp-server-allow", default="",
+                            help=("Comma-separated tools to expose in MCP mode beyond the safe "
+                                  "defaults (Read, Glob, Grep, Chat). Allowed: "
+                                  "Bash, Write, Edit, ApplyPatch, MultiEdit, NotebookEdit, "
+                                  "WebFetch, WebSearch."))
+        parser.add_argument("--mcp-server-yes", action="store_true", default=False,
+                            help=("Bypass PermissionMgr in MCP mode (legacy behaviour). Use only "
+                                  "when the connecting MCP client is fully trusted to enforce "
+                                  "permissions itself."))
         args = parser.parse_args(argv)
 
         if args.prompt:
@@ -1938,6 +1950,12 @@ class Config:
         # MCP server mode
         if args.mcp_server:
             self.mcp_server = True
+        if getattr(args, "mcp_server_allow", ""):
+            self.mcp_server_allow_tools = [
+                tok.strip() for tok in str(args.mcp_server_allow).split(",") if tok.strip()
+            ]
+        if getattr(args, "mcp_server_yes", False):
+            self.mcp_server_yes = True
 
     def _load_output_schema(self, schema_arg):
         """Load output schema from inline JSON string or file path."""
@@ -10521,19 +10539,65 @@ class _MCPChatTool:
 
 
 class MCPServer:
-    """Run eve-coder as an MCP server, exposing built-in tools over JSON-RPC 2.0 stdio."""
+    """Run eve-coder as an MCP server, exposing built-in tools over JSON-RPC 2.0 stdio.
 
-    EXPOSED_TOOLS = frozenset({
-        "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Chat",
+    Security model (Security Finding #1, P2-equivalent):
+    - DEFAULT_SAFE_TOOLS: read-only tools always exposed (Read, Glob, Grep, Chat)
+    - DANGEROUS_TOOLS: write/network tools require explicit opt-in via
+      ``--mcp-server-allow`` (e.g. ``--mcp-server-allow Bash,Write``)
+    - Tool execution always routes through PermissionMgr and HookManager unless
+      ``--mcp-server-yes`` is set, mirroring the interactive permission flow.
+      Without ``--mcp-server-yes`` the underlying PermissionMgr falls back to its
+      configured rules (permissions.json). This means MCP-mode operators can
+      pre-author allow/deny rules per tool and still benefit from PreToolUse /
+      PostToolUse hooks for audit.
+    """
+
+    # Read-only tools that are safe to expose by default.
+    DEFAULT_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep", "Chat"})
+    # Tools that require explicit opt-in via --mcp-server-allow.
+    DANGEROUS_TOOLS = frozenset({
+        "Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit",
+        "WebFetch", "WebSearch",
     })
+    # Hard cap: anything outside this set is never exposed even with --mcp-server-allow.
+    KNOWN_TOOLS = DEFAULT_SAFE_TOOLS | DANGEROUS_TOOLS
 
-    def __init__(self, config, client=None):
+    def __init__(self, config, client=None, permissions=None, hook_mgr=None):
         self.config = config
         self.registry = ToolRegistry()
         self.registry.register_defaults()
         # Register Chat tool if Ollama client is available
         if client:
             self.registry.register(_MCPChatTool(config, client))
+        self.permissions = permissions
+        self.hook_mgr = hook_mgr
+        self.exposed_tools = self._compute_exposed_tools()
+
+    def _compute_exposed_tools(self):
+        """Resolve the effective exposed-tool set from config flags.
+
+        Always includes DEFAULT_SAFE_TOOLS. Additional tools listed in
+        ``config.mcp_server_allow_tools`` are added as long as they are in
+        KNOWN_TOOLS. Unknown / typoed names are dropped silently to avoid
+        a misleading "tool not exposed" error later.
+        """
+        exposed = set(self.DEFAULT_SAFE_TOOLS)
+        extra = list(getattr(self.config, "mcp_server_allow_tools", []) or [])
+        for name in extra:
+            if not isinstance(name, str):
+                continue
+            n = name.strip()
+            if not n:
+                continue
+            if n in self.KNOWN_TOOLS:
+                exposed.add(n)
+        return frozenset(exposed)
+
+    @property
+    def EXPOSED_TOOLS(self):
+        # Backward-compat alias for any external code reading the constant.
+        return self.exposed_tools
 
     def run(self):
         """Main event loop: read JSON-RPC requests from stdin, write responses to stdout."""
@@ -10597,16 +10661,60 @@ class MCPServer:
         self._send_response(req_id, {"tools": tools})
 
     def _handle_tools_call(self, req_id, params):
-        """Execute a tool and return the result."""
+        """Execute a tool and return the result.
+
+        Routes through PreToolUse hook + PermissionMgr (unless --mcp-server-yes
+        is set) and fires PostToolUse on completion. This makes MCP-mode tool
+        invocations subject to the same permission rules and audit hooks as
+        interactive use.
+        """
         tool_name = params.get("name", "")
-        arguments = params.get("arguments", {})
-        if tool_name not in self.EXPOSED_TOOLS:
-            self._send_error(req_id, -32602, f"Tool not exposed: {tool_name}")
+        arguments = params.get("arguments", {}) or {}
+        if tool_name not in self.exposed_tools:
+            self._send_error(req_id, -32602, (
+                f"Tool not exposed: {tool_name}. Default exposed: "
+                f"{sorted(self.DEFAULT_SAFE_TOOLS)}. Use --mcp-server-allow to "
+                "explicitly opt-in additional tools."
+            ))
             return
         tool = self.registry.get(tool_name)
         if not tool:
             self._send_error(req_id, -32602, f"Tool not found: {tool_name}")
             return
+
+        # 1) PreToolUse hook (deny capable)
+        if self.hook_mgr is not None and self.hook_mgr.has_hooks:
+            try:
+                if self.hook_mgr.fire_pre_tool(tool_name, arguments) == "deny":
+                    self._send_response(req_id, {
+                        "content": [{"type": "text",
+                                     "text": f"Blocked by PreToolUse hook: {tool_name}"}],
+                        "isError": True,
+                    })
+                    return
+            except Exception:
+                pass  # Don't let a buggy hook crash the server
+
+        # 2) PermissionMgr check (skipped only when explicit yes-mode is set)
+        if self.permissions is not None and not getattr(self.config, "mcp_server_yes", False):
+            try:
+                allowed = self.permissions.check(tool_name, arguments, tui=None)
+            except Exception:
+                allowed = False
+            if not allowed:
+                reason = ""
+                try:
+                    reason = self.permissions.describe_last_decision() or ""
+                except Exception:
+                    pass
+                self._send_response(req_id, {
+                    "content": [{"type": "text",
+                                 "text": f"Permission denied for {tool_name}: {reason}"}],
+                    "isError": True,
+                })
+                return
+
+        # 3) Execute
         try:
             result = tool.execute(arguments)
             result_text = str(result) if result is not None else ""
@@ -10614,15 +10722,23 @@ class MCPServer:
             if isinstance(result, ToolResult):
                 result_text = result.output
                 is_error = result.is_error
-            self._send_response(req_id, {
-                "content": [{"type": "text", "text": result_text}],
-                "isError": is_error,
-            })
+            elif isinstance(result, str):
+                is_error = result.startswith("Error:") or result.startswith("Error -")
         except Exception as e:
-            self._send_response(req_id, {
-                "content": [{"type": "text", "text": f"Tool execution error: {e}"}],
-                "isError": True,
-            })
+            result_text = f"Tool execution error: {e}"
+            is_error = True
+
+        # 4) PostToolUse hook (audit)
+        if self.hook_mgr is not None and self.hook_mgr.has_hooks:
+            try:
+                self.hook_mgr.fire_post_tool(tool_name, result_text, is_error)
+            except Exception:
+                pass
+
+        self._send_response(req_id, {
+            "content": [{"type": "text", "text": result_text}],
+            "isError": is_error,
+        })
 
     def _send_response(self, req_id, result):
         """Write a JSON-RPC success response."""
@@ -10642,8 +10758,15 @@ class MCPServer:
 
 
 def _run_mcp_server(config):
-    """Entry point for MCP server mode."""
-    config.yes_mode = True  # In server mode, the MCP client manages permissions
+    """Entry point for MCP server mode.
+
+    Constructs PermissionMgr and HookManager so MCP tool calls go through the
+    same audit / permission gates as interactive mode. ``--mcp-server-yes``
+    explicitly bypasses PermissionMgr (legacy behavior, opt-in).
+    """
+    if getattr(config, "mcp_server_yes", False):
+        # Legacy behavior: trust the MCP client to enforce permissions.
+        config.yes_mode = True
     # Try to create OllamaClient for Chat tool support
     client = None
     if config.model:
@@ -10651,7 +10774,9 @@ def _run_mcp_server(config):
             client = OllamaClient(config)
         except Exception:
             pass  # Chat tool won't be available
-    server = MCPServer(config, client=client)
+    permissions = PermissionMgr(config)
+    hook_mgr = HookManager(config)
+    server = MCPServer(config, client=client, permissions=permissions, hook_mgr=hook_mgr)
     try:
         server.run()
     except (KeyboardInterrupt, EOFError):

@@ -273,6 +273,60 @@ HOOK_ENV_SET=TEAM=backend
 
 ---
 
+## MCP サーバーモード
+
+EvE CLI を **MCP サーバー** として起動し、他の AI クライアント（Claude Desktop、Cursor 等）から内蔵ツールを呼ばせることができます。
+
+```bash
+eve-cli --mcp-server
+```
+
+### 既定で公開されるツール（読み取り専用）
+
+| ツール | 用途 |
+|---|---|
+| `Read` | ファイル読み取り |
+| `Glob` | パターンによるファイル検索 |
+| `Grep` | テキスト検索 |
+| `Chat` | LLM との対話（Ollama 接続時のみ） |
+
+`Bash` / `Write` / `Edit` / `WebFetch` などの**書き込み・任意実行系は既定では公開されません**（Security Finding #1 対策）。
+
+### 危険ツールを公開するには
+
+明示的にオプトインが必要です:
+
+```bash
+# Bash と Write を追加で公開
+eve-cli --mcp-server --mcp-server-allow Bash,Write
+
+# 全部許可したいケース（Edit など）
+eve-cli --mcp-server --mcp-server-allow Bash,Write,Edit,MultiEdit,WebFetch
+```
+
+### 認可フロー
+
+MCP サーバーモードでも、ツール実行は通常モードと同じ経路を通ります:
+
+1. **PreToolUse hook** が deny → ブロック
+2. **PermissionMgr** ルール（`permissions.json` の `tools`/`categories`/`paths`/`allowed_urls`）で deny → ブロック
+3. ツール実行
+4. **PostToolUse hook** で監査
+
+PermissionMgr のプロンプトは MCP モードでは表示できないため、`permissions.json` で **事前に rule を書いておく**運用になります。
+
+### `--mcp-server-yes`（互換用、非推奨）
+
+PermissionMgr を完全にバイパスして全許可します。これは旧来の挙動で、**接続する MCP クライアントを完全に信頼できる場合のみ**使用してください:
+
+```bash
+eve-cli --mcp-server --mcp-server-allow Bash --mcp-server-yes
+```
+
+PreToolUse / PostToolUse hooks は `--mcp-server-yes` 下でも依然として発火します（監査目的）。
+
+---
+
 ## Skills（カスタムスキル）
 
 特定のタスクに特化した AI への指示セットを再利用可能な形で定義できます。
