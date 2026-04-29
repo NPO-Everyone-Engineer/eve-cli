@@ -1129,6 +1129,14 @@ class InputMonitor:
                     break
                 # Ignore all other bytes. Reading ahead here breaks IME and paste.
 
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop()
+        return False
+
     def stop(self):
         """Stop monitoring and restore terminal settings."""
         self._stop_event.set()
@@ -21928,747 +21936,745 @@ class Agent:
         # Check if scroll region is already active (managed by main loop)
         _scroll_mode = self.tui.scroll_region._active
 
-        # ESC key monitor for real-time interrupt
-        _esc_monitor = InputMonitor()
-        _esc_monitor.start()
+        # ESC key monitor for real-time interrupt (context manager ensures cleanup)
+        with InputMonitor() as _esc_monitor:
 
-        for iteration in range(self.max_iterations):
-            if iteration > 0:
-                self._route_prefilter_names = None
-            if self._interrupted.is_set() or _esc_monitor.pressed:
-                if _esc_monitor.pressed:
-                    _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
-                    self._interrupted.set()
-                self._set_stop_reason("interrupted", "user interrupt")
-                break
-
-            # Auto-compact if context is getting full
-            if iteration > 0 and iteration % 5 == 0:
-                _before_tokens = self.session.get_token_estimate()
-                _threshold_pct = int(self.session.context_policy_for(self.config)["compact_threshold"] * 100)
-                _can_compact = True
-                if self.hook_mgr and self.hook_mgr.has_hooks:
-                    _usage_pct_now = int((_before_tokens / self.config.context_window) * 100)
-                    if _usage_pct_now >= _threshold_pct:
-                        _decision = self.hook_mgr.fire_pre_compact(_before_tokens, _threshold_pct)
-                        if _decision == "deny":
-                            _can_compact = False
-                            _p(f"\n  {C.DIM}[PreCompact hook denied auto-compaction]{C.RESET}")
-                if _can_compact and self.session.auto_compact(self.client, self.config):
-                    _after_tokens = self.session.get_token_estimate()
-                    _p(
-                        f"\n  {C.DIM}[auto-compacted at >{_threshold_pct}% full: "
-                        f"~{_before_tokens:,} → ~{_after_tokens:,} tokens]{C.RESET}"
-                    )
-
-            text = ""
-            try:
-                # 0. Inject file watcher changes (if any)
-                if self.file_watcher.enabled and iteration == 0:
-                    fw_changes = self.file_watcher.get_pending_changes()
-                    if fw_changes:
-                        fw_msg = self.file_watcher.format_changes(fw_changes)
-                        self.session.add_system_note(fw_msg)
-                        _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}👁 {len(fw_changes)} file change(s) detected{C.RESET}")
-
-                # 1. Call Ollama (with retry for malformed responses)
-                tools = self._get_tool_schemas()
-                request_policy = self._resolve_request_policy(tools, _empty_retries)
-                if self.tui.scroll_region._active:
-                    self.tui.scroll_region.update_mode_display(f"Model: {request_policy['model']}")
-                route_notice = ""
-                if request_policy.get("vision_route") and request_policy["model"] != self.config.model:
-                    route_notice = request_policy["model"]
-                    if route_notice != self._last_route_notice:
-                        _p(f"  {C.DIM}[vision route: {self.config.model} → {request_policy['model']}]{C.RESET}")
-                self._last_route_notice = route_notice
-                _esc_hint = " — ESC: 中断" if HAS_TERMIOS else ""
-                # P2: フッターにツール呼び出し数を渡す
-                self.tui._current_iteration = iteration
-                self.tui._max_iterations = self.max_iterations
-                if iteration == 0:
-                    self.tui.start_spinner(("Planning" if self._plan_mode else "Thinking") + _esc_hint)
-                else:
-                    elapsed = int(time.time() - _start_time)
-                    self.tui.start_spinner(
-                        f"{'Planning' if self._plan_mode else 'Thinking'} (step {iteration+1}, {elapsed}s){_esc_hint}"
-                    )
-
-                response = None
-                last_error = None
-                for retry in range(self.MAX_RETRIES + 1):
-                    _prev_think_mode = self.client.think_mode
-                    _prev_thinking_budget = self.client.thinking_budget
-                    try:
-                        self.client.think_mode = request_policy["reasoning"]["think_mode"]
-                        self.client.thinking_budget = request_policy["reasoning"]["thinking_budget"]
-                        response = self.client.chat(
-                            model=request_policy["model"],
-                            messages=self.session.get_messages(),
-                            tools=request_policy["tools"],
-                            stream=True,  # always try streaming (text + tool calls)
-                            options=request_policy["options"],
-                        )
-                        break
-                    except (RuntimeError, urllib.error.URLError) as e:
-                        last_error = e
-                        if retry < self.MAX_RETRIES:
-                            if self.config.debug:
-                                print(f"{C.DIM}[debug] Retry {retry+1}/{self.MAX_RETRIES}: {e}{C.RESET}", file=sys.stderr)
-                            time.sleep(1 + retry)  # increasing backoff
-                            continue
-                        raise
-                    finally:
-                        self.client.think_mode = _prev_think_mode
-                        self.client.thinking_budget = _prev_thinking_budget
-
-                self.tui.stop_spinner()
-
-                if response is None:
-                    _p(f"\n{C.RED}AI が応答しませんでした。読み込み中か、メモリ不足の可能性があります。(The AI didn't respond - it may still be loading or ran out of memory){C.RESET}")
-                    _p(f"{C.DIM}Try again, or restart Ollama if this keeps happening.{C.RESET}")
-                    break
-
-                # 2. Parse response
-                if isinstance(response, dict):
-                    # Sync response (tool use mode)
-                    _had_thinking = False
-                    text, tool_calls, _had_thinking = self.tui.show_sync_response(
-                        response, known_tools=self.registry.names()
-                    )
-                else:
-                    # Streaming response — ensure generator is closed on exit
-                    _had_thinking = False
-                    try:
-                        text, tool_calls, _had_thinking = self.tui.stream_response(
-                            response,
-                            known_tools=self.registry.names(),
-                            interrupt_monitor=_esc_monitor,
-                        )
-                    finally:
-                        if hasattr(response, 'close'):
-                            response.close()
-
-                # Reconcile token estimate with actual usage from API
-                # Skip reconciliation right after compaction to avoid drift
-                if isinstance(response, dict) and not self.session._just_compacted:
-                    usage = response.get("usage", {})
-                    if usage.get("prompt_tokens", 0) > 0:
-                        self.session._token_estimate = (
-                            usage["prompt_tokens"] + usage.get("completion_tokens", 0)
-                        )
-                    # Show per-turn token usage (subtle, always visible)
-                    prompt_t = usage.get("prompt_tokens", 0)
-                    completion_t = usage.get("completion_tokens", 0)
-                    if prompt_t or completion_t:
-                        pct = min(int(((prompt_t + completion_t) / self.config.context_window) * 100), 100)
-                        _p(f"  {_ansi(chr(27)+'[38;5;240m')}tokens: {prompt_t}→{completion_t} "
-                           f"({pct}% ctx){C.RESET}")
-                        if self._evolution:
-                            self._evolution.record_usage(
-                                request_policy["model"],
-                                prompt_t,
-                                completion_t,
-                                self.config.prompt_cost_per_mtok,
-                                self.config.completion_cost_per_mtok,
-                            )
-                        if self.output_collector:
-                            self.output_collector.record_usage(prompt_t, completion_t)
-                self.session._just_compacted = False
-
-                # Handle empty response from local LLM (smart retry cascade)
-                if not text and not tool_calls and iteration < self.max_iterations - 1:
-                    _empty_retries += 1
-                    # Step 0: Thinking-only nudge
-                    if _had_thinking and _empty_retries <= 2:
-                        self.session.add_user_message(
-                            "[SYSTEM] Your thinking completed but you produced no visible output. "
-                            "Please provide your response or call a tool now."
-                        )
-                        if self.config.debug:
-                            print(f"{C.DIM}[debug] Thinking-only response — nudging model{C.RESET}", file=sys.stderr)
-                        continue
-                    # Step 1: Auto-compact if context is >70% full
-                    if _empty_retries == 1:
-                        _usage_pct = self.session.get_token_estimate() / max(self.config.context_window, 1)
-                        if _usage_pct > 0.70:
-                            _p(f"  {C.DIM}[auto-compact: context was {int(_usage_pct*100)}% full]{C.RESET}")
-                            self.session.compact_if_needed(force=True)
-                            continue
-                    # Step 2: Retry with slightly higher temperature
-                    if _empty_retries == 2:
-                        _retry_temp = self.client._resolve_request_temperature(
-                            request_policy["model"],
-                            tools=bool(tools),
-                            options={"retry_temperature_boost": 0.3},
-                        )
-                        _p(f"  {C.DIM}[retry with temperature {_retry_temp:.1f}]{C.RESET}")
-                        time.sleep(0.5)
-                        continue
-                    # Step 3: Give up with actionable suggestions
-                    if _empty_retries > 2:
-                        _p(f"\n{C.YELLOW}AI から空のレスポンスが返されました（3回リトライ後も失敗）{C.RESET}")
-                        _p(f"{C.DIM}対処法:{C.RESET}")
-                        _p(f"{C.DIM}  1. /compact — コンテキストを圧縮{C.RESET}")
-                        _p(f"{C.DIM}  2. /model <name> — 別モデルに切替{C.RESET}")
-                        _p(f"{C.DIM}  3. リクエストを簡潔に書き直す{C.RESET}")
-                        break
-                    time.sleep(_empty_retries * 0.5)
-                    continue
-
-                # 3. Add to history
-                self.session.add_assistant_message(text, tool_calls if tool_calls else None)
-
-                # Store last assistant output for loop mode completion detection
-                self._last_output = text
-
-                # Headless output collector: record assistant text
-                if self.output_collector and text:
-                    self.output_collector.assistant_text(text)
-
-                # Learn mode: add explanations after code or errors
-                if self.config.learn_mode and self.config.learn_auto_explain:
-                    # Check if response contains code blocks
-                    has_code = '```' in text
-                    has_error = any(err in text.lower() for err in ['error:', 'error -', 'exception', 'failed'])
-                    if has_code or has_error:
-                        self._add_learn_explanation(text, has_code, has_error)
-
-                # 4. If no tool calls, we're done
-                if not tool_calls:
-                    if self._pending_verification and iteration < self.max_iterations - 1:
-                        if self._last_rubber_duck_review_generation < self._modification_generation:
-                            diff, desc = _get_review_diff(self.config.cwd)
-                            if diff:
-                                if self._maybe_run_rubber_duck_review(
-                                    "post_edit",
-                                    "diff",
-                                    desc,
-                                    diff,
-                                ):
-                                    continue
-                        if self._verification_reminders < 2:
-                            self._verification_reminders += 1
-                            self._update_runtime_phase(
-                                "verification_required",
-                                resume_hint="run syntax check or tests before finishing",
-                                verification_required=True,
-                                pending_verification=self._relativize_paths(self._modified_file_paths),
-                            )
-                            self.session.add_system_note(
-                                "You modified files in this run but have not run a verification step yet. "
-                                "Before finishing, run ONE of: syntax check "
-                                "(python3 -c 'import py_compile; py_compile.compile(..., cfile=..., doraise=True)'), "
-                                "test suite (pytest / unittest), linter (ruff / flake8), or build command. "
-                                "If no test framework is installed, a syntax check is sufficient."
-                            )
-                            continue
-                        self._set_stop_reason(
-                            "verification_required",
-                            "model stopped before running verification",
-                        )
-                        self._route_prefilter_names = None
-                        break
-                    self._set_stop_reason("assistant_final", "model returned final text without tool calls")
+            for iteration in range(self.max_iterations):
+                if iteration > 0:
                     self._route_prefilter_names = None
+                if self._interrupted.is_set() or _esc_monitor.pressed:
+                    if _esc_monitor.pressed:
+                        _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
+                        self._interrupted.set()
+                    self._set_stop_reason("interrupted", "user interrupt")
                     break
 
-                # 5. Detect infinite tool call loops
-                def _norm_args(raw):
-                    """Normalize JSON args so whitespace/key-order variations don't evade loop detection."""
-                    try:
-                        return json.dumps(json.loads(raw), sort_keys=True) if isinstance(raw, str) else str(raw)
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        return str(raw)
-                current_calls = [(tc.get("function", {}).get("name", ""),
-                                  _norm_args(tc.get("function", {}).get("arguments", "")))
-                                 for tc in tool_calls]
-                _recent_tool_calls.append(current_calls)
-                if len(_recent_tool_calls) >= self.MAX_SAME_TOOL_REPEAT:
-                    recent = _recent_tool_calls[-self.MAX_SAME_TOOL_REPEAT:]
-                    if all(r == recent[0] for r in recent):
-                        if not _loop_warned:
-                            # First detection: inject warning into conversation so LLM can self-correct
-                            _loop_warned = True
-                            _loop_tool_name = current_calls[0][0] if current_calls else "unknown"
-                            _warn_text = (
-                                f"[SYSTEM WARNING] You have called '{_loop_tool_name}' with the same "
-                                f"arguments {self.MAX_SAME_TOOL_REPEAT} times in a row. "
-                                "This looks like an infinite loop. Please stop repeating the same call, "
-                                "re-evaluate your approach, and either try a different tool/argument or "
-                                "report your findings to the user."
+                # Auto-compact if context is getting full
+                if iteration > 0 and iteration % 5 == 0:
+                    _before_tokens = self.session.get_token_estimate()
+                    _threshold_pct = int(self.session.context_policy_for(self.config)["compact_threshold"] * 100)
+                    _can_compact = True
+                    if self.hook_mgr and self.hook_mgr.has_hooks:
+                        _usage_pct_now = int((_before_tokens / self.config.context_window) * 100)
+                        if _usage_pct_now >= _threshold_pct:
+                            _decision = self.hook_mgr.fire_pre_compact(_before_tokens, _threshold_pct)
+                            if _decision == "deny":
+                                _can_compact = False
+                                _p(f"\n  {C.DIM}[PreCompact hook denied auto-compaction]{C.RESET}")
+                    if _can_compact and self.session.auto_compact(self.client, self.config):
+                        _after_tokens = self.session.get_token_estimate()
+                        _p(
+                            f"\n  {C.DIM}[auto-compacted at >{_threshold_pct}% full: "
+                            f"~{_before_tokens:,} → ~{_after_tokens:,} tokens]{C.RESET}"
+                        )
+
+                text = ""
+                try:
+                    # 0. Inject file watcher changes (if any)
+                    if self.file_watcher.enabled and iteration == 0:
+                        fw_changes = self.file_watcher.get_pending_changes()
+                        if fw_changes:
+                            fw_msg = self.file_watcher.format_changes(fw_changes)
+                            self.session.add_system_note(fw_msg)
+                            _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}👁 {len(fw_changes)} file change(s) detected{C.RESET}")
+
+                    # 1. Call Ollama (with retry for malformed responses)
+                    tools = self._get_tool_schemas()
+                    request_policy = self._resolve_request_policy(tools, _empty_retries)
+                    if self.tui.scroll_region._active:
+                        self.tui.scroll_region.update_mode_display(f"Model: {request_policy['model']}")
+                    route_notice = ""
+                    if request_policy.get("vision_route") and request_policy["model"] != self.config.model:
+                        route_notice = request_policy["model"]
+                        if route_notice != self._last_route_notice:
+                            _p(f"  {C.DIM}[vision route: {self.config.model} → {request_policy['model']}]{C.RESET}")
+                    self._last_route_notice = route_notice
+                    _esc_hint = " — ESC: 中断" if HAS_TERMIOS else ""
+                    # P2: フッターにツール呼び出し数を渡す
+                    self.tui._current_iteration = iteration
+                    self.tui._max_iterations = self.max_iterations
+                    if iteration == 0:
+                        self.tui.start_spinner(("Planning" if self._plan_mode else "Thinking") + _esc_hint)
+                    else:
+                        elapsed = int(time.time() - _start_time)
+                        self.tui.start_spinner(
+                            f"{'Planning' if self._plan_mode else 'Thinking'} (step {iteration+1}, {elapsed}s){_esc_hint}"
+                        )
+
+                    response = None
+                    last_error = None
+                    for retry in range(self.MAX_RETRIES + 1):
+                        _prev_think_mode = self.client.think_mode
+                        _prev_thinking_budget = self.client.thinking_budget
+                        try:
+                            self.client.think_mode = request_policy["reasoning"]["think_mode"]
+                            self.client.thinking_budget = request_policy["reasoning"]["thinking_budget"]
+                            response = self.client.chat(
+                                model=request_policy["model"],
+                                messages=self.session.get_messages(),
+                                tools=request_policy["tools"],
+                                stream=True,  # always try streaming (text + tool calls)
+                                options=request_policy["options"],
                             )
-                            self.session.add_user_message(_warn_text)
-                            _recent_tool_calls.clear()
+                            break
+                        except (RuntimeError, urllib.error.URLError) as e:
+                            last_error = e
+                            if retry < self.MAX_RETRIES:
+                                if self.config.debug:
+                                    print(f"{C.DIM}[debug] Retry {retry+1}/{self.MAX_RETRIES}: {e}{C.RESET}", file=sys.stderr)
+                                time.sleep(1 + retry)  # increasing backoff
+                                continue
+                            raise
+                        finally:
+                            self.client.think_mode = _prev_think_mode
+                            self.client.thinking_budget = _prev_thinking_budget
+
+                    self.tui.stop_spinner()
+
+                    if response is None:
+                        _p(f"\n{C.RED}AI が応答しませんでした。読み込み中か、メモリ不足の可能性があります。(The AI didn't respond - it may still be loading or ran out of memory){C.RESET}")
+                        _p(f"{C.DIM}Try again, or restart Ollama if this keeps happening.{C.RESET}")
+                        break
+
+                    # 2. Parse response
+                    if isinstance(response, dict):
+                        # Sync response (tool use mode)
+                        _had_thinking = False
+                        text, tool_calls, _had_thinking = self.tui.show_sync_response(
+                            response, known_tools=self.registry.names()
+                        )
+                    else:
+                        # Streaming response — ensure generator is closed on exit
+                        _had_thinking = False
+                        try:
+                            text, tool_calls, _had_thinking = self.tui.stream_response(
+                                response,
+                                known_tools=self.registry.names(),
+                                interrupt_monitor=_esc_monitor,
+                            )
+                        finally:
+                            if hasattr(response, 'close'):
+                                response.close()
+
+                    # Reconcile token estimate with actual usage from API
+                    # Skip reconciliation right after compaction to avoid drift
+                    if isinstance(response, dict) and not self.session._just_compacted:
+                        usage = response.get("usage", {})
+                        if usage.get("prompt_tokens", 0) > 0:
+                            self.session._token_estimate = (
+                                usage["prompt_tokens"] + usage.get("completion_tokens", 0)
+                            )
+                        # Show per-turn token usage (subtle, always visible)
+                        prompt_t = usage.get("prompt_tokens", 0)
+                        completion_t = usage.get("completion_tokens", 0)
+                        if prompt_t or completion_t:
+                            pct = min(int(((prompt_t + completion_t) / self.config.context_window) * 100), 100)
+                            _p(f"  {_ansi(chr(27)+'[38;5;240m')}tokens: {prompt_t}→{completion_t} "
+                               f"({pct}% ctx){C.RESET}")
+                            if self._evolution:
+                                self._evolution.record_usage(
+                                    request_policy["model"],
+                                    prompt_t,
+                                    completion_t,
+                                    self.config.prompt_cost_per_mtok,
+                                    self.config.completion_cost_per_mtok,
+                                )
+                            if self.output_collector:
+                                self.output_collector.record_usage(prompt_t, completion_t)
+                    self.session._just_compacted = False
+
+                    # Handle empty response from local LLM (smart retry cascade)
+                    if not text and not tool_calls and iteration < self.max_iterations - 1:
+                        _empty_retries += 1
+                        # Step 0: Thinking-only nudge
+                        if _had_thinking and _empty_retries <= 2:
+                            self.session.add_user_message(
+                                "[SYSTEM] Your thinking completed but you produced no visible output. "
+                                "Please provide your response or call a tool now."
+                            )
                             if self.config.debug:
-                                print(f"{C.DIM}[debug] Loop detected — injecting warning into context{C.RESET}", file=sys.stderr)
+                                print(f"{C.DIM}[debug] Thinking-only response — nudging model{C.RESET}", file=sys.stderr)
                             continue
-                        else:
-                            # Second detection after warning: give up
-                            _p(f"\n{C.YELLOW}AI が同じアクションを繰り返して停止しました。(The AI got stuck repeating the same action - Stopped){C.RESET}")
-                            _p(f"{C.DIM}Try rephrasing your request or asking for a different approach.{C.RESET}")
-                            self._set_stop_reason("tool_loop", current_calls[0][0] if current_calls else "unknown")
+                        # Step 1: Auto-compact if context is >70% full
+                        if _empty_retries == 1:
+                            _usage_pct = self.session.get_token_estimate() / max(self.config.context_window, 1)
+                            if _usage_pct > 0.70:
+                                _p(f"  {C.DIM}[auto-compact: context was {int(_usage_pct*100)}% full]{C.RESET}")
+                                self.session.compact_if_needed(force=True)
+                                continue
+                        # Step 2: Retry with slightly higher temperature
+                        if _empty_retries == 2:
+                            _retry_temp = self.client._resolve_request_temperature(
+                                request_policy["model"],
+                                tools=bool(tools),
+                                options={"retry_temperature_boost": 0.3},
+                            )
+                            _p(f"  {C.DIM}[retry with temperature {_retry_temp:.1f}]{C.RESET}")
+                            time.sleep(0.5)
+                            continue
+                        # Step 3: Give up with actionable suggestions
+                        if _empty_retries > 2:
+                            _p(f"\n{C.YELLOW}AI から空のレスポンスが返されました（3回リトライ後も失敗）{C.RESET}")
+                            _p(f"{C.DIM}対処法:{C.RESET}")
+                            _p(f"{C.DIM}  1. /compact — コンテキストを圧縮{C.RESET}")
+                            _p(f"{C.DIM}  2. /model <name> — 別モデルに切替{C.RESET}")
+                            _p(f"{C.DIM}  3. リクエストを簡潔に書き直す{C.RESET}")
+                            break
+                        time.sleep(_empty_retries * 0.5)
+                        continue
+
+                    # 3. Add to history
+                    self.session.add_assistant_message(text, tool_calls if tool_calls else None)
+
+                    # Store last assistant output for loop mode completion detection
+                    self._last_output = text
+
+                    # Headless output collector: record assistant text
+                    if self.output_collector and text:
+                        self.output_collector.assistant_text(text)
+
+                    # Learn mode: add explanations after code or errors
+                    if self.config.learn_mode and self.config.learn_auto_explain:
+                        # Check if response contains code blocks
+                        has_code = '```' in text
+                        has_error = any(err in text.lower() for err in ['error:', 'error -', 'exception', 'failed'])
+                        if has_code or has_error:
+                            self._add_learn_explanation(text, has_code, has_error)
+
+                    # 4. If no tool calls, we're done
+                    if not tool_calls:
+                        if self._pending_verification and iteration < self.max_iterations - 1:
+                            if self._last_rubber_duck_review_generation < self._modification_generation:
+                                diff, desc = _get_review_diff(self.config.cwd)
+                                if diff:
+                                    if self._maybe_run_rubber_duck_review(
+                                        "post_edit",
+                                        "diff",
+                                        desc,
+                                        diff,
+                                    ):
+                                        continue
+                            if self._verification_reminders < 2:
+                                self._verification_reminders += 1
+                                self._update_runtime_phase(
+                                    "verification_required",
+                                    resume_hint="run syntax check or tests before finishing",
+                                    verification_required=True,
+                                    pending_verification=self._relativize_paths(self._modified_file_paths),
+                                )
+                                self.session.add_system_note(
+                                    "You modified files in this run but have not run a verification step yet. "
+                                    "Before finishing, run ONE of: syntax check "
+                                    "(python3 -c 'import py_compile; py_compile.compile(..., cfile=..., doraise=True)'), "
+                                    "test suite (pytest / unittest), linter (ruff / flake8), or build command. "
+                                    "If no test framework is installed, a syntax check is sufficient."
+                                )
+                                continue
+                            self._set_stop_reason(
+                                "verification_required",
+                                "model stopped before running verification",
+                            )
                             self._route_prefilter_names = None
                             break
-                if len(_recent_tool_calls) > 10:
-                    _recent_tool_calls = _recent_tool_calls[-10:]
+                        self._set_stop_reason("assistant_final", "model returned final text without tool calls")
+                        self._route_prefilter_names = None
+                        break
 
-                # 6. Execute tool calls
-                # Phase 1: Parse all tool calls
-                results = []  # initialize early — needed if JSON parsing fails
-                parsed_calls = []
-                for tc in tool_calls:
-                    func = tc.get("function", {})
-                    tc_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
-                    tool_name = func.get("name", "")
-                    raw_args = func.get("arguments", "{}")
-                    try:
-                        tool_params = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                        if not isinstance(tool_params, dict):
-                            tool_params = {"raw": str(tool_params)}
-                    except json.JSONDecodeError:
-                        # Local LLMs sometimes produce broken JSON - try to salvage
+                    # 5. Detect infinite tool call loops
+                    def _norm_args(raw):
+                        """Normalize JSON args so whitespace/key-order variations don't evade loop detection."""
                         try:
-                            # Try Python dict literal first (handles single quotes safely)
-                            import ast
-                            parsed = ast.literal_eval(raw_args)
-                            tool_params = parsed if isinstance(parsed, dict) else {"raw": str(parsed)}
-                        except (ValueError, SyntaxError):
-                            # Fallback: fix trailing commas, then try JSON again
-                            try:
-                                fixed = re.sub(r',\s*}', '}', raw_args)
-                                fixed = re.sub(r',\s*]', ']', fixed)
-                                tool_params = json.loads(fixed)
-                            except (json.JSONDecodeError, ValueError, TypeError, KeyError):
-                                # Unsalvageable — report error to LLM instead of passing bad params
-                                results.append(ToolResult(tc_id, f"Error: tool arguments are not valid JSON: {raw_args[:200]}", True))
-                                continue
-                    parsed_calls.append((tc_id, tool_name, tool_params))
-
-                # Phase 2: Validate permissions on main thread
-                validated_calls = []
-                for tc_id, tool_name, tool_params in parsed_calls:
-                    tool = self.registry.get(tool_name)
-                    if not tool:
-                        results.append(ToolResult(tc_id, f"Error: unknown tool '{tool_name}'", True))
-                        continue
-                    # Canonicalize tool_name to registered name (defense-in-depth
-                    # against case variations like "bash" vs "Bash")
-                    tool_name = tool.name
-                    if tool_name not in self._get_allowed_tool_names():
-                        results.append(ToolResult(
-                            tc_id,
-                            f"Error: tool '{tool_name}' is not allowed in this run.",
-                            True,
-                        ))
-                        self.tui.show_tool_result(tool_name, "Blocked: tool not allowed", True)
-                        continue
-                    # Show what we're about to do FIRST
-                    self.tui.show_tool_call(tool_name, tool_params)
-                    # Plan mode: restrict Write to .eve-cli/plans/ only
-                    if self._plan_mode and tool_name == "Write":
-                        try:
-                            fpath = os.path.realpath(tool_params.get("file_path", ""))
-                            plans_dir = os.path.realpath(os.path.join(self.config.cwd, ".eve-cli", "plans"))
-                            if not fpath.startswith(plans_dir + os.sep):
-                                results.append(ToolResult(
-                                    tc_id,
-                                    "Error: In plan mode, Write is restricted to .eve-cli/plans/ directory only. "
-                                    "Use /approve to switch to Act mode for unrestricted writes.",
-                                    True
-                                ))
-                                self.tui.show_tool_result(tool_name, "Blocked: outside plans/ dir", True)
-                                continue
-                        except Exception:
-                            results.append(ToolResult(tc_id, "Error: could not validate file path in plan mode.", True))
-                            self.tui.show_tool_result(tool_name, "Blocked: path validation error", True)
-                            continue
-                    prereq_error = self._validate_read_before_write(tool_name, tool_params)
-                    if prereq_error:
-                        self._update_runtime_phase(
-                            "understanding",
-                            resume_hint="read target files before editing",
-                            verification_required=self._pending_verification,
-                            pending_verification=self._relativize_paths(self._modified_file_paths),
-                        )
-                        results.append(ToolResult(tc_id, f"Error: {prereq_error}", True))
-                        self.tui.show_tool_result(tool_name, prereq_error, True)
-                        continue
-                    # Then ask permission
-                    if not self.permissions.check(tool_name, tool_params, self.tui):
-                        denial_reason = self.permissions.describe_last_decision()
-                        results.append(ToolResult(
-                            tc_id,
-                            f"Permission denied. {denial_reason} Do not retry this operation.",
-                            True,
-                        ))
-                        self.tui.show_tool_result(tool_name, "Permission denied", True)
-                        continue
-                    # Show auto-mode classification result
-                    if (self.permissions.auto_mode and self.permissions._last_decision
-                            and self.permissions._last_decision.get("source") == "auto-mode"):
-                        _auto_reason = self.permissions._last_decision.get("reason", "")
-                        _p(f"  {C.DIM}{_auto_reason}{C.RESET}")
-                    # PreToolUse hook: allow hooks to deny tool execution after approval
-                    if self.hook_mgr and self.hook_mgr.has_hooks:
-                        _hook_result = self.hook_mgr.fire_pre_tool(tool_name, tool_params)
-                        if _hook_result == "deny":
-                            results.append(ToolResult(tc_id, "Blocked by hook (PreToolUse).", True))
-                            self.tui.show_tool_result(tool_name, "Blocked by hook", True)
-                            continue
-                    validated_calls.append((tc_id, tool_name, tool_params, tool))
-
-                # Phase 3: Execute — parallel for read-only tools, sequential otherwise
-                all_parallel_safe = (
-                    len(validated_calls) > 1
-                    and all(self._is_parallel_safe_tool(tool) for _, _, _, tool in validated_calls)
-                )
-
-                if all_parallel_safe:
-                    _parallel_durations = {}
-                    # Headless output collector: record tool calls before parallel execution
-                    if self.output_collector:
-                        for _, _tn, _tp, _ in validated_calls:
-                            self.output_collector.tool_call(_tn, _tp)
-                    def _exec_one(item):
-                        tc_id, tool_name, tool_params, tool = item
-                        try:
-                            _t0 = time.time()
-                            with self._tool_lock_context(tool):
-                                output = tool.execute(tool_params)
-                            _parallel_durations[tc_id] = time.time() - _t0
-                            return ToolResult(tc_id, output)
-                        except Exception as e:
-                            _parallel_durations[tc_id] = time.time() - _t0
-                            error_msg = f"Tool error: {e}"
-                            return ToolResult(tc_id, error_msg, True)
-
-                    # Execute all in parallel, buffer results, display in original order
-                    futures_map = {}
-                    pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-                    try:
-                        for item in validated_calls:
-                            future = pool.submit(_exec_one, item)
-                            futures_map[item[0]] = (future, item)
-                        concurrent.futures.wait([f for f, _ in futures_map.values()])
-                    finally:
-                        # cancel_futures (Python 3.9+) prevents blocking on outstanding work during Ctrl+C
-                        try:
-                            pool.shutdown(wait=False, cancel_futures=True)
-                        except TypeError:
-                            # Python 3.8: cancel_futures not available
-                            pool.shutdown(wait=False)
-
-                    # Show results in the original order of tool_calls
-                    for tc_id, tool_name, tool_params, tool in validated_calls:
-                        if self._interrupted.is_set() or _esc_monitor.pressed:
-                            break
-                        future, _ = futures_map[tc_id]
-                        try:
-                            result = future.result()
-                        except (concurrent.futures.CancelledError, Exception) as e:
-                            result = ToolResult(tc_id, f"Tool error: {e}", True)
-                        _pdur = _parallel_durations.get(tc_id)
-                        self.tui.show_tool_result(tool_name, result.output, result.is_error,
-                                                  duration=_pdur, params=tool_params)
-                        results.append(result)
-                        self._record_tool_runtime_effects(tool_name, tool_params, result.output, result.is_error)
-                        # Headless output collector (parallel path)
-                        if self.output_collector:
-                            self.output_collector.tool_result(tool_name, result.output, result.is_error)
-                        # PostToolUse hook (parallel path)
-                        if self.hook_mgr and self.hook_mgr.has_hooks:
-                            self.hook_mgr.fire_post_tool(tool_name, result.output, result.is_error)
-                            if tool_name in ("SubAgent", "ParallelAgents", "Task"):
-                                self.hook_mgr.fire_subagent_stop(
-                                    tool_name,
-                                    stop_reason="error" if result.is_error else "completed",
-                                    detail=str(result.output)[:200] if result.is_error else "",
+                            return json.dumps(json.loads(raw), sort_keys=True) if isinstance(raw, str) else str(raw)
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            return str(raw)
+                    current_calls = [(tc.get("function", {}).get("name", ""),
+                                      _norm_args(tc.get("function", {}).get("arguments", "")))
+                                     for tc in tool_calls]
+                    _recent_tool_calls.append(current_calls)
+                    if len(_recent_tool_calls) >= self.MAX_SAME_TOOL_REPEAT:
+                        recent = _recent_tool_calls[-self.MAX_SAME_TOOL_REPEAT:]
+                        if all(r == recent[0] for r in recent):
+                            if not _loop_warned:
+                                # First detection: inject warning into conversation so LLM can self-correct
+                                _loop_warned = True
+                                _loop_tool_name = current_calls[0][0] if current_calls else "unknown"
+                                _warn_text = (
+                                    f"[SYSTEM WARNING] You have called '{_loop_tool_name}' with the same "
+                                    f"arguments {self.MAX_SAME_TOOL_REPEAT} times in a row. "
+                                    "This looks like an infinite loop. Please stop repeating the same call, "
+                                    "re-evaluate your approach, and either try a different tool/argument or "
+                                    "report your findings to the user."
                                 )
-                else:
-                    # Sequential execution (preserves ordering for side-effecting tools)
-                    for tc_id, tool_name, tool_params, tool in validated_calls:
-                        if self._interrupted.is_set() or _esc_monitor.pressed:
-                            break
+                                self.session.add_user_message(_warn_text)
+                                _recent_tool_calls.clear()
+                                if self.config.debug:
+                                    print(f"{C.DIM}[debug] Loop detected — injecting warning into context{C.RESET}", file=sys.stderr)
+                                continue
+                            else:
+                                # Second detection after warning: give up
+                                _p(f"\n{C.YELLOW}AI が同じアクションを繰り返して停止しました。(The AI got stuck repeating the same action - Stopped){C.RESET}")
+                                _p(f"{C.DIM}Try rephrasing your request or asking for a different approach.{C.RESET}")
+                                self._set_stop_reason("tool_loop", current_calls[0][0] if current_calls else "unknown")
+                                self._route_prefilter_names = None
+                                break
+                    if len(_recent_tool_calls) > 10:
+                        _recent_tool_calls = _recent_tool_calls[-10:]
+
+                    # 6. Execute tool calls
+                    # Phase 1: Parse all tool calls
+                    results = []  # initialize early — needed if JSON parsing fails
+                    parsed_calls = []
+                    for tc in tool_calls:
+                        func = tc.get("function", {})
+                        tc_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                        tool_name = func.get("name", "")
+                        raw_args = func.get("arguments", "{}")
                         try:
-                            tracked_paths = self._resolve_tool_target_paths(tool_name, tool_params)
-                            tracked_existing = {p for p in tracked_paths if os.path.exists(p)}
+                            tool_params = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                            if not isinstance(tool_params, dict):
+                                tool_params = {"raw": str(tool_params)}
+                        except json.JSONDecodeError:
+                            # Local LLMs sometimes produce broken JSON - try to salvage
+                            try:
+                                # Try Python dict literal first (handles single quotes safely)
+                                import ast
+                                parsed = ast.literal_eval(raw_args)
+                                tool_params = parsed if isinstance(parsed, dict) else {"raw": str(parsed)}
+                            except (ValueError, SyntaxError):
+                                # Fallback: fix trailing commas, then try JSON again
+                                try:
+                                    fixed = re.sub(r',\s*}', '}', raw_args)
+                                    fixed = re.sub(r',\s*]', ']', fixed)
+                                    tool_params = json.loads(fixed)
+                                except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+                                    # Unsalvageable — report error to LLM instead of passing bad params
+                                    results.append(ToolResult(tc_id, f"Error: tool arguments are not valid JSON: {raw_args[:200]}", True))
+                                    continue
+                        parsed_calls.append((tc_id, tool_name, tool_params))
 
-                            # Git checkpoint before write/edit operations
-                            if tracked_paths and self.git_checkpoint._is_git_repo:
-                                self.git_checkpoint.create(f"before-{tool_name.lower()}")
-
-                            self.tui.start_tool_status(tool_name)
-                            _tool_t0 = time.time()
-                            with self._tool_lock_context(tool):
-                                output = tool.execute(tool_params)
-                            _tool_dur = time.time() - _tool_t0
-                            self.tui.stop_spinner()
-                            _is_err = isinstance(output, str) and (
-                                output.startswith("Error:") or output.startswith("Error -")
+                    # Phase 2: Validate permissions on main thread
+                    validated_calls = []
+                    for tc_id, tool_name, tool_params in parsed_calls:
+                        tool = self.registry.get(tool_name)
+                        if not tool:
+                            results.append(ToolResult(tc_id, f"Error: unknown tool '{tool_name}'", True))
+                            continue
+                        # Canonicalize tool_name to registered name (defense-in-depth
+                        # against case variations like "bash" vs "Bash")
+                        tool_name = tool.name
+                        if tool_name not in self._get_allowed_tool_names():
+                            results.append(ToolResult(
+                                tc_id,
+                                f"Error: tool '{tool_name}' is not allowed in this run.",
+                                True,
+                            ))
+                            self.tui.show_tool_result(tool_name, "Blocked: tool not allowed", True)
+                            continue
+                        # Show what we're about to do FIRST
+                        self.tui.show_tool_call(tool_name, tool_params)
+                        # Plan mode: restrict Write to .eve-cli/plans/ only
+                        if self._plan_mode and tool_name == "Write":
+                            try:
+                                fpath = os.path.realpath(tool_params.get("file_path", ""))
+                                plans_dir = os.path.realpath(os.path.join(self.config.cwd, ".eve-cli", "plans"))
+                                if not fpath.startswith(plans_dir + os.sep):
+                                    results.append(ToolResult(
+                                        tc_id,
+                                        "Error: In plan mode, Write is restricted to .eve-cli/plans/ directory only. "
+                                        "Use /approve to switch to Act mode for unrestricted writes.",
+                                        True
+                                    ))
+                                    self.tui.show_tool_result(tool_name, "Blocked: outside plans/ dir", True)
+                                    continue
+                            except Exception:
+                                results.append(ToolResult(tc_id, "Error: could not validate file path in plan mode.", True))
+                                self.tui.show_tool_result(tool_name, "Blocked: path validation error", True)
+                                continue
+                        prereq_error = self._validate_read_before_write(tool_name, tool_params)
+                        if prereq_error:
+                            self._update_runtime_phase(
+                                "understanding",
+                                resume_hint="read target files before editing",
+                                verification_required=self._pending_verification,
+                                pending_verification=self._relativize_paths(self._modified_file_paths),
                             )
-                            self.tui.show_tool_result(tool_name, output, is_error=_is_err,
-                                                      duration=_tool_dur, params=tool_params)
-                            results.append(ToolResult(tc_id, output, _is_err))
-                            self._record_tool_runtime_effects(tool_name, tool_params, output, _is_err)
-                            # Evolution: record tool call outcome
-                            if self._evolution:
-                                self._evolution.record_tool_call(tool_name, not _is_err, _tool_dur)
-                            # Headless output collector (sequential path)
+                            results.append(ToolResult(tc_id, f"Error: {prereq_error}", True))
+                            self.tui.show_tool_result(tool_name, prereq_error, True)
+                            continue
+                        # Then ask permission
+                        if not self.permissions.check(tool_name, tool_params, self.tui):
+                            denial_reason = self.permissions.describe_last_decision()
+                            results.append(ToolResult(
+                                tc_id,
+                                f"Permission denied. {denial_reason} Do not retry this operation.",
+                                True,
+                            ))
+                            self.tui.show_tool_result(tool_name, "Permission denied", True)
+                            continue
+                        # Show auto-mode classification result
+                        if (self.permissions.auto_mode and self.permissions._last_decision
+                                and self.permissions._last_decision.get("source") == "auto-mode"):
+                            _auto_reason = self.permissions._last_decision.get("reason", "")
+                            _p(f"  {C.DIM}{_auto_reason}{C.RESET}")
+                        # PreToolUse hook: allow hooks to deny tool execution after approval
+                        if self.hook_mgr and self.hook_mgr.has_hooks:
+                            _hook_result = self.hook_mgr.fire_pre_tool(tool_name, tool_params)
+                            if _hook_result == "deny":
+                                results.append(ToolResult(tc_id, "Blocked by hook (PreToolUse).", True))
+                                self.tui.show_tool_result(tool_name, "Blocked by hook", True)
+                                continue
+                        validated_calls.append((tc_id, tool_name, tool_params, tool))
+
+                    # Phase 3: Execute — parallel for read-only tools, sequential otherwise
+                    all_parallel_safe = (
+                        len(validated_calls) > 1
+                        and all(self._is_parallel_safe_tool(tool) for _, _, _, tool in validated_calls)
+                    )
+
+                    if all_parallel_safe:
+                        _parallel_durations = {}
+                        # Headless output collector: record tool calls before parallel execution
+                        if self.output_collector:
+                            for _, _tn, _tp, _ in validated_calls:
+                                self.output_collector.tool_call(_tn, _tp)
+                        def _exec_one(item):
+                            tc_id, tool_name, tool_params, tool = item
+                            try:
+                                _t0 = time.time()
+                                with self._tool_lock_context(tool):
+                                    output = tool.execute(tool_params)
+                                _parallel_durations[tc_id] = time.time() - _t0
+                                return ToolResult(tc_id, output)
+                            except Exception as e:
+                                _parallel_durations[tc_id] = time.time() - _t0
+                                error_msg = f"Tool error: {e}"
+                                return ToolResult(tc_id, error_msg, True)
+
+                        # Execute all in parallel, buffer results, display in original order
+                        futures_map = {}
+                        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+                        try:
+                            for item in validated_calls:
+                                future = pool.submit(_exec_one, item)
+                                futures_map[item[0]] = (future, item)
+                            concurrent.futures.wait([f for f, _ in futures_map.values()])
+                        finally:
+                            # cancel_futures (Python 3.9+) prevents blocking on outstanding work during Ctrl+C
+                            try:
+                                pool.shutdown(wait=False, cancel_futures=True)
+                            except TypeError:
+                                # Python 3.8: cancel_futures not available
+                                pool.shutdown(wait=False)
+
+                        # Show results in the original order of tool_calls
+                        for tc_id, tool_name, tool_params, tool in validated_calls:
+                            if self._interrupted.is_set() or _esc_monitor.pressed:
+                                break
+                            future, _ = futures_map[tc_id]
+                            try:
+                                result = future.result()
+                            except (concurrent.futures.CancelledError, Exception) as e:
+                                result = ToolResult(tc_id, f"Tool error: {e}", True)
+                            _pdur = _parallel_durations.get(tc_id)
+                            self.tui.show_tool_result(tool_name, result.output, result.is_error,
+                                                      duration=_pdur, params=tool_params)
+                            results.append(result)
+                            self._record_tool_runtime_effects(tool_name, tool_params, result.output, result.is_error)
+                            # Headless output collector (parallel path)
                             if self.output_collector:
-                                self.output_collector.tool_call(tool_name, tool_params)
-                                self.output_collector.tool_result(tool_name, output, _is_err)
-                            # PostToolUse hook (sequential path)
+                                self.output_collector.tool_result(tool_name, result.output, result.is_error)
+                            # PostToolUse hook (parallel path)
                             if self.hook_mgr and self.hook_mgr.has_hooks:
-                                self.hook_mgr.fire_post_tool(tool_name, output, _is_err)
+                                self.hook_mgr.fire_post_tool(tool_name, result.output, result.is_error)
                                 if tool_name in ("SubAgent", "ParallelAgents", "Task"):
                                     self.hook_mgr.fire_subagent_stop(
                                         tool_name,
-                                        stop_reason="error" if _is_err else "completed",
-                                        detail=str(output)[:200] if _is_err else "",
+                                        stop_reason="error" if result.is_error else "completed",
+                                        detail=str(result.output)[:200] if result.is_error else "",
                                     )
+                    else:
+                        # Sequential execution (preserves ordering for side-effecting tools)
+                        for tc_id, tool_name, tool_params, tool in validated_calls:
+                            if self._interrupted.is_set() or _esc_monitor.pressed:
+                                break
+                            try:
+                                tracked_paths = self._resolve_tool_target_paths(tool_name, tool_params)
+                                tracked_existing = {p for p in tracked_paths if os.path.exists(p)}
 
-                            if tracked_paths and not _is_err:
-                                for _tracked in tracked_paths:
-                                    if tool_name == "Write":
-                                        action = "write" if _tracked in tracked_existing else "create"
-                                    elif tool_name == "NotebookEdit":
-                                        action = "notebook"
-                                    else:
-                                        action = "edit"
-                                    self.change_tracker.record(action, _tracked)
+                                # Git checkpoint before write/edit operations
+                                if tracked_paths and self.git_checkpoint._is_git_repo:
+                                    self.git_checkpoint.create(f"before-{tool_name.lower()}")
 
-                            # Detect plan file creation
-                            if tool_name == "Write" and self._plan_mode and not _is_err:
-                                fpath = tool_params.get("file_path", "")
-                                try:
-                                    real_plans = os.path.realpath(os.path.join(self.config.cwd, ".eve-cli", "plans"))
-                                    if fpath and os.path.realpath(fpath).startswith(real_plans + os.sep):
-                                        self._active_plan_path = fpath
-                                except Exception:
-                                    pass
-
-                            # Refresh file watcher snapshot after writes
-                            if tracked_paths and self.file_watcher.enabled:
-                                self.file_watcher.refresh_snapshot()
-
-                            # Auto test after file modifications
-                            if tracked_paths and self.auto_test.enabled:
-                                fpath = tracked_paths[0]
-                                if fpath:
-                                    verifier_desc = self.auto_test.describe()
-                                    verifier_cmd = verifier_desc.get("test") or verifier_desc.get("lint") or ""
-                                    verifier_pipeline = self.auto_test.run_pipeline(fpath)
-                                    test_errors = verifier_pipeline.get("error_output") if verifier_pipeline else None
-                                    if verifier_pipeline and verifier_pipeline.get("retry_attempted") and self.session.runtime_state:
-                                        self.session.runtime_state.record_resume_event(
-                                            "verifier_retry",
-                                            f"Retried verifier once because {verifier_pipeline.get('retry_reason', 'the failure looked retryable')}.",
+                                self.tui.start_tool_status(tool_name)
+                                _tool_t0 = time.time()
+                                with self._tool_lock_context(tool):
+                                    output = tool.execute(tool_params)
+                                _tool_dur = time.time() - _tool_t0
+                                self.tui.stop_spinner()
+                                _is_err = isinstance(output, str) and (
+                                    output.startswith("Error:") or output.startswith("Error -")
+                                )
+                                self.tui.show_tool_result(tool_name, output, is_error=_is_err,
+                                                          duration=_tool_dur, params=tool_params)
+                                results.append(ToolResult(tc_id, output, _is_err))
+                                self._record_tool_runtime_effects(tool_name, tool_params, output, _is_err)
+                                # Evolution: record tool call outcome
+                                if self._evolution:
+                                    self._evolution.record_tool_call(tool_name, not _is_err, _tool_dur)
+                                # Headless output collector (sequential path)
+                                if self.output_collector:
+                                    self.output_collector.tool_call(tool_name, tool_params)
+                                    self.output_collector.tool_result(tool_name, output, _is_err)
+                                # PostToolUse hook (sequential path)
+                                if self.hook_mgr and self.hook_mgr.has_hooks:
+                                    self.hook_mgr.fire_post_tool(tool_name, output, _is_err)
+                                    if tool_name in ("SubAgent", "ParallelAgents", "Task"):
+                                        self.hook_mgr.fire_subagent_stop(
+                                            tool_name,
+                                            stop_reason="error" if _is_err else "completed",
+                                            detail=str(output)[:200] if _is_err else "",
                                         )
-                                    if verifier_pipeline and not verifier_pipeline.get("ok"):
-                                        failure_kind = verifier_pipeline.get("failure_kind") or "unknown"
-                                        if self.session.runtime_state:
+
+                                if tracked_paths and not _is_err:
+                                    for _tracked in tracked_paths:
+                                        if tool_name == "Write":
+                                            action = "write" if _tracked in tracked_existing else "create"
+                                        elif tool_name == "NotebookEdit":
+                                            action = "notebook"
+                                        else:
+                                            action = "edit"
+                                        self.change_tracker.record(action, _tracked)
+
+                                # Detect plan file creation
+                                if tool_name == "Write" and self._plan_mode and not _is_err:
+                                    fpath = tool_params.get("file_path", "")
+                                    try:
+                                        real_plans = os.path.realpath(os.path.join(self.config.cwd, ".eve-cli", "plans"))
+                                        if fpath and os.path.realpath(fpath).startswith(real_plans + os.sep):
+                                            self._active_plan_path = fpath
+                                    except Exception:
+                                        pass
+
+                                # Refresh file watcher snapshot after writes
+                                if tracked_paths and self.file_watcher.enabled:
+                                    self.file_watcher.refresh_snapshot()
+
+                                # Auto test after file modifications
+                                if tracked_paths and self.auto_test.enabled:
+                                    fpath = tracked_paths[0]
+                                    if fpath:
+                                        verifier_desc = self.auto_test.describe()
+                                        verifier_cmd = verifier_desc.get("test") or verifier_desc.get("lint") or ""
+                                        verifier_pipeline = self.auto_test.run_pipeline(fpath)
+                                        test_errors = verifier_pipeline.get("error_output") if verifier_pipeline else None
+                                        if verifier_pipeline and verifier_pipeline.get("retry_attempted") and self.session.runtime_state:
+                                            self.session.runtime_state.record_resume_event(
+                                                "verifier_retry",
+                                                f"Retried verifier once because {verifier_pipeline.get('retry_reason', 'the failure looked retryable')}.",
+                                            )
+                                        if verifier_pipeline and not verifier_pipeline.get("ok"):
+                                            failure_kind = verifier_pipeline.get("failure_kind") or "unknown"
+                                            if self.session.runtime_state:
+                                                self.session.runtime_state.record_verifier_run(
+                                                    "autotest",
+                                                    verifier_cmd,
+                                                    verifier_pipeline.get("status", f"failed:{failure_kind}"),
+                                                    verifier_pipeline.get("summary") or test_errors,
+                                                )
+                                                self.session.runtime_state.update_runtime(
+                                                    last_known_phase="verifier_failed",
+                                                    resume_hint=f"retry last verifier ({failure_kind})",
+                                                    updated_at=time.time(),
+                                                )
+                                                self.session.runtime_state.record_resume_event(
+                                                    "verifier_failed",
+                                                    verifier_pipeline.get("summary") or f"Verifier failed: {failure_kind}",
+                                                )
+                                            self._mark_verification_status(
+                                                False,
+                                                verifier_cmd,
+                                                verifier_pipeline.get("summary") or test_errors,
+                                                source="autotest",
+                                            )
+                                            _p(f"\n  {_ansi(chr(27)+'[38;5;196m')}Auto-test errors detected:{C.RESET}")
+                                            for line in test_errors.split('\n')[:5]:
+                                                _p(f"  {C.DIM}{line}{C.RESET}")
+                                            if verifier_pipeline.get("retry_attempted"):
+                                                _p(
+                                                    f"  {C.DIM}retry policy: reran once because "
+                                                    f"{verifier_pipeline.get('retry_reason', 'failure looked retryable')}{C.RESET}"
+                                                )
+                                            # Feed errors back as additional context
+                                            results.append(ToolResult(
+                                                f"autotest_{tc_id}",
+                                                f"[AUTO-TEST] Errors detected after {tool_name}:\n{test_errors}\n\nPlease fix these errors.",
+                                                True
+                                            ))
+                                        elif self.session.runtime_state:
                                             self.session.runtime_state.record_verifier_run(
                                                 "autotest",
                                                 verifier_cmd,
-                                                verifier_pipeline.get("status", f"failed:{failure_kind}"),
-                                                verifier_pipeline.get("summary") or test_errors,
-                                            )
-                                            self.session.runtime_state.update_runtime(
-                                                last_known_phase="verifier_failed",
-                                                resume_hint=f"retry last verifier ({failure_kind})",
-                                                updated_at=time.time(),
+                                                verifier_pipeline.get("status", "passed") if verifier_pipeline else "passed",
+                                                verifier_pipeline.get("summary") if verifier_pipeline else f"{tool_name} completed without auto-test errors.",
                                             )
                                             self.session.runtime_state.record_resume_event(
-                                                "verifier_failed",
-                                                verifier_pipeline.get("summary") or f"Verifier failed: {failure_kind}",
+                                                "verifier_passed",
+                                                verifier_pipeline.get("summary") if verifier_pipeline else f"Verifier passed after {tool_name}.",
                                             )
-                                        self._mark_verification_status(
-                                            False,
-                                            verifier_cmd,
-                                            verifier_pipeline.get("summary") or test_errors,
-                                            source="autotest",
-                                        )
-                                        _p(f"\n  {_ansi(chr(27)+'[38;5;196m')}Auto-test errors detected:{C.RESET}")
-                                        for line in test_errors.split('\n')[:5]:
-                                            _p(f"  {C.DIM}{line}{C.RESET}")
-                                        if verifier_pipeline.get("retry_attempted"):
-                                            _p(
-                                                f"  {C.DIM}retry policy: reran once because "
-                                                f"{verifier_pipeline.get('retry_reason', 'failure looked retryable')}{C.RESET}"
+                                            self._mark_verification_status(
+                                                True,
+                                                verifier_cmd,
+                                                verifier_pipeline.get("summary") if verifier_pipeline else f"Verifier passed after {tool_name}.",
+                                                source="autotest",
                                             )
-                                        # Feed errors back as additional context
-                                        results.append(ToolResult(
-                                            f"autotest_{tc_id}",
-                                            f"[AUTO-TEST] Errors detected after {tool_name}:\n{test_errors}\n\nPlease fix these errors.",
-                                            True
-                                        ))
-                                    elif self.session.runtime_state:
-                                        self.session.runtime_state.record_verifier_run(
-                                            "autotest",
-                                            verifier_cmd,
-                                            verifier_pipeline.get("status", "passed") if verifier_pipeline else "passed",
-                                            verifier_pipeline.get("summary") if verifier_pipeline else f"{tool_name} completed without auto-test errors.",
-                                        )
-                                        self.session.runtime_state.record_resume_event(
-                                            "verifier_passed",
-                                            verifier_pipeline.get("summary") if verifier_pipeline else f"Verifier passed after {tool_name}.",
-                                        )
-                                        self._mark_verification_status(
-                                            True,
-                                            verifier_cmd,
-                                            verifier_pipeline.get("summary") if verifier_pipeline else f"Verifier passed after {tool_name}.",
-                                            source="autotest",
-                                        )
-                        except KeyboardInterrupt:
-                            self.tui.stop_spinner()
-                            _tool_dur = time.time() - _tool_t0
-                            results.append(ToolResult(tc_id, "Interrupted by user", True))
-                            self.tui.show_tool_result(tool_name, "Interrupted", True, duration=_tool_dur, params=tool_params)
-                            self._interrupted.set()
-                            break
-                        except Exception as e:
-                            self.tui.stop_spinner()
-                            _tool_dur = time.time() - _tool_t0
-                            error_msg = f"Tool error: {e}"
-                            self.tui.show_tool_result(tool_name, error_msg, True, duration=_tool_dur, params=tool_params)
-                            results.append(ToolResult(tc_id, error_msg, True))
+                            except KeyboardInterrupt:
+                                self.tui.stop_spinner()
+                                _tool_dur = time.time() - _tool_t0
+                                results.append(ToolResult(tc_id, "Interrupted by user", True))
+                                self.tui.show_tool_result(tool_name, "Interrupted", True, duration=_tool_dur, params=tool_params)
+                                self._interrupted.set()
+                                break
+                            except Exception as e:
+                                self.tui.stop_spinner()
+                                _tool_dur = time.time() - _tool_t0
+                                error_msg = f"Tool error: {e}"
+                                self.tui.show_tool_result(tool_name, error_msg, True, duration=_tool_dur, params=tool_params)
+                                results.append(ToolResult(tc_id, error_msg, True))
 
-                # 6. Add tool results to history
-                # If interrupted mid-tool-loop, pad missing results so the
-                # session stays valid (assistant.tool_calls must match tool results).
-                if self._interrupted.is_set():
-                    called_ids = {r.id for r in results}
-                    for tc in tool_calls:
-                        tid = tc.get("id", "")
-                        if tid and tid not in called_ids:
-                            results.append(ToolResult(tid, "Cancelled by user", True))
-                self.session.add_tool_results(results)
+                    # 6. Add tool results to history
+                    # If interrupted mid-tool-loop, pad missing results so the
+                    # session stays valid (assistant.tool_calls must match tool results).
+                    if self._interrupted.is_set():
+                        called_ids = {r.id for r in results}
+                        for tc in tool_calls:
+                            tid = tc.get("id", "")
+                            if tid and tid not in called_ids:
+                                results.append(ToolResult(tid, "Cancelled by user", True))
+                    self.session.add_tool_results(results)
 
-                # 6b. Auto-fix error injection (after tool results to maintain message order)
-                # This prevents user messages from being inserted between tool_calls and tool results
-                for tc_id, tool_name, tool_params, tool in validated_calls:
-                    result = next((r for r in results if r.id == tc_id), None)
-                    if result and result.is_error and result.output:
-                        self._auto_fix_error(tool_name, tool_params, result.output)
+                    # 6b. Auto-fix error injection (after tool results to maintain message order)
+                    # This prevents user messages from being inserted between tool_calls and tool results
+                    for tc_id, tool_name, tool_params, tool in validated_calls:
+                        result = next((r for r in results if r.id == tc_id), None)
+                        if result and result.is_error and result.output:
+                            self._auto_fix_error(tool_name, tool_params, result.output)
 
-                # Skip compaction if interrupted — just save partial results and break
-                if self._interrupted.is_set():
+                    # Skip compaction if interrupted — just save partial results and break
+                    if self._interrupted.is_set():
+                        break
+
+                    # 7. Context compaction check
+                    before_tokens = self.session.get_token_estimate()
+                    self.session.compact_if_needed()
+                    after_tokens = self.session.get_token_estimate()
+                    if after_tokens < before_tokens * 0.9:  # significant compaction happened
+                        pct = min(int((after_tokens / self.config.context_window) * 100), 100)
+                        _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}⚡ Auto-compacted: {before_tokens}→{after_tokens} tokens ({pct}% used){C.RESET}")
+
+                    # Loop: LLM will be called again to process tool results
+
+                except KeyboardInterrupt:
+                    self.tui.stop_spinner()
+                    if response is not None and hasattr(response, 'close'):
+                        response.close()
+                    if text:
+                        self.session.add_assistant_message(text)
+                    _p(f"\n{C.YELLOW}Interrupted.{C.RESET}")
+                    self._interrupted.set()
                     break
-
-                # 7. Context compaction check
-                before_tokens = self.session.get_token_estimate()
-                self.session.compact_if_needed()
-                after_tokens = self.session.get_token_estimate()
-                if after_tokens < before_tokens * 0.9:  # significant compaction happened
-                    pct = min(int((after_tokens / self.config.context_window) * 100), 100)
-                    _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}⚡ Auto-compacted: {before_tokens}→{after_tokens} tokens ({pct}% used){C.RESET}")
-
-                # Loop: LLM will be called again to process tool results
-
-            except KeyboardInterrupt:
-                self.tui.stop_spinner()
-                if response is not None and hasattr(response, 'close'):
-                    response.close()
-                if text:
-                    self.session.add_assistant_message(text)
-                _p(f"\n{C.YELLOW}Interrupted.{C.RESET}")
-                self._interrupted.set()
-                break
-            except urllib.error.HTTPError as e:
-                self.tui.stop_spinner()
-                if response is not None and hasattr(response, 'close'):
-                    response.close()
-                if text:
-                    self.session.add_assistant_message(text)
-                body = ""
-                try:
-                    body = e.read().decode("utf-8", errors="replace")[:200]
-                except Exception:
-                    pass
-                finally:
+                except urllib.error.HTTPError as e:
+                    self.tui.stop_spinner()
+                    if response is not None and hasattr(response, 'close'):
+                        response.close()
+                    if text:
+                        self.session.add_assistant_message(text)
+                    body = ""
                     try:
-                        e.close()
+                        body = e.read().decode("utf-8", errors="replace")[:200]
                     except Exception:
                         pass
-                _p(f"\n{C.RED}HTTP {e.code} {e.reason}: {body}{C.RESET}")
-                if e.code == 404:
-                    if self.config.uses_local_ollama():
-                        _p(f"{C.DIM}The model '{self.config.model}' may not be downloaded yet.{C.RESET}")
-                        _p(f"{C.DIM}Download it:  ollama pull {self.config.model}{C.RESET}")
+                    finally:
+                        try:
+                            e.close()
+                        except Exception:
+                            pass
+                    _p(f"\n{C.RED}HTTP {e.code} {e.reason}: {body}{C.RESET}")
+                    if e.code == 404:
+                        if self.config.uses_local_ollama():
+                            _p(f"{C.DIM}The model '{self.config.model}' may not be downloaded yet.{C.RESET}")
+                            _p(f"{C.DIM}Download it:  ollama pull {self.config.model}{C.RESET}")
+                        else:
+                            _p(f"{C.DIM}The model '{self.config.model}' is not available on the configured Ollama endpoint.{C.RESET}")
+                            _p(f"{C.DIM}Check OLLAMA_HOST / OLLAMA_API_KEY and your Ollama Cloud access.{C.RESET}")
+                    elif e.code == 400:
+                        _p(f"{C.DIM}The request was rejected — the model name or context may be invalid.{C.RESET}")
+                    break
+                except urllib.error.URLError as e:
+                    self.tui.stop_spinner()
+                    if response is not None and hasattr(response, 'close'):
+                        response.close()
+                    if text:
+                        self.session.add_assistant_message(text)
+                    _p(f"\n{C.RED}Ollama（ローカル AI エンジン）への接続が失われました。(Lost connection to Ollama - the local AI engine){C.RESET}")
+                    _p(f"{C.DIM}It may have crashed or been closed. Restart it:  ollama serve{C.RESET}")
+                    _p(f"{C.DIM}Your conversation is still here — just try again after restarting.{C.RESET}")
+                    break
+                except Exception as e:
+                    self.tui.stop_spinner()
+                    if response is not None and hasattr(response, 'close'):
+                        response.close()
+                    if text:
+                        self.session.add_assistant_message(text)
+                    _p(f"\n{C.RED}問題が発生しました：{e} (Something went wrong: {e}){C.RESET}")
+                    _p(f"{C.DIM}Your conversation is still active. Try your request again.{C.RESET}")
+                    self._set_stop_reason("error", str(e)[:200])
+                    if self.config.debug:
+                        traceback.print_exc()
                     else:
-                        _p(f"{C.DIM}The model '{self.config.model}' is not available on the configured Ollama endpoint.{C.RESET}")
-                        _p(f"{C.DIM}Check OLLAMA_HOST / OLLAMA_API_KEY and your Ollama Cloud access.{C.RESET}")
-                elif e.code == 400:
-                    _p(f"{C.DIM}The request was rejected — the model name or context may be invalid.{C.RESET}")
-                break
-            except urllib.error.URLError as e:
-                self.tui.stop_spinner()
-                if response is not None and hasattr(response, 'close'):
-                    response.close()
-                if text:
-                    self.session.add_assistant_message(text)
-                _p(f"\n{C.RED}Ollama（ローカル AI エンジン）への接続が失われました。(Lost connection to Ollama - the local AI engine){C.RESET}")
-                _p(f"{C.DIM}It may have crashed or been closed. Restart it:  ollama serve{C.RESET}")
-                _p(f"{C.DIM}Your conversation is still here — just try again after restarting.{C.RESET}")
-                break
-            except Exception as e:
-                self.tui.stop_spinner()
-                if response is not None and hasattr(response, 'close'):
-                    response.close()
-                if text:
-                    self.session.add_assistant_message(text)
-                _p(f"\n{C.RED}問題が発生しました：{e} (Something went wrong: {e}){C.RESET}")
-                _p(f"{C.DIM}Your conversation is still active. Try your request again.{C.RESET}")
-                self._set_stop_reason("error", str(e)[:200])
-                if self.config.debug:
-                    traceback.print_exc()
-                else:
-                    _p(f"{C.DIM}(Run with --debug for full details){C.RESET}")
-                self._route_prefilter_names = None
-                break
-        else:
-            # P1: 制限到達時の UX 改善 — 自動保存＋再開 prompt
-            session_path = self.session.save()
-            _p(f"\n{C.YELLOW}The AI took {self.max_iterations} steps without finishing.{C.RESET}")
-            _p(f"{C.GREEN}✓ Session auto-saved to: {session_path}{C.RESET}")
-            _p(f"{C.DIM}Try breaking the task into smaller steps,{C.RESET}")
-            _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
-            _p(f"\n{C.CYAN}Continue this session? [Y/n]: {C.RESET}", end="")
-            try:
-                cont = input().strip().lower()
-                if cont in ("", "y", "yes", "はい"):
-                    _p(f"{C.DIM}Continuing... (reset step counter){C.RESET}")
-                    self.session.add_system_note(f"Session continued after {self.max_iterations} steps")
-                    self._run_impl(user_input, skip_add=True)  # restart without re-adding user message
-                else:
+                        _p(f"{C.DIM}(Run with --debug for full details){C.RESET}")
+                    self._route_prefilter_names = None
+                    break
+            else:
+                # P1: 制限到達時の UX 改善 — 自動保存＋再開 prompt
+                session_path = self.session.save()
+                _p(f"\n{C.YELLOW}The AI took {self.max_iterations} steps without finishing.{C.RESET}")
+                _p(f"{C.GREEN}✓ Session auto-saved to: {session_path}{C.RESET}")
+                _p(f"{C.DIM}Try breaking the task into smaller steps,{C.RESET}")
+                _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
+                _p(f"\n{C.CYAN}Continue this session? [Y/n]: {C.RESET}", end="")
+                try:
+                    cont = input().strip().lower()
+                    if cont in ("", "y", "yes", "はい"):
+                        _p(f"{C.DIM}Continuing... (reset step counter){C.RESET}")
+                        self.session.add_system_note(f"Session continued after {self.max_iterations} steps")
+                        self._run_impl(user_input, skip_add=True)  # restart without re-adding user message
+                    else:
+                        _p(f"{C.DIM}セッションが終了しました。再開：eve-coder --resume (Session ended. Resume with: eve-coder --resume){C.RESET}")
+                except EOFError:
                     _p(f"{C.DIM}セッションが終了しました。再開：eve-coder --resume (Session ended. Resume with: eve-coder --resume){C.RESET}")
-            except EOFError:
-                _p(f"{C.DIM}セッションが終了しました。再開：eve-coder --resume (Session ended. Resume with: eve-coder --resume){C.RESET}")
-            self._set_stop_reason("max_iterations", f"{self.max_iterations} iterations")
+                self._set_stop_reason("max_iterations", f"{self.max_iterations} iterations")
 
-        # Fire Stop hook when agent loop ends
-        self._route_prefilter_names = None
-        if self.session.runtime_state:
-            self.session.runtime_state.update_runtime(
-                last_known_phase="idle",
-                updated_at=time.time(),
-            )
-        if self.hook_mgr and self.hook_mgr.has_hooks:
-            self.hook_mgr.fire("Stop", {"model": self.config.model, "cwd": self.config.cwd})
-        if _active_notifier is not None:
-            _active_notifier.notify("stop", {
-                "event": "stop",
-                "reason": (self._last_stop_reason or {}).get("reason", "completed"),
-                "detail": (self._last_stop_reason or {}).get("detail", ""),
-                "model": self.config.model,
-                "cwd": self.config.cwd,
-                "session_id": self.session.session_id,
-                "plan_mode": self._plan_mode,
-            })
+            # Fire Stop hook when agent loop ends
+            self._route_prefilter_names = None
+            if self.session.runtime_state:
+                self.session.runtime_state.update_runtime(
+                    last_known_phase="idle",
+                    updated_at=time.time(),
+                )
+            if self.hook_mgr and self.hook_mgr.has_hooks:
+                self.hook_mgr.fire("Stop", {"model": self.config.model, "cwd": self.config.cwd})
+            if _active_notifier is not None:
+                _active_notifier.notify("stop", {
+                    "event": "stop",
+                    "reason": (self._last_stop_reason or {}).get("reason", "completed"),
+                    "detail": (self._last_stop_reason or {}).get("detail", ""),
+                    "model": self.config.model,
+                    "cwd": self.config.cwd,
+                    "session_id": self.session.session_id,
+                    "plan_mode": self._plan_mode,
+                })
 
-        # Stop ESC monitor (scroll region stays active — managed by main loop)
-        _esc_monitor.stop()
+        # ESC monitor stopped automatically by context manager (__exit__)
 
     def get_typeahead(self):
         """Return and clear any type-ahead text captured during last run()."""

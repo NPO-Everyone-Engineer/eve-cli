@@ -28,6 +28,12 @@ class _FakeInputMonitor:
     def stop(self):
         return None
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
 
 class _FakePermissions:
     auto_mode = False
