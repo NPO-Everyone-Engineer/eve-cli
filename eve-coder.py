@@ -315,7 +315,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.41.0"
+__version__ = "2.41.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -21860,7 +21860,10 @@ class Agent:
                 pending_verification=self._relativize_paths(self._modified_file_paths),
             )
 
-        # Auto-parallel detection: if user asks multiple independent tasks, run them in parallel
+        # Auto-parallel detection: if user asks multiple independent tasks, run them in parallel.
+        # Routes the synthetic tool call through the same hook/permission path as a normal
+        # tool dispatch so PreToolUse hooks, permission rules, and PostToolUse audit fire
+        # consistently regardless of whether ParallelAgents was invoked by the LLM or auto-detected.
         # Known limitation: RAG context is not injected when auto-parallel fires, because
         # this branch returns early before the RAG injection block below.
         parallel_tasks = []
@@ -21877,13 +21880,59 @@ class Agent:
                         {"prompt": t, "max_turns": default_subagent_turns}
                         for t in parallel_tasks
                     ]
-                    _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}⚡ Auto-detected {len(parallel_tasks)} parallel tasks{C.RESET}")
-                    result = pa_tool.execute({"tasks": tasks_payload})
-                    # Add parallel result to conversation and continue to main loop for follow-up tasks
-                    self.session.add_assistant_message(result, [])
-                    _p(f"\n{C.BBLUE}assistant{C.RESET}: ", end="")
-                    self.tui._render_markdown(result)
-                    _p()
+                    pa_tool_name = getattr(pa_tool, "name", "ParallelAgents")
+                    pa_params = {"tasks": tasks_payload}
+                    pa_blocked_reason = None
+
+                    # 1) PreToolUse hook can deny
+                    if self.hook_mgr and self.hook_mgr.has_hooks:
+                        if self.hook_mgr.fire_pre_tool(pa_tool_name, pa_params) == "deny":
+                            pa_blocked_reason = "blocked by PreToolUse hook"
+
+                    # 2) PermissionMgr check (same as normal dispatch). Some tests
+                    # construct Agent without a permissions instance — be lenient there.
+                    if pa_blocked_reason is None and self.permissions is not None:
+                        if not self.permissions.check(pa_tool_name, pa_params, self.tui):
+                            pa_blocked_reason = self.permissions.describe_last_decision() \
+                                or "permission denied"
+
+                    if pa_blocked_reason is not None:
+                        _p(f"\n  {_ansi(chr(27)+'[38;5;196m')}⛔ Auto-parallel "
+                           f"({len(parallel_tasks)} tasks) {pa_blocked_reason}.{C.RESET}")
+                    else:
+                        _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}⚡ Auto-detected "
+                           f"{len(parallel_tasks)} parallel tasks{C.RESET}")
+                        _pa_t0 = time.time()
+                        try:
+                            result = pa_tool.execute(pa_params)
+                            _pa_err = isinstance(result, str) and (
+                                result.startswith("Error:") or result.startswith("Error -")
+                            )
+                        except Exception:
+                            # Re-raise to preserve existing test contract that
+                            # ParallelAgents exceptions propagate (e.g. cancellation).
+                            raise
+                        _pa_dur = time.time() - _pa_t0
+
+                        # 3) PostToolUse hook + audit (mirror normal dispatch)
+                        if self.hook_mgr and self.hook_mgr.has_hooks:
+                            self.hook_mgr.fire_post_tool(pa_tool_name, result, _pa_err)
+                            self.hook_mgr.fire_subagent_stop(
+                                pa_tool_name,
+                                stop_reason="error" if _pa_err else "completed",
+                                detail=str(result)[:200] if _pa_err else "",
+                            )
+                        if self._evolution:
+                            self._evolution.record_tool_call(pa_tool_name, not _pa_err, _pa_dur)
+                        if self.output_collector:
+                            self.output_collector.tool_call(pa_tool_name, pa_params)
+                            self.output_collector.tool_result(pa_tool_name, result, _pa_err)
+
+                        # Add parallel result to conversation and continue to main loop
+                        self.session.add_assistant_message(result, [])
+                        _p(f"\n{C.BBLUE}assistant{C.RESET}: ", end="")
+                        self.tui._render_markdown(result)
+                        _p()
                     # 'return' を削除 → メインループに進みLLMが後続タスクを処理する
 
         # RAG: inject relevant context before the user message

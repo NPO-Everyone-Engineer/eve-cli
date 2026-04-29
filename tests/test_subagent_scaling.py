@@ -289,5 +289,132 @@ class TestParallelAgents(unittest.TestCase):
         )
 
 
+class TestAutoParallelHookGate(unittest.TestCase):
+    """Auto-parallel detection should fire PreToolUse + PostToolUse hooks
+    for the synthetic ParallelAgents call, matching normal tool dispatch.
+    Regression test for security review finding #2."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.config_dir = os.path.join(self.test_dir, ".eve-cli-config")
+        os.makedirs(self.config_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _build_agent(self, hook_mgr, parallel_tool, perm_check_returns=True):
+        class _FakeRegistry:
+            def __init__(self, tool):
+                self.tool = tool
+            def get(self, name):
+                return self.tool if name == "ParallelAgents" else None
+
+        class _FakeSession:
+            def __init__(self):
+                self.runtime_state = None
+                self.user_messages = []
+            def get_resume_summary(self):
+                return {}
+            def add_user_message(self, m):
+                self.user_messages.append(m)
+            def add_assistant_message(self, *a, **k):
+                pass
+
+        class _FakePermissions:
+            def __init__(self, returns):
+                self.returns = returns
+                self.checks = []
+            def check(self, tool_name, params, tui):
+                self.checks.append((tool_name, params))
+                return self.returns
+            def describe_last_decision(self):
+                return "denied for test"
+
+        tui = SimpleNamespace(
+            _scroll_print=lambda *a, **k: None,
+            _render_markdown=lambda *a, **k: None,
+        )
+        cfg = SimpleNamespace(
+            cwd=self.test_dir, config_dir=self.config_dir,
+            autotest_on_start=False, max_agent_steps=20, max_turns=None,
+            rag=False, default_subagent_max_turns=15, model="m", sidecar_model="",
+        )
+        perms = _FakePermissions(perm_check_returns)
+        session = _FakeSession()
+        agent = eve_coder.Agent(
+            cfg, client=object(), registry=_FakeRegistry(parallel_tool),
+            permissions=perms, session=session, tui=tui, hook_mgr=hook_mgr,
+        )
+        return agent, perms
+
+    def test_pre_tool_hook_deny_blocks_auto_parallel(self):
+        class _StopRun(Exception):
+            pass
+
+        class _FakeParallelTool:
+            name = "ParallelAgents"
+            def __init__(self):
+                self.executed = False
+            def execute(self, payload):
+                self.executed = True
+                raise _StopRun()
+
+        class _FakeHookMgr:
+            has_hooks = True
+            def __init__(self):
+                self.pre_calls = []
+                self.post_calls = []
+            def fire_pre_tool(self, tool, params):
+                self.pre_calls.append(tool)
+                return "deny"
+            def fire_post_tool(self, *a, **k):
+                self.post_calls.append(a)
+            def fire_subagent_stop(self, *a, **k):
+                pass
+
+        hook_mgr = _FakeHookMgr()
+        ptool = _FakeParallelTool()
+        agent, perms = self._build_agent(hook_mgr, ptool)
+        with patch.object(eve_coder.Agent, "_detect_parallel_tasks", return_value=["a", "b"]):
+            try:
+                agent._run_impl("two parallel things")
+            except Exception:
+                pass  # outer loop may raise on subsequent steps; we only check the gate
+        self.assertEqual(hook_mgr.pre_calls, ["ParallelAgents"])
+        self.assertFalse(ptool.executed, "tool must NOT execute when PreToolUse hook denies")
+        self.assertEqual(perms.checks, [], "permission check must be skipped after hook deny")
+
+    def test_permission_deny_blocks_auto_parallel(self):
+        class _FakeParallelTool:
+            name = "ParallelAgents"
+            def __init__(self):
+                self.executed = False
+            def execute(self, payload):
+                self.executed = True
+                return "ok"
+
+        class _FakeHookMgr:
+            has_hooks = False
+            def fire_pre_tool(self, *a, **k):
+                return "allow"
+            def fire_post_tool(self, *a, **k):
+                pass
+            def fire_subagent_stop(self, *a, **k):
+                pass
+
+        ptool = _FakeParallelTool()
+        agent, perms = self._build_agent(_FakeHookMgr(), ptool, perm_check_returns=False)
+        with patch.object(eve_coder.Agent, "_detect_parallel_tasks", return_value=["a", "b"]):
+            try:
+                agent._run_impl("two parallel things")
+            except Exception:
+                pass
+        self.assertEqual(perms.checks, [("ParallelAgents", {"tasks": [
+            {"prompt": "a", "max_turns": 15},
+            {"prompt": "b", "max_turns": 15},
+        ]})])
+        self.assertFalse(ptool.executed, "tool must NOT execute when permissions.check returns False")
+
+
 if __name__ == "__main__":
     unittest.main()
