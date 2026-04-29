@@ -315,7 +315,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.41.2"
+__version__ = "2.41.3"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -7914,14 +7914,21 @@ def _get_default_subagent_max_turns(config):
     )
 
 class MultiEditTool(Tool):
-    """Apply multiple file edits in a single tool call with parallel execution."""
+    """Apply multiple file edits in a single tool call with two-phase commit semantics.
+
+    Atomicity contract: validates and stages every edit first; if any single
+    edit fails validation, **no files are modified**. Only when all edits
+    validate cleanly do we write the staged changes. If a write itself fails
+    mid-batch, already-written files are rolled back to their original
+    content (best-effort).
+    """
     name = "MultiEdit"
     description = (
         "Apply multiple edits across one or more files in a single call. "
         "Each edit specifies a file_path, old_string, and new_string. "
         "Use this when you need to make coordinated changes across files "
         "(e.g., rename a function and update all call sites). "
-        "Files are processed in parallel (max 5 concurrent) for better performance."
+        "ATOMIC: if any edit fails validation, no files are modified."
     )
     parameters = {
         "type": "object",
@@ -7955,105 +7962,185 @@ class MultiEditTool(Tool):
                 self._file_locks[path] = threading.Lock()
             return self._file_locks[path]
 
-    def _validate_and_apply_edit(self, edit, index):
-        """Validate and apply a single edit. Returns (success, result_message)."""
-        fpath = edit.get("file_path", "")
-        old_s = edit.get("old_string", "")
-        new_s = edit.get("new_string", "")
+    def _resolve_edit_target(self, edit, index):
+        """Resolve and validate path-level checks for one edit.
 
+        Returns (resolved_path, error_message). On failure, error_message is
+        a human-readable string and resolved_path is None.
+        """
+        fpath = edit.get("file_path", "")
         if not fpath or not os.path.isabs(fpath):
-            return False, f"[{index+1}] Error: invalid path '{fpath}'"
+            return None, f"[{index+1}] Error: invalid path '{fpath}'"
         resolved_path, path_error = _resolve_repo_path(
             self._base_dir(), fpath, require_exists=True, path_label="file"
         )
         if path_error:
             if "symlink" in path_error.lower():
-                return False, f"[{index+1}] Error: symlink not allowed '{fpath}'"
-            return False, f"[{index+1}] {path_error}"
+                return None, f"[{index+1}] Error: symlink not allowed '{fpath}'"
+            return None, f"[{index+1}] {path_error}"
         if _is_protected_path(fpath):
-            return False, f"[{index+1}] Error: protected path '{fpath}'"
-
+            return None, f"[{index+1}] Error: protected path '{fpath}'"
         if not os.path.isfile(resolved_path):
-            return False, f"[{index+1}] Error: file not found '{fpath}'"
+            return None, f"[{index+1}] Error: file not found '{fpath}'"
+        return resolved_path, None
 
-        # Acquire lock for this specific file to prevent concurrent writes
+    def _write_atomic(self, resolved_path, new_content):
+        """Atomic single-file write. Raises on failure."""
         lock = self._get_file_lock(resolved_path)
         with lock:
+            dirname = os.path.dirname(resolved_path)
+            fd, tmp_path = tempfile.mkstemp(dir=dirname or ".", suffix=".eve_tmp")
             try:
-                with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-
-                if old_s not in content:
-                    return False, f"[{index+1}] Error: old_string not found in {os.path.basename(resolved_path)}"
-
-                count = content.count(old_s)
-                warning = ""
-                if count > 1:
-                    warning = f" [{count} occurrences, replacing first only]"
-
-                new_content = content.replace(old_s, new_s, 1)
-                dirname = os.path.dirname(resolved_path)
-                fd, tmp_path = tempfile.mkstemp(dir=dirname or ".", suffix=".eve_tmp")
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                    f.write(new_content)
+                os.replace(tmp_path, resolved_path)
+            except Exception:
                 try:
-                    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                        f.write(new_content)
-                    os.replace(tmp_path, resolved_path)
-                except Exception:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                    raise
-
-                return True, f"[{index+1}] OK: {os.path.basename(resolved_path)}{warning}"
-            except OSError as e:
-                return False, f"[{index+1}] Error: {e}"
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
 
     def execute(self, params):
+        """Two-phase commit: validate all edits (chained per-file), then write
+        all (or none). Same-file edits compose in input order so the second
+        edit sees the result of the first; this preserves the legacy chain
+        semantics while providing all-or-nothing atomicity at the batch level.
+
+        Phase 1 (sequential per file, parallel across files): for each unique
+        target file, read once and apply the file's edits in input order to
+        build a final new_content. Any single edit failure aborts the batch.
+        Phase 2 (sequential apply): write each file's final content atomically.
+        On any write failure, roll back already-written files to their
+        captured originals (best-effort) before returning the error.
+        """
         edits = params.get("edits", [])
         if not edits:
             return "Error: no edits provided"
         if len(edits) > 20:
             return "Error: too many edits (max 20)"
 
-        results = [None] * len(edits)
-        success_count = 0
+        # Phase 1a: resolve every edit's target path so we can group cleanly.
+        path_resolutions = []  # list[(resolved_path or None, error_msg or None)]
+        for i, edit in enumerate(edits):
+            resolved_path, error = self._resolve_edit_target(edit, i)
+            path_resolutions.append((resolved_path, error))
 
-        # Show progress if enabled
+        path_errors = [err for _, err in path_resolutions if err]
+        if path_errors:
+            summary = (
+                f"\n{C.BOLD}MultiEdit: 0/{len(edits)} edits applied "
+                f"— aborted at validation (atomic){C.RESET}\n"
+            )
+            return summary + "\n".join(path_errors)
+
+        # Phase 1b: group edits by resolved path, preserving input order.
+        groups = collections.OrderedDict()  # path -> list[(index, edit)]
+        for i, edit in enumerate(edits):
+            resolved_path = path_resolutions[i][0]
+            groups.setdefault(resolved_path, []).append((i, edit))
+
         if _SHOW_PROGRESS and len(edits) > 1:
-            print(f"\n{C.CYAN}Processing {len(edits)} file(s) in parallel (max {_MAX_PARALLEL_FILES} concurrent)...{C.RESET}")
+            print(f"\n{C.CYAN}Validating {len(edits)} edit(s) across {len(groups)} file(s)...{C.RESET}")
 
-        # Process edits in parallel using ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_PARALLEL_FILES) as executor:
-            # Submit all tasks
-            future_to_index = {
-                executor.submit(self._validate_and_apply_edit, edit, i): i
-                for i, edit in enumerate(edits)
-            }
+        # Phase 1c: per file, read once and chain-apply edits to build final content.
+        plans = []  # list[(resolved_path, original_content, final_content, [(idx, msg)])]
+        per_edit_messages = [None] * len(edits)
+        per_edit_failures = []
 
-            # Collect results as they complete
-            for future in concurrent.futures.as_completed(future_to_index):
-                index = future_to_index[future]
+        def _stage_group(resolved_path, group):
+            lock = self._get_file_lock(resolved_path)
+            with lock:
                 try:
-                    success, result_msg = future.result()
-                    results[index] = result_msg
-                    if success:
-                        success_count += 1
+                    with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
+                        original = f.read()
+                except OSError as e:
+                    return None, [(group[0][0], f"[{group[0][0]+1}] Error: {e}")]
+            running = original
+            local_msgs = []
+            for idx, edit in group:
+                old_s = edit.get("old_string", "")
+                new_s = edit.get("new_string", "")
+                if old_s not in running:
+                    local_msgs.append((
+                        idx,
+                        f"[{idx+1}] Error: old_string not found in "
+                        f"{os.path.basename(resolved_path)}",
+                    ))
+                    return None, local_msgs
+                count = running.count(old_s)
+                warning = f" [{count} occurrences, replacing first only]" if count > 1 else ""
+                running = running.replace(old_s, new_s, 1)
+                local_msgs.append((
+                    idx,
+                    f"[{idx+1}] OK: {os.path.basename(resolved_path)}{warning}",
+                ))
+            return (resolved_path, original, running, local_msgs), None
 
-                    # Show progress update
-                    if _SHOW_PROGRESS and len(edits) > 1:
-                        completed = sum(1 for r in results if r is not None)
-                        status = f"{C.GREEN}✓{C.RESET}" if success else f"{C.RED}✗{C.RESET}"
-                        fname = os.path.basename(edits[index].get("file_path", "unknown"))
-                        print(f"  {status} {fname} ({completed}/{len(edits)})")
-
+        # Files are independent; stage them in parallel for speed.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_PARALLEL_FILES) as executor:
+            future_to_path = {
+                executor.submit(_stage_group, p, g): p
+                for p, g in groups.items()
+            }
+            for future in concurrent.futures.as_completed(future_to_path):
+                try:
+                    plan, failure = future.result()
                 except Exception as e:
-                    results[index] = f"[{index+1}] Error: {e}"
+                    plan = None
+                    failure = [(0, f"Error: {e}")]
+                if plan is not None:
+                    for idx, msg in plan[3]:
+                        per_edit_messages[idx] = msg
+                    plans.append(plan)
+                else:
+                    for idx, msg in (failure or []):
+                        per_edit_failures.append((idx, msg))
 
-        # Filter out None results and build final output
-        final_results = [r for r in results if r is not None]
-        summary = f"\n{C.BOLD}MultiEdit: {success_count}/{len(edits)} edits applied{C.RESET}\n"
-        return summary + "\n".join(final_results)
+        if per_edit_failures:
+            ok_lines = [m for m in per_edit_messages if m]
+            ok_lines = [m + " (staged, rolled back)" for m in ok_lines]
+            failure_lines = [m for _, m in sorted(per_edit_failures, key=lambda x: x[0])]
+            summary = (
+                f"\n{C.BOLD}MultiEdit: 0/{len(edits)} edits applied "
+                f"— aborted at validation (atomic){C.RESET}\n"
+            )
+            return summary + "\n".join(ok_lines + failure_lines)
+
+        # Phase 2: write each file once with the chained final content.
+        applied = []  # list[(resolved_path, original_content)] for rollback
+        write_error = None
+        for resolved_path, original, final_content, _ in plans:
+            try:
+                self._write_atomic(resolved_path, final_content)
+                applied.append((resolved_path, original))
+                if _SHOW_PROGRESS and len(edits) > 1:
+                    print(f"  {C.GREEN}✓{C.RESET} {os.path.basename(resolved_path)} "
+                          f"({len(applied)}/{len(plans)} files)")
+            except Exception as e:
+                write_error = (resolved_path, str(e))
+                break
+
+        if write_error is None:
+            summary = f"\n{C.BOLD}MultiEdit: {len(edits)}/{len(edits)} edits applied{C.RESET}\n"
+            return summary + "\n".join(m for m in per_edit_messages if m)
+
+        # Apply phase failed mid-batch — roll back already-written files.
+        rollback_errors = []
+        for path, original in applied:
+            try:
+                self._write_atomic(path, original)
+            except Exception as e:
+                rollback_errors.append(f"{os.path.basename(path)}: {e}")
+        failed_path, failed_msg = write_error
+        msg_lines = [
+            f"\n{C.BOLD}MultiEdit: 0/{len(edits)} edits applied "
+            f"— write failed, rolled back (atomic){C.RESET}",
+            f"Failed at {os.path.basename(failed_path)}: {failed_msg}",
+        ]
+        if rollback_errors:
+            msg_lines.append("Rollback issues: " + "; ".join(rollback_errors))
+        return "\n".join(msg_lines)
 
 
 class GlobTool(Tool):

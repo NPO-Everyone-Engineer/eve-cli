@@ -82,7 +82,10 @@ class TestParallelFileEditing(ParallelFileEditingTestCase):
             self.assertNotIn(f"Hello World {i}", content)
         self.assertLess(elapsed, 2.0)
 
-    def test_partial_failure(self):
+    def test_partial_failure_aborts_atomically(self):
+        """Security Finding #4: MultiEdit must abort the whole batch if any
+        single edit fails validation. Previously this test asserted partial
+        success (`2/3 edits applied`); the atomic contract reverses that."""
         edits = [
             {
                 "file_path": self.test_files[0],
@@ -103,14 +106,16 @@ class TestParallelFileEditing(ParallelFileEditingTestCase):
 
         result = self.tool.execute({"edits": edits})
 
-        self.assertIn("2/3 edits applied", result)
+        self.assertIn("0/3 edits applied", result)
+        self.assertIn("aborted at validation", result)
         self.assertIn("Error: old_string not found", result)
+        # All three files MUST remain at their original content.
         with open(self.test_files[0], "r", encoding="utf-8") as f:
-            self.assertIn("Modified 0", f.read())
-        with open(self.test_files[2], "r", encoding="utf-8") as f:
-            self.assertIn("Modified 2", f.read())
+            self.assertIn("Hello World 0", f.read())
         with open(self.test_files[1], "r", encoding="utf-8") as f:
             self.assertIn("Hello World 1", f.read())
+        with open(self.test_files[2], "r", encoding="utf-8") as f:
+            self.assertIn("Hello World 2", f.read())
 
     def test_invalid_path(self):
         edits = [{
@@ -244,6 +249,49 @@ class TestParallelFileEditing(ParallelFileEditingTestCase):
     def test_empty_edits(self):
         result = self.tool.execute({"edits": []})
         self.assertIn("no edits provided", result)
+
+    def test_apply_phase_rollback(self):
+        """If a write fails after some files have been written, MultiEdit
+        must roll back the already-written files to their originals."""
+        edits = [
+            {
+                "file_path": self.test_files[0],
+                "old_string": "Hello World 0",
+                "new_string": "Modified 0",
+            },
+            {
+                "file_path": self.test_files[1],
+                "old_string": "Hello World 1",
+                "new_string": "Modified 1",
+            },
+            {
+                "file_path": self.test_files[2],
+                "old_string": "Hello World 2",
+                "new_string": "Modified 2",
+            },
+        ]
+        # Validation will pass for all three; force the second write to fail.
+        original_write = self.tool._write_atomic
+        call_count = {"n": 0}
+
+        def flaky_write(path, content):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise OSError("simulated disk failure")
+            return original_write(path, content)
+
+        self.tool._write_atomic = flaky_write
+        try:
+            result = self.tool.execute({"edits": edits})
+        finally:
+            self.tool._write_atomic = original_write
+
+        self.assertIn("0/3 edits applied", result)
+        self.assertIn("write failed, rolled back", result)
+        # All three originals must be restored.
+        for i in range(3):
+            with open(self.test_files[i], "r", encoding="utf-8") as f:
+                self.assertIn(f"Hello World {i}", f.read())
 
 
 class TestParallelConfiguration(unittest.TestCase):
