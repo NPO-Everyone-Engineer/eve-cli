@@ -47,8 +47,9 @@ eve-cli -p "Hello Worldを作って"
 |-----------|------|-----|
 | `--model <名前>` | 使用モデルを指定 | `--model qwen3.5:14b` |
 | `--vision-model <名前>` | 画像入力ターン専用モデルを指定 | `--vision-model gemma3` |
+| `--approval-mode <mode>` | 承認モードを指定 | `--approval-mode auto-run` |
 | `-p "<指示>"` | ワンショットモードで実行 | `-p "バグを直して"` |
-| `-y` | 自動許可モード（毎回の確認をスキップ） | |
+| `-y` | `--approval-mode full-auto` のエイリアス | |
 | `--resume` | セッションを再開（候補が複数あればピッカー表示） | |
 | `--continue` | 最新セッションを即時再開（ピッカーをスキップ） | |
 | `--session-id <id>` | 特定セッションを ID で指定再開 | |
@@ -104,7 +105,20 @@ eve-cli --model qwen3:8b --vision-model gemma3
 
 ## パーミッション（実行許可）
 
-EvE CLI はファイル書き込みやコマンド実行の前に必ず確認を求めます。
+EvE CLI には 5 つの承認モードがあります。既定の `suggest` は、ファイル変更・コマンド実行・ネットワークアクセスの前に確認を求めます。
+
+### 承認モード
+
+| モード | 動作 |
+|------|------|
+| `suggest` | 副作用のある操作は毎回確認 |
+| `auto-edit` | 通常のファイル編集は自動許可。シェル・ネットワーク・push/publish は確認 |
+| `auto-run` | 通常の編集・シェル・ネットワークは自動許可。高リスク操作と push/publish は確認 |
+| `full-auto` | 危険コマンドを除き自動許可 |
+| `audit` | 副作用のある操作をブロックする監査モード |
+
+起動時は `--approval-mode <mode>` で指定でき、セッション中は `/approval <mode>` で切り替えられます。
+`-y` / `--dangerously-skip-permissions` は `full-auto`、`--auto-mode` は `auto-run` への互換エイリアスです。
 
 ### 確認画面の選択肢
 
@@ -115,15 +129,17 @@ EvE CLI はファイル書き込みやコマンド実行の前に必ず確認を
 | `p` | このツールを**今後も毎回確認** |
 | `n` / Enter | **拒否**（デフォルト） |
 | `d` | このツールを**今後すべて**拒否 |
-| `Y` | **すべてのツール**を自動許可（`-y` モードと同じ） |
+| `Y` | `full-auto` に切り替えて許可 |
+| `e` / `r` / `u` / `s` | `auto-edit` / `auto-run` / `audit` / `suggest` に切り替えて許可 |
 
 ### 知っておくと便利なこと
 
 - `a` や `d` の設定は `~/.config/eve-cli/permissions.json` に保存され、次回も有効
-- `p` を選ぶと、そのツールは三値ポリシーの `prompt` として保存され、`-y` や Guardian auto-mode より優先して毎回確認されます
+- `p` を選ぶと、そのツールは三値ポリシーの `prompt` として保存され、承認モードより優先して毎回確認されます
 - **安全のため** `Bash`・`Write`・`Edit`・`ApplyPatch`・`MultiEdit`・`NotebookEdit` は永続的な自動許可ができません（毎回確認）
 - 危険なコマンド（`sudo`、`rm` 等）は赤色でハイライト表示されます
-- `--auto-mode` では Guardian が `low / medium / high` リスクを評価し、`low` は自動許可、`medium` は確認、`high` は自動拒否します
+- `auto-run` は Guardian/heuristic のリスク評価を使い、高リスク操作は再確認します
+- `audit` は副作用のある操作を止めるので、レビュー専用セッションに向いています
 
 ---
 
@@ -178,7 +194,7 @@ EvE CLI はファイル書き込みやコマンド実行の前に必ず確認を
 - `hooks / MCP / channel の読込状態を見たい` とき: `/bootstrap-graph`
 - `トークン消費と概算費用を見たい` とき: `/usage`
 
-`/doctor` には approval stack と直近の Guardian risk 判定も表示されます。
+`/doctor` には approval mode / approval stack と直近の Guardian risk 判定も表示されます。
 
 ---
 

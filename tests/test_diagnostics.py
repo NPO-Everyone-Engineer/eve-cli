@@ -118,6 +118,7 @@ class TestDiagnosticsFormatting(unittest.TestCase):
             hook_mgr = SimpleNamespace(has_hooks=False, _hooks=[])
             agent = SimpleNamespace(_evolution=None, _last_stop_reason=None, _last_route_report=None)
             lines = eve_coder._build_doctor_lines(cfg, client, registry, permissions, session, agent, hook_mgr, None, [])
+            self.assertIn("approval_mode", "\n".join(lines))
             self.assertIn("approval_stack", "\n".join(lines))
 
     def test_command_graph_uses_last_route_when_no_prompt(self):

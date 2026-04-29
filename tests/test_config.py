@@ -92,6 +92,9 @@ class TestConfigDefaults(unittest.TestCase):
     def test_default_yes_mode_false(self):
         self.assertFalse(self.cfg.yes_mode)
 
+    def test_default_approval_mode_suggest(self):
+        self.assertEqual(self.cfg.approval_mode, "suggest")
+
     def test_default_debug_false(self):
         self.assertFalse(self.cfg.debug)
 
@@ -562,7 +565,7 @@ class TestLoadEnv(unittest.TestCase):
             "EVE_CLI_SKILLS_ENABLE", "EVE_CLI_SKILLS_DISABLE",
             "EVE_CODER_SIDECAR", "EVE_CLI_SIDECAR_MODEL",
             "EVE_CODER_MAX_AGENT_STEPS", "EVE_CLI_MAX_AGENT_STEPS",
-            "EVE_CLI_PROFILE", "EVE_CODER_DEBUG", "EVE_CLI_DEBUG",
+            "EVE_CLI_PROFILE", "EVE_CLI_APPROVAL_MODE", "EVE_CODER_DEBUG", "EVE_CLI_DEBUG",
             "EVE_CLI_MARKDOWN_RENDERER",
         ]
         return {k: None for k in keys}
@@ -702,6 +705,14 @@ class TestLoadEnv(unittest.TestCase):
             self.cfg._load_env()
         self.assertEqual(self.cfg.profile, "offline")
 
+    def test_approval_mode_from_env(self):
+        env = self._make_env(EVE_CLI_APPROVAL_MODE="auto-edit")
+        with patch.dict(os.environ, env):
+            self.cfg._load_env()
+        self.assertEqual(self.cfg.approval_mode, "auto-edit")
+        self.assertFalse(self.cfg.yes_mode)
+        self.assertFalse(self.cfg.auto_mode)
+
     def test_debug_from_eve_cli_debug(self):
         env = self._make_env(EVE_CLI_DEBUG="1")
         with patch.dict(os.environ, env):
@@ -777,13 +788,27 @@ class TestLoadCliArgs(unittest.TestCase):
         self.cfg._load_cli_args(["--rubber-duck-checkpoints", "plan"])
         self.assertEqual(self.cfg.rubber_duck_checkpoints, "plan")
 
+    def test_approval_mode_flag(self):
+        self.cfg._load_cli_args(["--approval-mode", "auto-edit"])
+        self.assertEqual(self.cfg.approval_mode, "auto-edit")
+        self.assertFalse(self.cfg.yes_mode)
+        self.assertFalse(self.cfg.auto_mode)
+
     def test_yes_flag(self):
         self.cfg._load_cli_args(["-y"])
+        self.assertEqual(self.cfg.approval_mode, "full-auto")
         self.assertTrue(self.cfg.yes_mode)
 
     def test_dangerously_skip_permissions_flag(self):
         self.cfg._load_cli_args(["--dangerously-skip-permissions"])
+        self.assertEqual(self.cfg.approval_mode, "full-auto")
         self.assertTrue(self.cfg.yes_mode)
+
+    def test_auto_mode_flag_maps_to_auto_run(self):
+        self.cfg._load_cli_args(["--auto-mode"])
+        self.assertEqual(self.cfg.approval_mode, "auto-run")
+        self.assertFalse(self.cfg.yes_mode)
+        self.assertTrue(self.cfg.auto_mode)
 
     def test_debug_flag(self):
         self.cfg._load_cli_args(["--debug"])
@@ -1257,6 +1282,19 @@ class TestLoadConfigFile(unittest.TestCase):
             cfg._old_config_dir = os.path.join(tmpdir, "nonexistent_old")
             cfg._load_config_file()
             self.assertEqual(cfg.model, "test-model")
+
+    def test_approval_mode_loaded_from_config(self):
+        cfg = Config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = os.path.join(tmpdir, "config")
+            with open(config_file, "w") as f:
+                f.write("APPROVAL_MODE = auto-run\n")
+            cfg.config_file = config_file
+            cfg._old_config_dir = os.path.join(tmpdir, "nonexistent_old")
+            cfg._load_config_file()
+            self.assertEqual(cfg.approval_mode, "auto-run")
+            self.assertFalse(cfg.yes_mode)
+            self.assertTrue(cfg.auto_mode)
 
     def test_old_config_dir_backward_compat(self):
         """Old eve-coder config dir should be checked for backward compat."""

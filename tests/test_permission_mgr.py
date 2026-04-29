@@ -23,13 +23,20 @@ spec.loader.exec_module(eve_coder)
 PermissionMgr = eve_coder.PermissionMgr
 
 
-def _make_config(tmpdir, yes_mode=False, rules=None, auto_mode=False):
+def _make_config(tmpdir, yes_mode=False, rules=None, auto_mode=False, approval_mode=None):
     """Create a mock Config with a temporary permissions file."""
     perm_file = os.path.join(tmpdir, "permissions.json")
     if rules is not None:
         with open(perm_file, "w", encoding="utf-8") as f:
             json.dump(rules, f)
+    if approval_mode is None:
+        approval_mode = "full-auto" if yes_mode else "auto-run" if auto_mode else "suggest"
+    else:
+        approval_mode = eve_coder.Config.normalize_approval_mode(approval_mode) or approval_mode
+        yes_mode = approval_mode == "full-auto"
+        auto_mode = approval_mode == "auto-run"
     return SimpleNamespace(
+        approval_mode=approval_mode,
         yes_mode=yes_mode,
         auto_mode=auto_mode,
         permissions_file=perm_file,
@@ -162,6 +169,46 @@ class TestPermissionMgrYesMode(unittest.TestCase):
         cfg = _make_config(self.tmpdir, yes_mode=True)
         mgr = PermissionMgr(cfg)
         self.assertTrue(mgr.check("WebFetch", {"url": "https://example.com"}))
+
+
+class TestPermissionMgrApprovalModes(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_auto_edit_allows_write_without_prompt(self):
+        cfg = _make_config(self.tmpdir, approval_mode="auto-edit")
+        mgr = PermissionMgr(cfg)
+        self.assertTrue(mgr.check("Write", {"file_path": os.path.join(self.tmpdir, "note.txt")}))
+
+    def test_auto_edit_prompts_shell_without_tui(self):
+        cfg = _make_config(self.tmpdir, approval_mode="auto-edit")
+        mgr = PermissionMgr(cfg)
+        self.assertFalse(mgr.check("Bash", {"command": "ls"}))
+
+    def test_auto_run_prompts_push_without_tui(self):
+        cfg = _make_config(self.tmpdir, approval_mode="auto-run")
+        mgr = PermissionMgr(cfg)
+        self.assertFalse(mgr.check("Bash", {"command": "git push origin main"}))
+
+    def test_full_auto_allows_push_without_prompt(self):
+        cfg = _make_config(self.tmpdir, approval_mode="full-auto")
+        mgr = PermissionMgr(cfg)
+        self.assertTrue(mgr.check("Bash", {"command": "git push origin main"}))
+
+    def test_audit_blocks_write_even_when_session_allowed(self):
+        cfg = _make_config(self.tmpdir, approval_mode="audit")
+        mgr = PermissionMgr(cfg)
+        mgr.session_allow("Write")
+        self.assertFalse(mgr.check("Write", {"file_path": os.path.join(self.tmpdir, "note.txt")}))
+        self.assertIn("audit mode blocks write actions", mgr.describe_last_decision())
+
+    def test_policy_precedence_reports_current_approval_mode(self):
+        cfg = _make_config(self.tmpdir, approval_mode="audit")
+        mgr = PermissionMgr(cfg)
+        self.assertIn("approval-mode(audit)", mgr.policy_precedence())
 
 
 class TestPermissionMgrDangerousCommands(unittest.TestCase):
@@ -415,14 +462,13 @@ class TestPermissionMgrGuardian(unittest.TestCase):
         mgr._classify_with_sidecar = lambda tool, params: {"level": "low", "score": 0.1, "reason": "safe", "source": "guardian"}
         self.assertTrue(mgr.check("WebFetch", {"url": "https://example.com"}))
 
-    def test_auto_mode_medium_risk_prompts(self):
+    def test_auto_mode_medium_risk_allows_without_prompt(self):
         cfg = _make_config(self.tmpdir, auto_mode=True)
         mgr = PermissionMgr(cfg)
         mgr._sidecar_client = object()
         mgr._sidecar_model = "sidecar"
         mgr._classify_with_sidecar = lambda tool, params: {"level": "medium", "score": 0.5, "reason": "review", "source": "guardian"}
-        tui = SimpleNamespace(ask_permission=lambda *args, **kwargs: True)
-        self.assertTrue(mgr.check("WebFetch", {"url": "https://example.com"}, tui=tui))
+        self.assertTrue(mgr.check("WebFetch", {"url": "https://example.com"}))
 
     def test_auto_mode_high_risk_denies(self):
         cfg = _make_config(self.tmpdir, auto_mode=True)
@@ -431,6 +477,19 @@ class TestPermissionMgrGuardian(unittest.TestCase):
         mgr._sidecar_model = "sidecar"
         mgr._classify_with_sidecar = lambda tool, params: {"level": "high", "score": 0.9, "reason": "danger", "source": "guardian"}
         self.assertFalse(mgr.check("WebFetch", {"url": "https://example.com"}))
+
+    def test_auto_mode_high_risk_prompts_with_tui(self):
+        cfg = _make_config(self.tmpdir, auto_mode=True)
+        mgr = PermissionMgr(cfg)
+        mgr._sidecar_client = object()
+        mgr._sidecar_model = "sidecar"
+        mgr._classify_with_sidecar = lambda tool, params: {"level": "high", "score": 0.9, "reason": "danger", "source": "guardian"}
+        prompted_modes = []
+        tui = SimpleNamespace(
+            ask_permission=lambda *args, **kwargs: prompted_modes.append(kwargs.get("approval_mode")) or True
+        )
+        self.assertTrue(mgr.check("WebFetch", {"url": "https://example.com"}, tui=tui))
+        self.assertEqual(prompted_modes, ["auto-run"])
 
 
 if __name__ == "__main__":

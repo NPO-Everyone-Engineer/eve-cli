@@ -1202,6 +1202,8 @@ class Config:
     DEFAULT_SUBAGENT_MODEL = "qwen3-coder-next:cloud"
     DEFAULT_REVIEW_MODEL = ""
     DEFAULT_VISION_MODEL = "gemma4:31b-cloud"
+    DEFAULT_APPROVAL_MODE = "suggest"
+    APPROVAL_MODES = ("suggest", "auto-edit", "auto-run", "full-auto", "audit")
     DEFAULT_RUBBER_DUCK_CHECKPOINTS = "plan,post-edit"
     DEFAULT_MAX_TOKENS = 8192
     DEFAULT_TEMPERATURE = 0.7
@@ -1233,7 +1235,8 @@ class Config:
         self.max_agent_steps = self.DEFAULT_MAX_AGENT_STEPS
         self.prompt = None          # -p one-shot prompt
         self.output_format = "text" # --output-format (text, json, stream-json)
-        self.yes_mode = False       # -y auto-approve
+        self.approval_mode = self.DEFAULT_APPROVAL_MODE
+        self.yes_mode = False       # derived: approval_mode == full-auto
         self.debug = False
         self.resume = False
         self.continue_latest = False  # --continue: resume most recent without picker
@@ -1302,7 +1305,7 @@ class Config:
         self.sandbox_image = "python:3-slim"  # --sandbox-image
         self.sandbox_no_network = False  # --sandbox-no-network
         self.output_schema = None       # --output-schema (structured JSON output)
-        self.auto_mode = False          # -a/--auto-mode (sidecar permission classifier)
+        self.auto_mode = False          # derived: approval_mode == auto-run
         self.mcp_server = False         # --mcp-server (run as MCP server)
         self.shell_env_policy = "default"
         self.shell_env_include = []
@@ -1374,6 +1377,39 @@ class Config:
         self._ensure_dirs()
         self.load_custom_commands()
         return self
+
+    @classmethod
+    def normalize_approval_mode(cls, value):
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        aliases = {
+            "suggest": "suggest",
+            "confirm": "suggest",
+            "prompt": "suggest",
+            "manual": "suggest",
+            "auto-edit": "auto-edit",
+            "autoedit": "auto-edit",
+            "edit": "auto-edit",
+            "auto-run": "auto-run",
+            "autorun": "auto-run",
+            "run": "auto-run",
+            "full-auto": "full-auto",
+            "fullauto": "full-auto",
+            "audit": "audit",
+            "readonly": "audit",
+            "read-only": "audit",
+        }
+        return aliases.get(normalized)
+
+    def set_approval_mode(self, mode):
+        normalized = self.normalize_approval_mode(mode)
+        if not normalized:
+            return None
+        self.approval_mode = normalized
+        self.yes_mode = normalized == "full-auto"
+        self.auto_mode = normalized == "auto-run"
+        return normalized
 
     def _load_config_file(self):
         # Check old eve-coder config for backward compatibility, then current config
@@ -1449,6 +1485,8 @@ class Config:
                         self.ollama_api_key = val
                     elif key == "PROFILE" and val:
                         self.profile = val
+                    elif key == "APPROVAL_MODE" and val:
+                        self.set_approval_mode(val)
                     elif key == "MAX_TOKENS" and val:
                         try:
                             self.max_tokens = int(val)
@@ -1585,6 +1623,8 @@ class Config:
             )
         if os.environ.get("EVE_CLI_PROFILE"):
             self.profile = os.environ["EVE_CLI_PROFILE"]
+        if os.environ.get("EVE_CLI_APPROVAL_MODE"):
+            self.set_approval_mode(os.environ["EVE_CLI_APPROVAL_MODE"])
         if os.environ.get("EVE_CLI_PROMPT_COST_PER_MTOK"):
             try:
                 self.prompt_cost_per_mtok = max(0.0, float(os.environ["EVE_CLI_PROMPT_COST_PER_MTOK"]))
@@ -1669,7 +1709,10 @@ class Config:
         parser.add_argument("--vision-model", help=t('help.vision_model', default="Vision model for image input turns"))
         parser.add_argument("--review-model", help="Model to use for second-opinion reviews (/review, rubber-duck)")
         parser.add_argument("--rubber-duck-checkpoints", help="Automatic review checkpoints: plan, post-edit, or all")
-        parser.add_argument("-y", "--yes", action="store_true", help=t('help.yes', default="Auto-approve all tool calls"))
+        parser.add_argument("--approval-mode", choices=self.APPROVAL_MODES, metavar="MODE",
+                            help=t('help.approval_mode', default="Approval mode: suggest, auto-edit, auto-run, full-auto, audit"))
+        parser.add_argument("-y", "--yes", action="store_true",
+                            help=t('help.yes', default="Alias for --approval-mode full-auto"))
         parser.add_argument("--debug", action="store_true", help=t('help.debug', default="Debug mode"))
         parser.add_argument("--resume", action="store_true", help=t('help.resume', default="Resume a session (interactive picker if multiple candidates)"))
         parser.add_argument("--continue", dest="continue_latest", action="store_true",
@@ -1696,7 +1739,7 @@ class Config:
         parser.add_argument("--version", action="version", version=f"eve-coder {__version__}")
         parser.add_argument("--profile", help=t('help.profile', default="Connection profile: auto, online, offline, or custom name"))
         parser.add_argument("--dangerously-skip-permissions", action="store_true",
-                            help=t('help.dangerously_skip_permissions', default="Alias for -y (compatibility)"))
+                            help=t('help.dangerously_skip_permissions', default="Compatibility alias for --approval-mode full-auto"))
         # Output format
         parser.add_argument("--output-format", choices=["text", "json", "stream-json"],
                             default="text", help=t('help.output_format', default="Output format for one-shot mode"))
@@ -1764,9 +1807,9 @@ class Config:
         # Structured output schema for CI/CD
         parser.add_argument("--output-schema", metavar="SCHEMA",
                             help="JSON schema for structured output (file path or inline JSON). Use with --output-format json")
-        # Auto mode (sidecar-based permission classification)
+        # Auto mode (compatibility alias for approval-mode auto-run)
         parser.add_argument("-a", "--auto-mode", action="store_true", default=False,
-                            help="Auto-approve safe tool calls using sidecar model classification")
+                            help=t('help.auto_mode', default="Compatibility alias for --approval-mode auto-run"))
         parser.add_argument("--rubber-duck", action="store_true", default=False,
                             help="Enable automatic second-opinion reviews at key checkpoints")
         # MCP server mode
@@ -1794,8 +1837,12 @@ class Config:
         if args.review_model:
             self.review_model = args.review_model
             self._cli_review_model_set = True
-        if args.yes or args.dangerously_skip_permissions:
-            self.yes_mode = True
+        approval_mode_explicit = False
+        if args.approval_mode:
+            self.set_approval_mode(args.approval_mode)
+            approval_mode_explicit = True
+        if (args.yes or args.dangerously_skip_permissions) and not approval_mode_explicit:
+            self.set_approval_mode("full-auto")
         if args.debug:
             self.debug = True
         if args.resume:
@@ -1944,9 +1991,9 @@ class Config:
         # Output schema
         if args.output_schema:
             self.output_schema = self._load_output_schema(args.output_schema)
-        # Auto mode
-        if args.auto_mode:
-            self.auto_mode = True
+        # Auto mode compatibility alias
+        if args.auto_mode and not approval_mode_explicit and not (args.yes or args.dangerously_skip_permissions):
+            self.set_approval_mode("auto-run")
         # MCP server mode
         if args.mcp_server:
             self.mcp_server = True
@@ -10869,7 +10916,10 @@ def _run_mcp_server(config):
     """
     if getattr(config, "mcp_server_yes", False):
         # Legacy behavior: trust the MCP client to enforce permissions.
-        config.yes_mode = True
+        if hasattr(config, "set_approval_mode"):
+            config.set_approval_mode("full-auto")
+        else:
+            config.yes_mode = True
     # Try to create OllamaClient for Chat tool support
     client = None
     if config.model:
@@ -14903,6 +14953,26 @@ def _build_usage_report_lines(config, evolution, session=None):
     return lines
 
 
+def _approval_mode_value(config):
+    return (
+        Config.normalize_approval_mode(getattr(config, "approval_mode", None))
+        or ("full-auto" if getattr(config, "yes_mode", False)
+            else "auto-run" if getattr(config, "auto_mode", False)
+            else Config.DEFAULT_APPROVAL_MODE)
+    )
+
+
+def _approval_mode_allows(config, action):
+    allowed = {
+        "suggest": set(),
+        "auto-edit": {"write"},
+        "auto-run": {"write", "shell", "network"},
+        "full-auto": {"write", "shell", "network", "push"},
+        "audit": set(),
+    }
+    return action in allowed.get(_approval_mode_value(config), set())
+
+
 def _build_doctor_lines(config, client, registry, permissions, session, agent, hook_mgr, channel_manager, mcp_clients):
     try:
         conn_ok, models = client.check_connection(retries=1)
@@ -14916,6 +14986,7 @@ def _build_doctor_lines(config, client, registry, permissions, session, agent, h
     evo = getattr(agent, "_evolution", None)
     usage = evo.usage_summary() if evo else {"prompt_tokens": 0, "completion_tokens": 0, "estimated_cost_usd": 0.0}
     role_models = _role_model_snapshot(config)
+    approval_mode = _approval_mode_value(config)
     lines = [
         "Doctor",
         f"  version:            {__version__}",
@@ -14937,6 +15008,7 @@ def _build_doctor_lines(config, client, registry, permissions, session, agent, h
         f"  hook_env_policy:    {config.hook_env_policy}",
         f"  notifier:           {config.notify_command or '(disabled)'}",
         f"  notify_on:          {', '.join(config.notify_on)}",
+        f"  approval_mode:      {approval_mode}",
         f"  approvals:          global={policy['global_tool_rules'] + policy['global_category_rules'] + policy['global_path_rules']} "
         f"project={policy['project_tool_rules'] + policy['project_category_rules'] + policy['project_path_rules']}",
         f"  approval_stack:     {' > '.join(permissions.policy_precedence())}",
@@ -14982,6 +15054,10 @@ class PermissionMgr:
 
     _NO_PERSIST_ALLOW = {"Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"}
     _VALID_RULE_VALUES = {"allow", "deny", "prompt"}
+    _PUBLISH_COMMAND_PATTERN = re.compile(
+        r"\bgit\s+push\b|\bgh\s+(pr\s+(create|merge)|release\s+create|issue\s+create|repo\s+create)\b",
+        re.IGNORECASE,
+    )
     _TOOL_CATEGORIES = {
         "Bash": "shell",
         "Write": "write",
@@ -15005,8 +15081,18 @@ class PermissionMgr:
     _PATH_PARAM_KEYS = ("file_path", "notebook_path", "path")
 
     def __init__(self, config):
-        self.yes_mode = config.yes_mode
-        self.auto_mode = getattr(config, 'auto_mode', False)
+        legacy_mode = Config.DEFAULT_APPROVAL_MODE
+        if getattr(config, "yes_mode", False):
+            legacy_mode = "full-auto"
+        elif getattr(config, "auto_mode", False):
+            legacy_mode = "auto-run"
+        self.approval_mode = (
+            Config.normalize_approval_mode(getattr(config, "approval_mode", legacy_mode))
+            or legacy_mode
+        )
+        self.yes_mode = False
+        self.auto_mode = False
+        self._sync_approval_flags()
         self._sidecar_client = None   # Set externally after OllamaClient init
         self._sidecar_model = None    # Set externally after sidecar model selection
         self.rules = {}  # tool_name -> "allow" | "deny"
@@ -15035,7 +15121,19 @@ class PermissionMgr:
             if _should_load_project_permissions(config, self._project_permissions_path):
                 self._load_rules(self._project_permissions_path, scope="project")
 
-    # Dangerous commands that require confirmation even in -y mode
+    def _sync_approval_flags(self):
+        self.yes_mode = self.approval_mode == "full-auto"
+        self.auto_mode = self.approval_mode == "auto-run"
+
+    def set_approval_mode(self, mode):
+        normalized = Config.normalize_approval_mode(mode)
+        if not normalized:
+            return None
+        self.approval_mode = normalized
+        self._sync_approval_flags()
+        return normalized
+
+    # Dangerous commands that require confirmation even in auto-run/full-auto
     _ALWAYS_CONFIRM_PATTERNS = [
         r'\brm\s+-rf\s+/',       # rm -rf from root
         r'\bsudo\b',             # sudo commands
@@ -15284,18 +15382,112 @@ class PermissionMgr:
         return None
 
     def policy_precedence(self):
-        return [
+        stack = [
             "session-deny",
+            "dangerous-bash",
             "path-policy",
             "category-policy",
             "tool-policy",
-            "yes-mode",
-            "guardian-auto-mode",
             "safe-tool",
-            "session-allow",
-            "interactive-prompt",
-            "default-deny",
         ]
+        if self.approval_mode == "audit":
+            stack.append(f"approval-mode({self.approval_mode})")
+            stack.append("session-allow")
+        else:
+            stack.append("session-allow")
+            stack.append(f"approval-mode({self.approval_mode})")
+        stack.extend(["interactive-prompt", "default-deny"])
+        return stack
+
+    def _approval_action(self, tool_name, params):
+        if tool_name in self.SAFE_TOOLS:
+            return "safe"
+        if tool_name == "Bash":
+            command = ((params or {}).get("command", "") or "").strip()
+            if self._PUBLISH_COMMAND_PATTERN.search(command):
+                return "push"
+            return "shell"
+        if tool_name in self.NETWORK_TOOLS:
+            return "network"
+        if tool_name in {"Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"}:
+            return "write"
+        return "other"
+
+    def _approval_prompt_reason(self, mode, action, risk=None):
+        if action == "push":
+            return f"{mode} mode requires confirmation for push/publish actions."
+        if risk and risk.get("reason"):
+            return f"{mode} mode requires confirmation for high-risk {action} actions ({risk['reason']})"
+        return f"{mode} mode requires confirmation for {action} actions."
+
+    def _check_approval_mode(self, tool_name, params, tui):
+        action = self._approval_action(tool_name, params)
+        mode = self.approval_mode
+        if action == "safe":
+            return None
+        if mode == "audit":
+            self._set_last_decision(
+                False,
+                "approval-mode",
+                f"audit mode blocks {action} actions ({tool_name}).",
+                "session",
+                record_event=True,
+            )
+            return False
+        if action == "push":
+            if mode == "full-auto":
+                self._set_last_decision(
+                    True,
+                    "approval-mode",
+                    f"full-auto allows push/publish actions ({tool_name}).",
+                    "session",
+                )
+                return True
+            return self._prompt_for_permission(
+                tool_name,
+                params,
+                tui,
+                prompt_reason=self._approval_prompt_reason(mode, action),
+            )
+        if mode == "suggest":
+            return None
+        if mode == "auto-edit":
+            if action != "write":
+                return None
+            risk = self.assess_risk(tool_name, params)
+            if risk["level"] == "high":
+                return self._prompt_for_permission(
+                    tool_name,
+                    params,
+                    tui,
+                    prompt_reason=self._approval_prompt_reason(mode, action, risk),
+                    risk=risk,
+                )
+            self._set_last_decision(True, "approval-mode", f"auto-edit allows {tool_name}.", "session")
+            return True
+        if mode == "auto-run":
+            if action not in {"write", "shell", "network"}:
+                return None
+            risk = self.assess_risk(tool_name, params)
+            if risk["level"] == "high":
+                return self._prompt_for_permission(
+                    tool_name,
+                    params,
+                    tui,
+                    prompt_reason=self._approval_prompt_reason(mode, action, risk),
+                    risk=risk,
+                )
+            self._set_last_decision(
+                True,
+                "approval-mode",
+                f"auto-run allows {tool_name} ({action}).",
+                "session",
+            )
+            return True
+        if mode == "full-auto" and action in {"write", "shell", "network"}:
+            self._set_last_decision(True, "approval-mode", f"full-auto allows {tool_name}.", "session")
+            return True
+        return None
 
     def _record_risk(self, level, score, reason, source):
         self._last_risk = {
@@ -15349,15 +15541,26 @@ class PermissionMgr:
             return sidecar
         return heuristic
 
-    def _prompt_for_permission(self, tool_name, params, tui, *, prompt_reason=""):
-        risk = self.assess_risk(tool_name, params)
+    def _prompt_for_permission(self, tool_name, params, tui, *, prompt_reason="", risk=None):
+        risk = risk or self.assess_risk(tool_name, params)
         if not tui:
             self._set_last_decision(False, "default-deny", f"{tool_name} requires approval and no TUI is available.", "runtime")
             return False
-        result = tui.ask_permission(tool_name, params, risk=risk, reason=prompt_reason)
+        result = tui.ask_permission(
+            tool_name,
+            params,
+            risk=risk,
+            reason=prompt_reason,
+            approval_mode=self.approval_mode,
+        )
         if result == "yes_mode":
-            self.yes_mode = True
-            self._set_last_decision(True, "prompt", f"User enabled yes_mode while approving {tool_name}.", "session", record_event=True)
+            self.set_approval_mode("full-auto")
+            self._set_last_decision(True, "prompt", f"User switched approval mode to full-auto while approving {tool_name}.", "session", record_event=True)
+            return True
+        if isinstance(result, str) and result.startswith("mode:"):
+            mode = result.split(":", 1)[1]
+            self.set_approval_mode(mode)
+            self._set_last_decision(True, "prompt", f"User switched approval mode to {mode} while approving {tool_name}.", "session", record_event=True)
             return True
         if result == "allow_all":
             self.session_allow(tool_name)
@@ -15386,8 +15589,8 @@ class PermissionMgr:
             self._set_last_decision(False, "session", f"{tool_name} is denied for the rest of this session.", "session")
             return False
 
-        # Even in -y mode, confirm truly dangerous Bash commands
-        if tool_name == "Bash" and self.yes_mode:
+        # Even in auto-run/full-auto, confirm truly dangerous Bash commands
+        if tool_name == "Bash" and self.approval_mode in {"auto-run", "full-auto"}:
             cmd = params.get("command", "")
             for pat in self._ALWAYS_CONFIRM_PATTERNS:
                 if re.search(pat, cmd, re.IGNORECASE):
@@ -15431,33 +15634,20 @@ class PermissionMgr:
             message = f"Matched {tool_rule['scope']} tool rule {tool_rule['decision']} for {tool_name}"
             self._set_last_decision(allowed, "tool-policy", message, tool_rule["scope"], rule=tool_rule, record_event=not allowed)
             return allowed
-        if self.yes_mode:
-            self._set_last_decision(True, "yes-mode", f"yes_mode enabled for {tool_name}.", "session")
-            return True
-        # Auto mode: use sidecar model to classify tool calls
-        if self.auto_mode and tool_name not in self.SAFE_TOOLS:
-            if tool_name in self.ASK_TOOLS or tool_name in self.NETWORK_TOOLS:
-                risk = self.assess_risk(tool_name, params)
-                if risk["level"] == "low":
-                    self._set_last_decision(True, "auto-mode",
-                        f"[guardian] {tool_name}: low risk ({risk['reason']})",
-                        "session")
-                    return True
-                if risk["level"] == "high":
-                    self._set_last_decision(False, "auto-mode",
-                        f"[guardian] {tool_name}: high risk ({risk['reason']})",
-                        "session")
-                    return False
-                # Sidecar unavailable — fall through to user prompt
         if tool_name in self.SAFE_TOOLS:
             self._set_last_decision(True, "safe-tool", f"{tool_name} is always allowed.", "runtime")
             return True
+        if self.approval_mode == "audit":
+            return self._check_approval_mode(tool_name, params, tui)
 
         # Check persistent rules
         # Check session-level blanket allow
         if tool_name in self._session_allows:
             self._set_last_decision(True, "session", f"{tool_name} is allowed for the rest of this session.", "session")
             return True
+        approval_decision = self._check_approval_mode(tool_name, params, tui)
+        if approval_decision is not None:
+            return approval_decision
 
         # Unknown tools denied without TUI
         if tool_name not in self.SAFE_TOOLS and tool_name not in self.ASK_TOOLS and tool_name not in getattr(self, 'NETWORK_TOOLS', set()):
@@ -19897,7 +20087,7 @@ class TUI:
                 _slash_commands = [
                     "/help", "/exit", "/quit", "/q", "/clear", "/model", "/models",
                     "/status", "/doctor", "/tool-pool", "/command-graph", "/bootstrap-graph",
-                    "/save", "/compact", "/yes", "/no", "/tokens", "/context", "/usage",
+                    "/save", "/compact", "/approval", "/yes", "/no", "/tokens", "/context", "/usage",
                     "/think", "/no-think", "/map", "/review", "/rubber-duck", "/accept-review",
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
                     "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
@@ -19995,7 +20185,15 @@ class TUI:
 
         # System info with icons
         ram = _get_ram_gb()
-        mode_str = f"{_ansi(chr(27)+'[38;5;46m')}✓ AUTO-APPROVE{C.RESET}" if config.yes_mode else f"{_ansi(chr(27)+'[38;5;226m')}◆ CONFIRM{C.RESET}"
+        approval_mode = _approval_mode_value(config)
+        _mode_color, _mode_icon, _mode_label = {
+            "suggest": ("226", "◆", "SUGGEST"),
+            "auto-edit": ("46", "✎", "AUTO-EDIT"),
+            "auto-run": ("51", "⚡", "AUTO-RUN"),
+            "full-auto": ("46", "✓", "FULL-AUTO"),
+            "audit": ("196", "🛡", "AUDIT"),
+        }.get(approval_mode, ("226", "◆", approval_mode.upper()))
+        mode_str = f"{_ansi(chr(27)+f'[38;5;{_mode_color}m')}{_mode_icon} {_mode_label}{C.RESET}"
         model_color = _ansi(chr(27)+"[38;5;51m") if model_ok else _ansi(chr(27)+"[38;5;196m")
         model_icon = "🧠" if model_ok else "⚠️ "
         info_dim = C.DIM
@@ -20052,15 +20250,15 @@ class TUI:
                 print(f"  {C.DIM}  Check OLLAMA_HOST / OLLAMA_API_KEY and your Ollama Cloud access.{C.RESET}")
 
         print(sep_line)
-        # Recommend -y mode if not already enabled
-        if not config.yes_mode:
+        # Recommend approval modes if still in the default prompt-heavy mode
+        if approval_mode == "suggest":
             _rec = _ansi(chr(27)+"[38;5;226m")
             if self._is_cjk:
-                print(f"  {_rec}💡 推奨: eve-cli -y で自動許可モード（毎回の確認不要）{C.RESET}")
-                print(f"  {C.DIM}   セッション中に /yes でも切替可能{C.RESET}")
+                print(f"  {_rec}💡 推奨: eve-cli --approval-mode auto-run でローカル作業をより自動化{C.RESET}")
+                print(f"  {C.DIM}   切替: /approval suggest|auto-edit|auto-run|full-auto|audit{C.RESET}")
             else:
-                print(f"  {_rec}💡 Recommended: eve-cli -y for auto-approve (no confirmations){C.RESET}")
-                print(f"  {C.DIM}   Or type /yes during session to enable{C.RESET}")
+                print(f"  {_rec}💡 Recommended: eve-cli --approval-mode auto-run for smoother local execution{C.RESET}")
+                print(f"  {C.DIM}   Switch in-session with /approval suggest|auto-edit|auto-run|full-auto|audit{C.RESET}")
         # Detect CJK for appropriate hint
         _hint = _ansi("\033[38;5;250m")  # lighter gray for better visibility
         _esc_hint = "ESC/Ctrl+C 中断" if HAS_TERMIOS else "Ctrl+C 中断"
@@ -21161,7 +21359,7 @@ class TUI:
                 remaining = line_count - max_detail
                 _p(f"{detail_marker} {_ansi(chr(27)+'[38;5;245m')}  \u2195 {remaining} more lines{C.RESET}")
 
-    def ask_permission(self, tool_name, params, risk=None, reason=""):
+    def ask_permission(self, tool_name, params, risk=None, reason="", approval_mode="suggest"):
         """Ask user for permission — Claude Code style prompt."""
         icon, color = self._tool_icons().get(tool_name, ("🔧", C.YELLOW))
 
@@ -21279,10 +21477,12 @@ class TUI:
         risk_reason = reason or risk.get("reason", "")
         if risk_reason:
             print(f"  {_y}│{C.RESET} {C.DIM}   {risk_reason[:160]}{C.RESET}")
+        print(f"  {_y}│{C.RESET} {C.DIM}   approval mode: {approval_mode}{C.RESET}")
         print(f"  {_y}│{C.RESET}")
         persist_hint = " (保存)" if tool_name not in {"Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"} else ""
         print(f"  {_y}│{C.RESET}  [y] 一度許可   [a] 常に許可{persist_hint}   [p] 常に確認")
-        print(f"  {_y}│{C.RESET}  [n] 拒否 (Enter)  [d] 常に拒否   [Y] 全て自動許可")
+        print(f"  {_y}│{C.RESET}  [n] 拒否 (Enter)  [d] 常に拒否   [Y] full-auto")
+        print(f"  {_y}│{C.RESET}  [e] auto-edit   [r] auto-run   [u] audit   [s] suggest")
         print(f"  {_y}╰{'─' * box_w}{C.RESET}")
         try:
             reply = self._read_permission_input(f"  {_y}? {C.RESET}")
@@ -21301,6 +21501,16 @@ class TUI:
             return "prompt_all"
         elif reply_lower in ("d", "deny", "いいえ", "拒否"):
             return "deny_all"
+        elif reply_lower in ("e", "auto-edit"):
+            return "mode:auto-edit"
+        elif reply_lower in ("r", "auto-run"):
+            return "mode:auto-run"
+        elif reply_lower in ("u", "audit"):
+            return "mode:audit"
+        elif reply_lower in ("s", "suggest", "confirm"):
+            return "mode:suggest"
+        elif reply_lower in ("full-auto", "fullauto"):
+            return "mode:full-auto"
         else:
             return False
 
@@ -21432,8 +21642,9 @@ class TUI:
   {_c198}/context{C.RESET}           Alias of /tokens (Claude Code / Copilot CLI compatible)
   {_c198}/usage{C.RESET}             Show persistent token/cost usage report
   {_c198}/init{C.RESET}              Create CLAUDE.md template
-  {_c198}/yes{C.RESET}               Auto-approve ON
-  {_c198}/no{C.RESET}                Auto-approve OFF
+  {_c198}/approval{C.RESET} <mode>   Set approval mode (suggest, auto-edit, auto-run, full-auto, audit)
+  {_c198}/yes{C.RESET}               Alias for /approval full-auto
+  {_c198}/no{C.RESET}                Alias for /approval suggest
   {_c198}/image{C.RESET}             Attach image from clipboard
   {_c198}/image{C.RESET} <path>      Attach image file
   {_c198}@file{C.RESET}              Attach file contents (e.g. @src/main.py)
@@ -21506,7 +21717,8 @@ class TUI:
   {_c198}Ctrl+D{C.RESET}             Exit
   {_c198}Up/Down{C.RESET}            Command history
   {_c51}━━ Startup Flags {sep[16:]}{C.RESET}
-  {_c198}-y{C.RESET}                 Auto-approve all
+  {_c198}--approval-mode MODE{C.RESET} Set approval mode
+  {_c198}-y{C.RESET}                 Alias for --approval-mode full-auto
   {_c198}--debug{C.RESET}            Enable debug output
   {_c198}--resume{C.RESET}           Resume a session (interactive picker if multiple)
   {_c198}--continue{C.RESET}         Resume the most recent session (skip picker)
@@ -22746,7 +22958,7 @@ class Agent:
                             continue
                         # Show auto-mode classification result
                         if (self.permissions.auto_mode and self.permissions._last_decision
-                                and self.permissions._last_decision.get("source") == "auto-mode"):
+                                and self.permissions._last_decision.get("source") in {"auto-mode", "approval-mode"}):
                             _auto_reason = self.permissions._last_decision.get("reason", "")
                             _p(f"  {C.DIM}{_auto_reason}{C.RESET}")
                         # PreToolUse hook: allow hooks to deny tool execution after approval
@@ -23821,7 +24033,7 @@ def main():
         # Try to auto-start Ollama on macOS and Linux for local hosts only
         if config.uses_local_ollama() and shutil.which("ollama"):
             try:
-                ans = "y" if config.yes_mode else input(
+                ans = "y" if _approval_mode_allows(config, "shell") else input(
                     f"{_ansi(chr(27)+'[38;5;51m')}Try to start Ollama automatically? [Y/n]: {C.RESET}"
                 ).strip().lower()
                 if ans in ("", "y", "yes"):
@@ -23873,7 +24085,7 @@ def main():
             else:
                 print(f"{C.DIM}No models downloaded yet.{C.RESET}")
             do_pull = False
-            if config.yes_mode:
+            if _approval_mode_value(config) == "full-auto":
                 do_pull = True
             else:
                 try:
@@ -24800,15 +25012,29 @@ def main():
                                         f"{C.WHITE}E{C.RESET}{C.DIM}=Minimal{C.RESET}")
                         print(_tier_legend)
                     continue
+                elif cmd == "/approval":
+                    _parts = user_input.split(None, 1)
+                    if len(_parts) == 1:
+                        print(f"{C.CYAN}Approval mode: {config.approval_mode}{C.RESET}")
+                        print(f"{C.DIM}Modes: suggest | auto-edit | auto-run | full-auto | audit{C.RESET}")
+                        continue
+                    _new_mode = Config.normalize_approval_mode(_parts[1].strip())
+                    if not _new_mode:
+                        print(f"{C.YELLOW}{t('slash.approval_usage', default='Usage: /approval <suggest|auto-edit|auto-run|full-auto|audit>')}{C.RESET}")
+                        continue
+                    config.set_approval_mode(_new_mode)
+                    permissions.set_approval_mode(_new_mode)
+                    print(f"{C.GREEN}{t('slash.approval_set', default='Approval mode set to {mode}.').format(mode=_new_mode)}{C.RESET}")
+                    continue
                 elif cmd == "/yes":
-                    config.yes_mode = True
-                    permissions.yes_mode = True
-                    print(f"{C.GREEN}{t('slash.yes_enabled', default='Auto-approve enabled for this session.')}{C.RESET}")
+                    config.set_approval_mode("full-auto")
+                    permissions.set_approval_mode("full-auto")
+                    print(f"{C.GREEN}{t('slash.yes_enabled', default='Approval mode set to full-auto.')}{C.RESET}")
                     continue
                 elif cmd == "/no":
-                    config.yes_mode = False
-                    permissions.yes_mode = False
-                    print(f"{C.GREEN}{t('slash.no_disabled', default='Auto-approve disabled. Tool calls will require confirmation.')}{C.RESET}")
+                    config.set_approval_mode("suggest")
+                    permissions.set_approval_mode("suggest")
+                    print(f"{C.GREEN}{t('slash.no_disabled', default='Approval mode set to suggest.')}{C.RESET}")
                     continue
                 elif cmd == "/think":
                     config.think_mode = True
@@ -24931,7 +25157,7 @@ def main():
                             if not st.stdout.strip():
                                 print(f"{C.GREEN}{t('slash.commit_clean', default='Nothing to commit, working tree clean.')}{C.RESET}")
                                 continue
-                            if config.yes_mode:
+                            if _approval_mode_allows(config, "shell"):
                                 do_add = True
                             else:
                                 print(f"{C.YELLOW}{t('slash.commit_stage_prompt', default='Nothing staged. Stage tracked file changes with git add -u?')}{C.RESET}")
@@ -25032,7 +25258,7 @@ def main():
                         print(f"\n{C.CYAN}{t('slash.commit_proposed', default='Proposed commit message:')}{C.RESET}")
                         print(f"{C.BOLD}{commit_msg}{C.RESET}\n")
 
-                        if not config.yes_mode:
+                        if not _approval_mode_allows(config, "shell"):
                             ans = input(f"{C.CYAN}{t('slash.commit_confirm', default='Commit with this message? [Y/n/e(dit)]')}{C.RESET} ").strip().lower()
                             if ans == "e":
                                 print(f"{C.DIM}Enter new message (end with empty line):{C.RESET}")
@@ -25727,7 +25953,7 @@ def main():
                             print(f"  {C.DIM}{ln}{C.RESET}")
                         if test_code.count("\n") > 20:
                             print(f"  {C.DIM}... ({test_code.count(chr(10))+1} lines total){C.RESET}")
-                        if not config.yes_mode:
+                        if not _approval_mode_allows(config, "write"):
                             ans = input(f"{C.CYAN}Overwrite? [y/N] {C.RESET}").strip().lower()
                             if ans not in ("y", "yes"):
                                 continue
@@ -26011,7 +26237,7 @@ def main():
                     print(f"  {_c87x}Shell env{C.RESET}     {config.shell_env_policy}")
                     print(f"  {_c87x}Hook env{C.RESET}      {config.hook_env_policy}")
                     print(f"  {_c87x}Notify{C.RESET}        {config.notify_command or '(disabled)'}")
-                    print(f"  {_c87x}Auto-approve{C.RESET}  {'ON' if config.yes_mode else 'OFF'}")
+                    print(f"  {_c87x}Approval{C.RESET}      {config.approval_mode}")
                     print(f"  {_c87x}Debug{C.RESET}         {'ON' if config.debug else 'OFF'}")
                     print(f"\n  {_c240x}Config: {config.config_file}{C.RESET}")
                     print(f"  {_c240x}Format: KEY=VALUE (MODEL=qwen3:8b){C.RESET}")
@@ -26824,7 +27050,7 @@ Review this code for:
                         # "Did you mean?" for typo'd slash commands
                         _all_cmds = ["/help", "/exit", "/quit", "/clear", "/model", "/models",
                                      "/status", "/doctor", "/tool-pool", "/command-graph", "/bootstrap-graph",
-                                     "/save", "/compact", "/yes", "/no",
+                                     "/save", "/compact", "/approval", "/yes", "/no",
                                      "/tokens", "/context", "/usage", "/think", "/no-think", "/map", "/review", "/rubber-duck", "/accept-review",
                                      "/commit", "/diff", "/git", "/plan",
                                      "/approve", "/act", "/execute", "/undo", "/init",

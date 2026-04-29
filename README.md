@@ -130,6 +130,7 @@ EvE CLI はたくさん機能がありますが、最初は次の 4 つだけ覚
 | 画像モデルを別指定する | `eve-cli --model qwen3:8b --vision-model gemma3` |
 | 前回の続きから始める | `eve-cli --resume` |
 | 1回だけ実行する | `eve-cli -p "テストを書いて実行して"` |
+| auto-run 承認で使う | `eve-cli --approval-mode auto-run` |
 | 自動テスト付きで使う | `eve-cli --autotest` |
 | Thinking モードで使う | `eve-cli --think` |
 | Rubber Duck を有効にする | `eve-cli --review-model qwen3-coder-next:cloud --rubber-duck` |

@@ -801,6 +801,7 @@ eve-cli --channels discord,slack,webhook
 | `EVE_CLI_PROMPT_COST_PER_MTOK` | 入力 100 万 tokens あたりの推定コスト（USD） | `0.15` |
 | `EVE_CLI_COMPLETION_COST_PER_MTOK` | 出力 100 万 tokens あたりの推定コスト（USD） | `0.60` |
 | `EVE_CLI_PLAN_MODE_REASONING_EFFORT` | Plan mode 用の reasoning 強度 | `high` |
+| `EVE_CLI_APPROVAL_MODE` | 承認モード | `auto-run` |
 | `EVE_CLI_PROACTIVE` | KAIROS を強制有効化 | `1` |
 | `EVE_CLI_SHELL_ENV_POLICY` | Bash 実行時の環境変数ポリシー | `inherit` |
 | `EVE_CLI_HOOK_ENV_POLICY` | Hook 実行時の環境変数ポリシー | `inherit` |
@@ -830,6 +831,7 @@ SUBAGENT_DEFAULT_MAX_TURNS=15
 PROMPT_COST_PER_MTOK=0.15
 COMPLETION_COST_PER_MTOK=0.60
 PLAN_MODE_REASONING_EFFORT=high
+APPROVAL_MODE=auto-run
 SHELL_ENV_POLICY=inherit
 HOOK_ENV_POLICY=default
 NOTIFY_COMMAND=python3 ~/.config/eve-cli/notify.py
@@ -875,4 +877,4 @@ eve-cli --ollama-host https://ollama.com/api --model deepseek-v4-pro:cloud
 | `~/.local/state/eve-cli/kairos/` | KAIROS の state, approvals, audit, dream レポート |
 
 `permissions.json` は従来の `{ "ToolName": "allow|deny|prompt" }` 形式に加えて、`tools` / `categories` / `paths` を持つ構造化形式も読めます。
-`prompt` は明示的な確認ポリシーで、`-y` や Guardian auto-mode より優先されます。
+`prompt` は明示的な確認ポリシーで、`suggest` / `auto-edit` / `auto-run` / `full-auto` / `audit` の承認モードより優先されます。
