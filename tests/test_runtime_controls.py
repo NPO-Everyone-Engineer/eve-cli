@@ -132,6 +132,87 @@ class _FakeCodeIntel:
         return self.repo_map_text
 
 
+class TestInputMonitorPause(unittest.TestCase):
+    """InputMonitor must release stdin while a permission prompt is reading.
+
+    Regression: the ESC-watcher thread used to consume every byte off stdin
+    and discard non-ESC bytes, so the user's "y"/"n" key for permission
+    prompts was eaten and the prompt appeared frozen.
+    """
+
+    def tearDown(self):
+        # Defensive: ensure no stale class-level reference leaks into other tests.
+        eve_coder.InputMonitor._active = None
+
+    @staticmethod
+    def _primed_monitor():
+        """Build a monitor with the internal state pause/resume gates on,
+        without actually starting the polling thread or touching the terminal."""
+        mon = eve_coder.InputMonitor()
+        mon._thread = threading.Thread(target=lambda: None)
+        # tcsetattr requires a 7-element list; tcgetattr's real shape on this
+        # platform avoids hard-coding a fake one.
+        try:
+            import termios as _termios
+            mon._old_settings = [0, 0, 0, 0, 0, 0, [b'\x00'] * 32]
+        except ImportError:
+            mon._old_settings = None
+        return mon
+
+    def test_paused_active_is_noop_when_no_active_monitor(self):
+        eve_coder.InputMonitor._active = None
+        with eve_coder.InputMonitor.paused_active():
+            self.assertIsNone(eve_coder.InputMonitor._active)
+
+    def test_pause_resume_toggles_pause_event(self):
+        mon = self._primed_monitor()
+        try:
+            with patch.object(eve_coder, "termios", create=True) as _t, \
+                 patch.object(eve_coder, "tty", create=True):
+                _t.error = Exception
+                _t.TCSADRAIN = 0
+                mon.pause()
+                self.assertTrue(mon.paused)
+                mon.resume()
+                self.assertFalse(mon.paused)
+        finally:
+            mon._thread = None
+            mon._old_settings = None
+
+    def test_paused_active_pauses_and_resumes_active_monitor(self):
+        mon = self._primed_monitor()
+        eve_coder.InputMonitor._active = mon
+        try:
+            with patch.object(eve_coder, "termios", create=True) as _t, \
+                 patch.object(eve_coder, "tty", create=True):
+                _t.error = Exception
+                _t.TCSADRAIN = 0
+                with eve_coder.InputMonitor.paused_active():
+                    self.assertTrue(mon.paused)
+                self.assertFalse(mon.paused)
+        finally:
+            eve_coder.InputMonitor._active = None
+            mon._thread = None
+            mon._old_settings = None
+
+    def test_paused_active_resumes_on_exception(self):
+        mon = self._primed_monitor()
+        eve_coder.InputMonitor._active = mon
+        try:
+            with patch.object(eve_coder, "termios", create=True) as _t, \
+                 patch.object(eve_coder, "tty", create=True):
+                _t.error = Exception
+                _t.TCSADRAIN = 0
+                with self.assertRaises(RuntimeError):
+                    with eve_coder.InputMonitor.paused_active():
+                        raise RuntimeError("boom")
+                self.assertFalse(mon.paused)
+        finally:
+            eve_coder.InputMonitor._active = None
+            mon._thread = None
+            mon._old_settings = None
+
+
 class TestTypeAheadQueue(unittest.TestCase):
     def setUp(self):
         self.tui = eve_coder.TUI(eve_coder.Config())

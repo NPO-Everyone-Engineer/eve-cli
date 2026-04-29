@@ -127,6 +127,17 @@ class TestPermissionMgrSafeTools(unittest.TestCase):
     def test_subagent_always_allowed(self):
         self.assertTrue(self.mgr.check("SubAgent", {}))
 
+    def test_parallel_agents_always_allowed(self):
+        # Regression: ParallelAgents was missing from SAFE_TOOLS so full-auto
+        # would still raise an interactive prompt for it (and InputMonitor was
+        # eating the user's "y" key, leaving the user stuck).
+        self.assertTrue(self.mgr.check("ParallelAgents", {"tasks": []}))
+
+    def test_parallel_agents_allowed_in_full_auto(self):
+        cfg = _make_config(self.tmpdir, approval_mode="full-auto")
+        mgr = PermissionMgr(cfg)
+        self.assertTrue(mgr.check("ParallelAgents", {"tasks": []}))
+
     def test_ask_user_question_always_allowed(self):
         self.assertTrue(self.mgr.check("AskUserQuestion", {}))
 
@@ -136,7 +147,7 @@ class TestPermissionMgrSafeTools(unittest.TestCase):
                 self.assertTrue(self.mgr.check(tool, {}))
 
     def test_safe_tools_match_class_constant(self):
-        expected = {"Read", "Glob", "Grep", "SubAgent", "AskUserQuestion",
+        expected = {"Read", "Glob", "Grep", "SubAgent", "ParallelAgents", "AskUserQuestion",
                     "TaskCreate", "TaskList", "TaskGet", "TaskUpdate"}
         self.assertEqual(PermissionMgr.SAFE_TOOLS, expected)
 

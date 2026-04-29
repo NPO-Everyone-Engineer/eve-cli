@@ -315,7 +315,7 @@ def _cleanup_scroll_region():
 
 atexit.register(_cleanup_scroll_region)
 
-__version__ = "2.41.6"
+__version__ = "2.41.7"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -1060,11 +1060,24 @@ class InputMonitor:
     Type-ahead capture is intentionally disabled. The cbreak + background-read
     approach interferes with IME composition and multi-line paste in terminals.
     The on_typeahead parameter is accepted only for backward compatibility.
+
+    Pause / resume:
+      The poll loop reads bytes from stdin and discards anything that isn't
+      ESC / Ctrl+C. While that loop runs, an interactive prompt (e.g. the
+      permission box) cannot read user input — bytes are stolen. Callers that
+      need stdin during a turn should wrap their input in
+      ``InputMonitor.paused_active()`` so the active monitor temporarily stops
+      polling and restores cooked terminal mode.
     """
+
+    # Tracks the currently-active monitor so prompts running deep in the call
+    # tree (without a direct reference) can pause it.
+    _active = None
 
     def __init__(self, on_typeahead=None):
         self._pressed = threading.Event()
         self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
         self._thread = None
         self._old_settings = None
         self._on_typeahead = None
@@ -1074,12 +1087,17 @@ class InputMonitor:
         """True if ESC was pressed since start()."""
         return self._pressed.is_set()
 
+    @property
+    def paused(self):
+        return self._pause_event.is_set()
+
     def start(self):
         """Begin monitoring stdin for ESC key in a daemon thread."""
         if not HAS_TERMIOS or not sys.stdin.isatty():
             return
         self._pressed.clear()
         self._stop_event.clear()
+        self._pause_event.clear()
         try:
             self._old_settings = termios.tcgetattr(sys.stdin)
         except termios.error:
@@ -1089,6 +1107,7 @@ class InputMonitor:
         except termios.error:
             self._old_settings = None
             return
+        InputMonitor._active = self
         self._thread = threading.Thread(target=self._poll, daemon=True)
         self._thread.start()
 
@@ -1096,11 +1115,19 @@ class InputMonitor:
         """Poll stdin for ESC (0x1b) with 0.2s timeout."""
         fd = sys.stdin.fileno()
         while not self._stop_event.is_set():
+            if self._pause_event.is_set():
+                # Yield stdin to whatever called pause() (e.g. permission prompt).
+                # Use a short wait so resume takes effect promptly.
+                self._pause_event.wait(timeout=0.05)
+                continue
             try:
                 ready, _, _ = _select_mod.select([fd], [], [], 0.2)
             except (OSError, ValueError):
                 break
             if ready:
+                # Re-check pause: a caller may have paused us between select and read.
+                if self._pause_event.is_set():
+                    continue
                 try:
                     ch = os.read(fd, 1)
                 except OSError:
@@ -1140,6 +1167,7 @@ class InputMonitor:
     def stop(self):
         """Stop monitoring and restore terminal settings."""
         self._stop_event.set()
+        self._pause_event.clear()
         if self._thread is not None:
             self._thread.join(timeout=1)
             self._thread = None
@@ -1149,6 +1177,46 @@ class InputMonitor:
             except termios.error:
                 pass
             self._old_settings = None
+        if InputMonitor._active is self:
+            InputMonitor._active = None
+
+    def pause(self):
+        """Suspend polling and restore cooked terminal mode so input() works.
+
+        Safe to call when monitoring isn't active (e.g. non-tty stdin) — it
+        becomes a no-op.
+        """
+        if self._thread is None or self._old_settings is None:
+            return
+        self._pause_event.set()
+        try:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
+        except (termios.error, NameError):
+            pass
+
+    def resume(self):
+        """Re-enter cbreak mode and restart the poll loop."""
+        if self._thread is None or self._old_settings is None:
+            return
+        try:
+            tty.setcbreak(sys.stdin.fileno())
+        except (termios.error, NameError):
+            pass
+        self._pause_event.clear()
+
+    @classmethod
+    @contextlib.contextmanager
+    def paused_active(cls):
+        """Pause the currently-active monitor (if any) for the duration of the block."""
+        active = cls._active
+        if active is None:
+            yield
+            return
+        active.pause()
+        try:
+            yield
+        finally:
+            active.resume()
 
 
 class ReadWriteLock:
@@ -15118,7 +15186,12 @@ def _build_doctor_lines(config, client, registry, permissions, session, agent, h
 class PermissionMgr:
     """Manages tool execution permissions."""
 
-    SAFE_TOOLS = {"Read", "Glob", "Grep", "SubAgent", "AskUserQuestion",
+    # Orchestration tools (SubAgent / ParallelAgents) are listed as "safe" because
+    # they delegate work to sub-agents that run their own permission checks; the
+    # outer permission gate would only add a duplicate prompt. AskUserQuestion is
+    # interactive by design. Task* tools mutate the in-memory task store, not the
+    # filesystem.
+    SAFE_TOOLS = {"Read", "Glob", "Grep", "SubAgent", "ParallelAgents", "AskUserQuestion",
                    "TaskCreate", "TaskList", "TaskGet", "TaskUpdate"}
     ASK_TOOLS = {"Bash", "Write", "Edit", "ApplyPatch", "MultiEdit", "NotebookEdit"}
     NETWORK_TOOLS = {"WebFetch", "WebSearch"}
@@ -21612,11 +21685,16 @@ class TUI:
 
     @staticmethod
     def _read_permission_input(prompt_str):
-        """Read permission input with /dev/tty fallback for non-TTY stdin."""
+        """Read permission input with /dev/tty fallback for non-TTY stdin.
+
+        Pauses any active InputMonitor for the duration of the read so the
+        ESC-watcher thread doesn't steal user-typed bytes off stdin.
+        """
         import re as _re
         # Try normal input() first if stdin is a TTY
         if sys.stdin.isatty():
-            reply = input(prompt_str)
+            with InputMonitor.paused_active():
+                reply = input(prompt_str)
         else:
             # stdin is not a TTY (piped, redirected, etc.) — try /dev/tty
             sys.stdout.write(prompt_str)
