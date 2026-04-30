@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -664,6 +665,67 @@ class TestInputPrompts(unittest.TestCase):
         self.assertIn("Q2: delta", result)
         self.assertEqual(prompts, ["  > "])
         self.assertTrue(all("\x1b" not in prompt for prompt in prompts))
+
+    def test_read_interactive_input_prints_ansi_prompt_separately(self):
+        prompts = []
+        fake_stdin = SimpleNamespace(isatty=lambda: True)
+        fake_stdout = io.StringIO()
+        ansi_prompt = f"{eve_coder.C.CYAN}Confirm? [y/N]: {eve_coder.C.RESET}"
+
+        def fake_input(prompt=""):
+            prompts.append(prompt)
+            return "yes"
+
+        with patch.object(eve_coder.sys, "stdin", fake_stdin), \
+             patch.object(eve_coder.sys, "stdout", fake_stdout), \
+             patch("builtins.input", side_effect=fake_input):
+            result = eve_coder._read_interactive_input(ansi_prompt)
+
+        self.assertEqual(result, "yes")
+        self.assertEqual(prompts, [""])
+        self.assertIn("Confirm? [y/N]: ", fake_stdout.getvalue())
+        self.assertIn("\x1b", fake_stdout.getvalue())
+
+    def test_read_interactive_input_uses_tty_fallback_with_plain_prompt(self):
+        fake_stdin = SimpleNamespace(isatty=lambda: False)
+        fake_stdout = io.StringIO()
+        ansi_prompt = f"{eve_coder.C.CYAN}Confirm? [y/N]: {eve_coder.C.RESET}"
+
+        with patch.object(eve_coder.sys, "stdin", fake_stdin), \
+             patch.object(eve_coder.sys, "stdout", fake_stdout), \
+             patch("builtins.input") as mock_input, \
+             patch("builtins.open", return_value=io.StringIO("y\n")):
+            result = eve_coder._read_interactive_input(ansi_prompt, tty_fallback=True)
+
+        self.assertEqual(result, "y")
+        mock_input.assert_not_called()
+        self.assertEqual(fake_stdout.getvalue(), "Confirm? [y/N]: ")
+
+    def test_read_interactive_input_pauses_active_monitor(self):
+        mon = TestInputMonitorPause._primed_monitor()
+        eve_coder.InputMonitor._active = mon
+        fake_stdin = SimpleNamespace(isatty=lambda: True)
+        try:
+            with patch.object(eve_coder, "termios", create=True) as _t, \
+                 patch.object(eve_coder, "tty", create=True), \
+                 patch.object(eve_coder.sys, "stdin", fake_stdin):
+                _t.error = Exception
+                _t.TCSADRAIN = 0
+
+                def fake_input(prompt=""):
+                    self.assertTrue(mon.paused)
+                    self.assertEqual(prompt, "> ")
+                    return "ok"
+
+                with patch("builtins.input", side_effect=fake_input):
+                    result = eve_coder._read_interactive_input("> ")
+
+            self.assertEqual(result, "ok")
+            self.assertFalse(mon.paused)
+        finally:
+            eve_coder.InputMonitor._active = None
+            mon._thread = None
+            mon._old_settings = None
 
     def test_stream_response_renders_native_thinking_without_polluting_text(self):
         chunks = iter([

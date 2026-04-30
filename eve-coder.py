@@ -9957,13 +9957,7 @@ class AskUserQuestionTool(Tool):
                     print(f"  {_ansi(C.DIM)}Type your answer:{_ansi(C.RESET)}")
 
             try:
-                # Avoid ANSI codes in input() prompt on macOS - causes IME/input issues.
-                answer = input("  > ").strip()
-                # Strip terminal escape sequences (same as TUI.get_input)
-                import re as _re
-                answer = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z~]', '', answer)
-                answer = _strip_shift_enter_garbage(answer)
-                answer = answer.strip()
+                answer = _read_interactive_input("  > ").strip()
             except (EOFError, KeyboardInterrupt):
                 return "User cancelled the question."
 
@@ -10124,13 +10118,7 @@ class AskUserQuestionBatchTool(Tool):
                 print(f"  {_ansi(C.DIM)}各質問の答えをカンマ区切りで入力してください:{_ansi(C.RESET)}")
 
             try:
-                # Avoid ANSI codes in input() prompt on macOS - causes IME/input issues.
-                answer = input("  > ").strip()
-                # Strip terminal escape sequences (same as TUI.get_input)
-                import re as _re
-                answer = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z~]', '', answer)
-                answer = _strip_shift_enter_garbage(answer)
-                answer = answer.strip()
+                answer = _read_interactive_input("  > ").strip()
             except (EOFError, KeyboardInterrupt):
                 return "User cancelled the question."
 
@@ -11223,7 +11211,7 @@ def _prompt_repo_trust(config, scope, title, warning, hashes, preview_paths=None
     print(f"{C.YELLOW}│{C.RESET}  {t('prompts.repo_trust_choices', '[y] Trust  [n] Skip (default)')}")
     print(f"{C.YELLOW}╰──────────────────────────────────────────{C.RESET}")
     try:
-        ans = input(f"  {C.YELLOW}? {C.RESET}").strip().lower()
+        ans = _read_interactive_input(f"  {C.YELLOW}? {C.RESET}", tty_fallback=True).strip().lower()
     except (EOFError, KeyboardInterrupt):
         ans = ""
     if ans in ("y", "yes"):
@@ -11660,7 +11648,7 @@ class ExtensionManager:
                 print(f"  Source: {github_url}")
                 print(f"  Files: {', '.join(manifest.get('files', []))}")
                 try:
-                    confirm = input(f"\n  Install this extension? [y/N]: ").strip().lower()
+                    confirm = _read_interactive_input("\n  Install this extension? [y/N]: ", tty_fallback=True).strip().lower()
                     if confirm not in ("y", "yes"):
                         return False, "Installation cancelled."
                 except (EOFError, KeyboardInterrupt):
@@ -16124,7 +16112,7 @@ class HookManager:
             print(f"{C.YELLOW}│{C.RESET} {_ansi(chr(27)+'[38;5;196m')}{t('warnings.repo_hooks_arbitrary', default='Warning: repo hooks can run arbitrary commands')}{C.RESET}")
             print(f"{C.YELLOW}│{C.RESET}  {t('prompts.repo_trust_choices', '[y] Trust  [n] Skip (default)')}")
             print(f"{C.YELLOW}╰──────────────────────────────────────────{C.RESET}")
-            ans = input(f"  {C.YELLOW}? {C.RESET}").strip().lower()
+            ans = _read_interactive_input(f"  {C.YELLOW}? {C.RESET}", tty_fallback=True).strip().lower()
             if ans in ("y", "yes"):
                 cwd = os.path.realpath(self.config.cwd)
                 hook_hashes = self._compute_hooks_trust_hashes(hooks_path)
@@ -20090,10 +20078,11 @@ class Session:
         """Show a numbered picker over `sessions` and return the chosen entry's id.
 
         Returns "" when the user aborts (q / Ctrl+C / EOF) so callers can fall
-        back to starting a new session. Uses plain input() so it works under
-        libedit (macOS), TTYs without ANSI cursor support, and stdin pipes
-        from a controlling terminal. Headless / non-TTY callers should not
-        invoke this — they should resolve via list ordering directly.
+        back to starting a new session. Uses the shared interactive-input helper
+        so the picker stays libedit-safe on macOS and can still prompt through
+        a controlling terminal when stdin is redirected. Headless / non-TTY
+        callers should not invoke this — they should resolve via list ordering
+        directly.
         """
         if not sessions:
             return ""
@@ -20112,7 +20101,7 @@ class Session:
             print(row)
         print(f"  {C.DIM}q to abort, Enter for #{default_idx + 1}{C.RESET}")
         try:
-            choice = input(f"  Select [1-{max_show}]: ").strip().lower()
+            choice = _read_interactive_input(f"  Select [1-{max_show}]: ", tty_fallback=True).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return ""
@@ -20220,6 +20209,40 @@ def _strip_shift_enter_garbage(text):
     import re
     text = re.sub(r'(?:\x1b\[)?27;2;13~', '', text)
     return re.sub(r'7;2;13~', '', text)
+
+
+def _read_interactive_input(prompt_str="", tty_fallback=False, strip_controls=False):
+    """Read user input without passing ANSI escapes into input() itself."""
+    prompt_str = str(prompt_str or "")
+    prompt_plain = re.sub(r'\x1b\[[0-9;]*[a-zA-Z~]', '', prompt_str)
+
+    with InputMonitor.paused_active():
+        if sys.stdin.isatty():
+            if prompt_str != prompt_plain:
+                sys.stdout.write(prompt_str)
+                sys.stdout.flush()
+                reply = input("")
+            else:
+                reply = input(prompt_str)
+        else:
+            if not tty_fallback:
+                raise EOFError("stdin is not interactive")
+            sys.stdout.write(prompt_plain)
+            sys.stdout.flush()
+            try:
+                with open("/dev/tty", "r", encoding="utf-8", errors="replace") as tty:
+                    reply = tty.readline()
+                    if not reply:
+                        raise EOFError("No input from /dev/tty")
+                    reply = reply.rstrip("\r\n")
+            except (OSError, IOError) as exc:
+                raise EOFError("No terminal available for prompt") from exc
+
+    reply = re.sub(r'\x1b\[[0-9;]*[a-zA-Z~]', '', reply or "")
+    reply = _strip_shift_enter_garbage(reply)
+    if strip_controls:
+        reply = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', reply)
+    return reply
 
 
 class TUI:
@@ -21690,27 +21713,7 @@ class TUI:
         Pauses any active InputMonitor for the duration of the read so the
         ESC-watcher thread doesn't steal user-typed bytes off stdin.
         """
-        import re as _re
-        # Try normal input() first if stdin is a TTY
-        if sys.stdin.isatty():
-            with InputMonitor.paused_active():
-                reply = input(prompt_str)
-        else:
-            # stdin is not a TTY (piped, redirected, etc.) — try /dev/tty
-            sys.stdout.write(prompt_str)
-            sys.stdout.flush()
-            try:
-                with open("/dev/tty", "r") as tty:
-                    reply = tty.readline()
-                    if not reply:
-                        raise EOFError("No input from /dev/tty")
-                    reply = reply.rstrip("\n")
-            except (OSError, IOError):
-                # No terminal available at all — cannot prompt
-                raise EOFError("No terminal available for permission prompt")
-        # Strip control characters (some terminals add \r, ANSI escapes, etc.)
-        reply = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', reply)
-        return reply.strip()
+        return _read_interactive_input(prompt_str, tty_fallback=True, strip_controls=True).strip()
 
     def start_spinner(self, label="Thinking"):
         """Show a neon spinner while waiting."""
@@ -23462,7 +23465,7 @@ class Agent:
                 _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
                 _p(f"\n{C.CYAN}Continue this session? [Y/n]: {C.RESET}", end="")
                 try:
-                    cont = input().strip().lower()
+                    cont = _read_interactive_input("", tty_fallback=True).strip().lower()
                     if cont in ("", "y", "yes", "はい"):
                         _p(f"{C.DIM}Continuing... (reset step counter){C.RESET}")
                         self.session.add_system_note(f"Session continued after {self.max_iterations} steps")
@@ -23690,7 +23693,7 @@ def _handle_suggest_help(agent, config, client, session):
 
     # --- 4. ユーザー選択を受け付ける ---
     try:
-        choice = input("番号を入力してください > ").strip()
+        choice = _read_interactive_input("番号を入力してください > ", tty_fallback=True).strip()
     except (KeyboardInterrupt, EOFError):
         print("\nキャンセルしました。")
         return None
@@ -24207,8 +24210,9 @@ def main():
         # Try to auto-start Ollama on macOS and Linux for local hosts only
         if config.uses_local_ollama() and shutil.which("ollama"):
             try:
-                ans = "y" if _approval_mode_allows(config, "shell") else input(
-                    f"{_ansi(chr(27)+'[38;5;51m')}Try to start Ollama automatically? [Y/n]: {C.RESET}"
+                ans = "y" if _approval_mode_allows(config, "shell") else _read_interactive_input(
+                    f"{_ansi(chr(27)+'[38;5;51m')}Try to start Ollama automatically? [Y/n]: {C.RESET}",
+                    tty_fallback=True,
                 ).strip().lower()
                 if ans in ("", "y", "yes"):
                     if platform.system() == "Darwin":
@@ -24263,7 +24267,10 @@ def main():
                 do_pull = True
             else:
                 try:
-                    ans = input(f"{C.CYAN}Download '{config.model}' now? (may be several GB) [Y/n]: {C.RESET}").strip().lower()
+                    ans = _read_interactive_input(
+                        f"{C.CYAN}Download '{config.model}' now? (may be several GB) [Y/n]: {C.RESET}",
+                        tty_fallback=True,
+                    ).strip().lower()
                     do_pull = ans in ("", "y", "yes")
                 except (EOFError, KeyboardInterrupt):
                     print()
@@ -25336,7 +25343,7 @@ def main():
                             else:
                                 print(f"{C.YELLOW}{t('slash.commit_stage_prompt', default='Nothing staged. Stage tracked file changes with git add -u?')}{C.RESET}")
                                 print(f"{C.DIM}{st.stdout.strip()}{C.RESET}")
-                                ans = input(f"{C.CYAN}[y/N]{C.RESET} ").strip().lower()
+                                ans = _read_interactive_input(f"{C.CYAN}[y/N]{C.RESET} ", tty_fallback=True).strip().lower()
                                 do_add = ans in ("y", "yes")
                             if do_add:
                                 subprocess.run(["git", "add", "-u"], timeout=10)
@@ -25433,7 +25440,10 @@ def main():
                         print(f"{C.BOLD}{commit_msg}{C.RESET}\n")
 
                         if not _approval_mode_allows(config, "shell"):
-                            ans = input(f"{C.CYAN}{t('slash.commit_confirm', default='Commit with this message? [Y/n/e(dit)]')}{C.RESET} ").strip().lower()
+                            ans = _read_interactive_input(
+                                f"{C.CYAN}{t('slash.commit_confirm', default='Commit with this message? [Y/n/e(dit)]')}{C.RESET} ",
+                                tty_fallback=True,
+                            ).strip().lower()
                             if ans == "e":
                                 print(f"{C.DIM}Enter new message (end with empty line):{C.RESET}")
                                 lines = []
@@ -25586,7 +25596,10 @@ def main():
                             agent.run(pr_prompt)
 
                             # After agent responds, ask user to confirm and create
-                            confirm = input(f"\n{C.CYAN}Create this PR? [Y/n]: {C.RESET}").strip().lower()
+                            confirm = _read_interactive_input(
+                                f"\n{C.CYAN}Create this PR? [Y/n]: {C.RESET}",
+                                tty_fallback=True,
+                            ).strip().lower()
                             if confirm in ("", "y", "yes"):
                                 # Extract title and body from last assistant message
                                 last_msg = ""
@@ -25657,7 +25670,10 @@ def main():
                         if pr_num:
                             args.append(pr_num)
                         try:
-                            confirm = input(f"{C.CYAN}Merge this PR? [y/N]: {C.RESET}").strip().lower()
+                            confirm = _read_interactive_input(
+                                f"{C.CYAN}Merge this PR? [y/N]: {C.RESET}",
+                                tty_fallback=True,
+                            ).strip().lower()
                             if confirm in ("y", "yes"):
                                 ok, out, err = _run_gh_command(args, cwd=config.cwd, timeout=30)
                                 if ok:
@@ -26128,7 +26144,7 @@ def main():
                         if test_code.count("\n") > 20:
                             print(f"  {C.DIM}... ({test_code.count(chr(10))+1} lines total){C.RESET}")
                         if not _approval_mode_allows(config, "write"):
-                            ans = input(f"{C.CYAN}Overwrite? [y/N] {C.RESET}").strip().lower()
+                            ans = _read_interactive_input(f"{C.CYAN}Overwrite? [y/N] {C.RESET}", tty_fallback=True).strip().lower()
                             if ans not in ("y", "yes"):
                                 continue
                     with open(test_path, "w", encoding="utf-8") as f:
